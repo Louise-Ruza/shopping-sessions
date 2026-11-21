@@ -13,6 +13,8 @@
 
 mod arena;
 mod csv;
+#[cfg(feature = "event-front")]
+mod event_front;
 #[allow(dead_code)]
 mod hash;
 mod key;
@@ -29,7 +31,9 @@ use arena::{ShardSet, Scatter, Segs};
 use key::Key8;
 use links::{prefetch, Resolver, SEED_A};
 use parquet::{Column, Kind};
-use ts::{parse_price, parse_ts, DateCache, DAY_MS};
+use ts::{parse_ts, DateCache, DAY_MS};
+#[cfg(not(feature = "event-front"))]
+use ts::parse_price;
 
 const GAP_MS: i64 = 1_800_000;
 const SEVEN_DAYS_MS: i64 = 7 * DAY_MS;
@@ -1185,6 +1189,42 @@ fn main() {
                 }
                 let d = chunks[i].data;
                 populate(d);
+                #[cfg(feature = "event-front")]
+                event_front::scan(d, &ctx.dates, |e| {
+                    if e.eid.is_empty() { return; }
+                    let ek = Key8::new(e.eid);
+                    let eh = ek.hash(SEED_ID);
+                    let mut r = RawEv {
+                        eid: ek, uid: Key8::EMPTY, ts: TS_INVALID, price: 0,
+                        ingest: enc_ingest_fast(e.ingest, ctx.base, oob_ref), ehash: eh as u32,
+                    };
+                    'v: {
+                        let Some(ing) = e.ingest else { break 'v };
+                        if e.uid.is_empty() || e.product.is_empty() { break 'v; }
+                        let ts = match e.timestamp {
+                            Some(t) if t >= ctx.ws && t < ctx.we => t,
+                            _ => break 'v,
+                        };
+                        let price_enc = match e.kind {
+                            1 => 0,
+                            2 if e.price != 0 => {
+                                let cat = ctx.products.get(e.product).unwrap_or(ctx.unknown_cat);
+                                if !ctx.wide { (e.price << 8) | cat } else {
+                                    let mut g = wide_ref.lock().unwrap();
+                                    g.push((e.price, cat as u16));
+                                    g.len() as u32
+                                }
+                            }
+                            _ => break 'v,
+                        };
+                        if ing - ts > LATE_MS { break 'v; }
+                        r.uid = Key8::new(e.uid);
+                        r.ts = (ts - ctx.base) as u32;
+                        r.price = price_enc;
+                    }
+                    w.push((eh >> (64 - ID_BITS)) as usize, r);
+                });
+                #[cfg(not(feature = "event-front"))]
                 csv::scan::<7, _>(d, |f| {
                     let eid = f[0];
                     if eid.is_empty() {

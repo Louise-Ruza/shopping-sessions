@@ -13,6 +13,10 @@
 //! overflow IDs always receive the exact same index, so equality remains a
 //! single `u64` comparison everywhere, while `cmp_bytes` falls back to exact
 //! byte slice comparison whenever either operand has `OVF_BIT` set.
+//!
+//! With `ascii-keys`, inline keys instead contain nine big-endian 7-bit slots
+//! for nonzero ASCII bytes. Lengths above nine, NULs, and high bytes use overflow.
+//! Zero padding and the unchanged bit-63 tag preserve exact ordering/equality.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -37,6 +41,7 @@ const OVF_SHARDS: usize = 1 << OVF_SHARD_BITS;
 /// 37: '_' (95)
 /// 38..=63: 'a'..='z' (97..=122)
 /// 0xFF: invalid (triggers overflow store)
+#[cfg(not(feature = "ascii-keys"))]
 const ENC6: [u8; 256] = {
     let mut t = [0xFFu8; 256];
     let mut c = b'0';
@@ -58,6 +63,7 @@ const ENC6: [u8; 256] = {
     t
 };
 
+#[cfg(not(feature = "ascii-keys"))]
 const DEC6: [u8; 64] = {
     let mut t = [0u8; 64];
     let mut i = 0u8;
@@ -85,7 +91,7 @@ pub struct Key8(pub u64);
 
 /// Team iteration 8's SWAR range check, with portable six-bit compaction.
 /// The narrow alphabet is an optimization only; other IDs use the exact encoder.
-#[cfg(feature = "fast-fields")]
+#[cfg(all(feature = "fast-fields", not(feature = "ascii-keys")))]
 #[inline(always)]
 fn pack8_lower_digits(w: u64) -> Option<u64> {
     const HI: u64 = 0x8080_8080_8080_8080;
@@ -107,6 +113,20 @@ fn pack8_lower_digits(w: u64) -> Option<u64> {
     Some((quads & 0x0000_0000_00FF_FFFF) | ((quads >> 8) & 0x0000_FFFF_FF00_0000))
 }
 
+/// Pack eight big-endian nonzero ASCII bytes directly into 56 ordered bits.
+#[cfg(feature = "ascii-keys")]
+#[inline(always)]
+fn pack8_ascii(word: u64) -> Option<u64> {
+    // A valid byte is 1..127, so subtracting one cannot borrow across its lane.
+    // A zero causes a high bit in the subtraction; high input bytes fail directly.
+    if (word | word.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    let pairs = (word & 0x007F_007F_007F_007F) | ((word >> 1) & 0x3F80_3F80_3F80_3F80);
+    let quads = (pairs & 0x0000_3FFF_0000_3FFF) | ((pairs >> 2) & 0x0FFF_C000_0FFF_C000);
+    Some((quads & 0x0000_0000_0FFF_FFFF) | ((quads >> 4) & 0x00FF_FFFF_F000_0000))
+}
+
 impl Key8 {
     pub const EMPTY: Key8 = Key8(0);
 
@@ -120,6 +140,36 @@ impl Key8 {
         (self.0 & OVF_BIT) == 0
     }
 
+    #[cfg(feature = "ascii-keys")]
+    #[inline(always)]
+    pub fn new(s: &[u8]) -> Key8 {
+        let n = s.len();
+        if n == 8 || n == 9 {
+            let word = u64::from_be_bytes(s[..8].try_into().unwrap());
+            if let Some(packed) = pack8_ascii(word) {
+                if n == 8 {
+                    return Key8(packed << 7);
+                }
+                if s[8].wrapping_sub(1) < 127 {
+                    return Key8((packed << 7) | s[8] as u64);
+                }
+            }
+            return Key8::overflow(s);
+        }
+        if n < 8 {
+            let mut packed = 0u64;
+            for &byte in s {
+                if byte.wrapping_sub(1) >= 127 {
+                    return Key8::overflow(s);
+                }
+                packed = (packed << 7) | byte as u64;
+            }
+            return Key8(packed << ((9 - n) * 7));
+        }
+        Key8::overflow(s)
+    }
+
+    #[cfg(not(feature = "ascii-keys"))]
     #[inline(always)]
     pub fn new(s: &[u8]) -> Key8 {
         let n = s.len();
@@ -228,6 +278,19 @@ impl Key8 {
     #[inline(always)]
     pub fn as_slice<'a>(&self, buf: &'a mut [u8; 16]) -> &'a [u8] {
         if self.is_inline() {
+            #[cfg(feature = "ascii-keys")]
+            {
+                let mut value = self.0 << 1;
+                let mut len = 0;
+                while value != 0 {
+                    buf[len] = (value >> 57) as u8;
+                    len += 1;
+                    value <<= 7;
+                }
+                &buf[..len]
+            }
+            #[cfg(not(feature = "ascii-keys"))]
+            {
             let mut v = self.0 << 4;
             let mut len = 0usize;
             while v != 0 {
@@ -237,6 +300,7 @@ impl Key8 {
                 v <<= 6;
             }
             unsafe { buf.get_unchecked(..len) }
+            }
         } else {
             overflow_store().get(self.0 & !OVF_BIT)
         }
@@ -305,7 +369,82 @@ impl OverflowStore {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "fast-fields")]
+    #[cfg(feature = "ascii-keys")]
+    #[test]
+    fn ascii_word_packing_matches_every_adjacent_byte_pair() {
+        for fill in [1u8, 127] {
+            for position in 0..7 {
+                for pair in 0..=u16::MAX {
+                    let mut bytes = [fill; 8];
+                    bytes[position..position + 2].copy_from_slice(&pair.to_le_bytes());
+                    let expected = bytes.iter().try_fold(0u64, |acc, &c| {
+                        (c != 0 && c < 128).then_some((acc << 7) | c as u64)
+                    });
+                    assert_eq!(pack8_ascii(u64::from_be_bytes(bytes)), expected, "{bytes:?}");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "ascii-keys")]
+    #[test]
+    fn ascii_key_boundaries_roundtrip_without_aliasing() {
+        assert_eq!(std::mem::size_of::<Key8>(), 8);
+        assert_eq!(Key8::new(&[]), Key8::EMPTY);
+        assert_eq!(Key8::new(&[127; 9]).0, OVF_BIT - 1);
+        let background = [1, 127, b'A', b' ', b'_', b'z', b'\r', b'a', b'X', b'3', b'4'];
+        for n in 1..=11 {
+            for position in 0..n {
+                for byte in 0..=255u8 {
+                    let mut text = background[..n].to_vec();
+                    text[position] = byte;
+                    let key = Key8::new(&text);
+                    let inline = n <= 9 && text.iter().all(|&c| c != 0 && c < 128);
+                    assert_eq!(key.is_inline(), inline, "{text:?}");
+                    if inline {
+                        let value = text.iter().fold(0u64, |acc, &c| (acc << 7) | c as u64);
+                        assert_eq!(key.0, value << ((9 - n) * 7));
+                    }
+                    assert_eq!(rt(&key), text);
+                    assert_eq!(key, Key8::new(&text));
+                }
+            }
+        }
+        let mut values: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
+        values.extend([vec![], vec![127; 8], vec![127; 9], vec![127; 10],
+                       b"aaaaaaaaa".to_vec(), b"aaaaaaaaa\0".to_vec(), b"aaaaaaaaaa".to_vec()]);
+        for a in &values {
+            for b in &values {
+                let (ka, kb) = (Key8::new(a), Key8::new(b));
+                assert_eq!(ka == kb, a == b);
+                assert_eq!(ka.cmp_bytes(&kb), a.cmp(b));
+            }
+        }
+    }
+
+    #[cfg(feature = "ascii-keys")]
+    #[test]
+    fn ascii_keys_sort_arbitrary_strings_exactly() {
+        let mut seed = 1729u64;
+        let mut rows = Vec::new();
+        for i in 0..10_000 {
+            let mut text = Vec::new();
+            for _ in 0..i % 25 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                text.push((seed >> 32) as u8);
+            }
+            let key = Key8::new(&text);
+            assert_eq!(rt(&key), text);
+            rows.push((key, text));
+        }
+        rows.sort_by(|a, b| a.0.cmp_bytes(&b.0));
+        for pair in rows.windows(2) {
+            assert!(pair[0].1 <= pair[1].1);
+            assert_eq!(pair[0].0 == pair[1].0, pair[0].1 == pair[1].1);
+        }
+    }
+
+    #[cfg(all(feature = "fast-fields", not(feature = "ascii-keys")))]
     #[test]
     fn packed_key_encoder_preserves_exact_codes_and_fallbacks() {
         fn code(byte: u8) -> Option<u64> {
