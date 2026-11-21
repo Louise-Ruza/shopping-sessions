@@ -20,7 +20,8 @@ pub struct Event<'a> {
     pub price: u32,
 }
 
-#[inline(always)]
+#[cold]
+#[inline(never)]
 fn fallback<'a, F: FnMut(Event<'a>)>(data: &'a [u8], dates: &DateCache, f: &mut F) {
     csv::scan::<7, _>(data, |fields| {
         let kind = match fields[4] {
@@ -111,27 +112,52 @@ fn parse_row<'a, P: Fn(u128) -> u128>(
     unsafe {
         let tq = (*p.add(c1 + 1) == b'"') as usize;
         let ta = c1 + 1 + tq;
-        let (tn, c2) = if *p.add(ta + 19) == b'Z' && *p.add(ta + 20 + tq) == b',' {
-            (20usize, ta + 20 + tq)
+        let (c3, timestamp, ingest) = if *p.add(ta + 19) == b'Z' && *p.add(ta + 20 + tq) == b',' {
+            let c2 = ta + 20 + tq;
+            let iq = (*p.add(c2 + 1) == b'"') as usize;
+            let ia = c2 + 1 + iq;
+            let c3 = ia + 20 + iq;
+            if *p.add(c3) != b',' {
+                return None;
+            }
+            let (ts, ing) =
+                dates.parse_event_ingest(data.get_unchecked(ta..ta + 20), data.get_unchecked(ia..ia + 20));
+            (c3, ts, ing)
         } else if *p.add(ta + 13 + tq) == b',' {
-            (13usize, ta + 13 + tq)
+            let c2 = ta + 13 + tq;
+            let iq = (*p.add(c2 + 1) == b'"') as usize;
+            let ia = c2 + 1 + iq;
+            let c3 = ia + 20 + iq;
+            if *p.add(c3) != b',' {
+                return None;
+            }
+            (
+                c3,
+                DateCache::parse_ts_13(data.get_unchecked(ta..ta + 13)),
+                dates.parse_f1_ingest(data.get_unchecked(ia..ia + 20)),
+            )
         } else if *p.add(ta + 25 + tq) == b',' {
-            (25usize, ta + 25 + tq)
+            let c2 = ta + 25 + tq;
+            let iq = (*p.add(c2 + 1) == b'"') as usize;
+            let ia = c2 + 1 + iq;
+            let c3 = ia + 20 + iq;
+            if *p.add(c3) != b',' {
+                return None;
+            }
+            (
+                c3,
+                dates.parse_ts_25(data.get_unchecked(ta..ta + 25)),
+                dates.parse_f1_ingest(data.get_unchecked(ia..ia + 20)),
+            )
         } else {
             return None;
         };
-        let iq = (*p.add(c2 + 1) == b'"') as usize;
-        let ia = c2 + 1 + iq;
-        let c3 = ia + 20 + iq;
-        if *p.add(c3) != b',' {
-            return None;
-        }
         let kq = (*p.add(c3 + 1) == b'"') as usize;
         let ka = c3 + 1 + kq;
         let k4 = (p.add(ka) as *const u32).read_unaligned();
-        let (kind, c4) = if (k4 == u32::from_ne_bytes(*b"view") || k4 == u32::from_ne_bytes(*b"cart"))
-            && *p.add(ka + 4 + kq) == b','
-        {
+        let is_vc = ((k4 == u32::from_ne_bytes(*b"view")) | (k4 == u32::from_ne_bytes(*b"cart")))
+            & (*p.add(ka + 4 + kq) == b',');
+        let (kind, c4) = if is_vc {
             (1u8, ka + 4 + kq)
         } else if (p.add(ka) as *const u64).read_unaligned() == u64::from_ne_bytes(*b"purchase")
             && *p.add(ka + 8 + kq) == b','
@@ -143,14 +169,6 @@ fn parse_row<'a, P: Fn(u128) -> u128>(
         if c4 >= c5 {
             return None;
         }
-        let ing_s = data.get_unchecked(ia..ia + 20);
-        let (timestamp, ingest) = if tn == 20 {
-            dates.parse_event_ingest(data.get_unchecked(ta..ta + 20), ing_s)
-        } else if tn == 13 {
-            (DateCache::parse_ts_13(data.get_unchecked(ta..ta + 13)), dates.parse_f1_ingest(ing_s))
-        } else {
-            (dates.parse_ts_25(data.get_unchecked(ta..ta + 25)), dates.parse_f1_ingest(ing_s))
-        };
         Some(Event {
             eid: field(data, 0, c0),
             uid: field(data, c0 + 1, c1),

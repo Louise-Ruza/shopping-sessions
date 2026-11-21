@@ -9,6 +9,7 @@ pub enum Kind {
     Str,
     OptStr,
     Date,
+    I32,
     I64,
 }
 
@@ -24,7 +25,7 @@ impl Column {
     pub fn new(name: &'static str, kind: Kind, cap_rows: usize) -> Column {
         let per = match kind {
             Kind::Str | Kind::OptStr => 16,
-            Kind::Date => 4,
+            Kind::Date | Kind::I32 => 4,
             Kind::I64 => 8,
         };
         let values = Vec::with_capacity(cap_rows * per);
@@ -134,6 +135,17 @@ impl Column {
     }
 
     #[inline(always)]
+    pub fn push_i32(&mut self, v: i32) {
+        self.ensure_val(4);
+        unsafe {
+            let len = self.values.len();
+            (self.values.as_mut_ptr().add(len) as *mut i32).write_unaligned(v.to_le());
+            self.values.set_len(len + 4);
+        }
+        self.n += 1;
+    }
+
+    #[inline(always)]
     pub fn push_i64(&mut self, v: i64) {
         self.ensure_val(8);
         unsafe {
@@ -214,7 +226,7 @@ impl Thrift {
 fn physical(kind: Kind) -> i32 {
     match kind {
         Kind::Str | Kind::OptStr => 6,
-        Kind::Date => 1,
+        Kind::Date | Kind::I32 => 1,
         Kind::I64 => 2,
     }
 }
@@ -305,7 +317,7 @@ pub fn write_file(path: &Path, cols: &[Column]) -> std::io::Result<()> {
                 t.end_struct();
                 t.end_struct();
             }
-            Kind::I64 => {}
+            Kind::I32 | Kind::I64 => {}
         }
         t.end_struct();
     }

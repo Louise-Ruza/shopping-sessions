@@ -20,6 +20,7 @@ mod hash;
 mod key;
 mod links;
 mod parquet;
+#[allow(dead_code)]
 mod timebins;
 mod ts;
 
@@ -183,6 +184,7 @@ pub(crate) fn release_chunk(d: &[u8]) {
 
 struct KeyMap {
     slots: Vec<(Key8, u32)>,
+    len: usize,
     mask: usize,
     fast_prefix: &'static [u8],
     fast: Vec<u32>,
@@ -227,15 +229,39 @@ fn parse_canon_idx(s: &[u8], prefix: &[u8], limit: usize) -> Option<usize> {
 
 impl KeyMap {
     fn new(n: usize) -> KeyMap {
-        Self::new_with_fast(n, b"", 0)
-    }
-    fn new_with_fast(n: usize, fast_prefix: &'static [u8], fast_cap: usize) -> KeyMap {
         let cap = (n * 2).next_power_of_two().max(16);
         KeyMap {
             slots: vec![(Key8::EMPTY, u32::MAX); cap],
+            len: 0,
+            mask: cap - 1,
+            fast_prefix: b"",
+            fast: Vec::new(),
+        }
+    }
+    fn new_with_fast(_n: usize, fast_prefix: &'static [u8], fast_cap: usize) -> KeyMap {
+        // Canonical IDs live solely in `fast`; `slots` starts tiny and grows lazily if non-canonical IDs appear.
+        let cap = 16usize;
+        KeyMap {
+            slots: vec![(Key8::EMPTY, u32::MAX); cap],
+            len: 0,
             mask: cap - 1,
             fast_prefix,
             fast: vec![u32::MAX; fast_cap],
+        }
+    }
+    #[cold]
+    fn grow_slots(&mut self) {
+        let new_cap = (self.slots.len() * 2).max(32);
+        let old = std::mem::replace(&mut self.slots, vec![(Key8::EMPTY, u32::MAX); new_cap]);
+        self.mask = new_cap - 1;
+        for (k, v) in old {
+            if v != u32::MAX {
+                let mut i = k.hash(SEED_MAP) as usize & self.mask;
+                while self.slots[i].1 != u32::MAX {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = (k, v);
+            }
         }
     }
     fn insert(&mut self, k: &[u8], v: u32) {
@@ -244,7 +270,11 @@ impl KeyMap {
                 if self.fast[idx] == u32::MAX {
                     self.fast[idx] = v;
                 }
+                return;
             }
+        }
+        if self.len * 2 >= self.slots.len() {
+            self.grow_slots();
         }
         let key = Key8::new(k);
         let mut i = key.hash(SEED_MAP) as usize & self.mask;
@@ -252,6 +282,7 @@ impl KeyMap {
             let s = &mut self.slots[i];
             if s.1 == u32::MAX {
                 *s = (key, v);
+                self.len += 1;
                 return;
             }
             if s.0 == key {
@@ -380,13 +411,12 @@ struct PEv {
     pc: u32,
 }
 
-/// A valid click, sharded by person (48 bytes).
+/// A valid click, sharded by raw uid / canonical person (24 bytes).
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Click {
     person: Key8,
     cid: Key8,
-    phash: u64,
     ts: u32,
     camp: u32,
 }
@@ -422,7 +452,7 @@ struct Cl24 {
 
 const _: () = assert!(std::mem::size_of::<RawEv>() == 32);
 const _: () = assert!(std::mem::size_of::<PEv>() == 16);
-const _: () = assert!(std::mem::size_of::<Click>() == 32);
+const _: () = assert!(std::mem::size_of::<Click>() == 24);
 const _: () = assert!(std::mem::size_of::<Ev8>() == 8);
 const _: () = assert!(std::mem::size_of::<Cl24>() == 16);
 const _: () = assert!(arena::SEG / std::mem::size_of::<RawEv>() <= 512);
@@ -538,7 +568,9 @@ fn mark_losers<S: Slot + Default + Clone>(
                 }
                 let r = rptr.add(ri);
                 let h = (*r).ehash;
-                let tag = (h >> 25) as u8;
+                // Bits 17..23 are disjoint from both group index (bits 4..16) and u32 slot tag (bits 24..31),
+                // cutting false-positive DRAM probes by 128x vs reusing bits 25..31!
+                let tag = ((h >> 17) & 0x7F) as u8;
                 let me = ((si << 9) | ri) as u32;
                 let mut group = h as usize & group_mask;
                 'probe: loop {
@@ -622,12 +654,24 @@ fn new_user_cols(cap: usize) -> [Column; 6] {
     [
         Column::new("user_id", Kind::Str, cap),
         Column::new("day", Kind::Date, cap),
-        Column::new("sessions", Kind::I64, cap),
-        Column::new("events", Kind::I64, cap),
+        Column::new("sessions", Kind::I32, cap),
+        Column::new("events", Kind::I32, cap),
         Column::new("revenue_cents", Kind::I64, cap),
         Column::new("top_category", Kind::OptStr, cap),
     ]
 }
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct AggBin {
+    min_ts: u32,
+    max_ts: u32,
+    cnt: u32,
+    head: u32, // head index into `bin_purch`, or u32::MAX if no purchases in this bin
+}
+
+const AGG_BIN_EMPTY: AggBin = AggBin { min_ts: u32::MAX, max_ts: 0, cnt: 0, head: u32::MAX };
+const BIN_AGG_MIN_EVENTS: usize = 96;
 
 struct Worker<'a> {
     ctx: &'a Ctx,
@@ -646,6 +690,10 @@ struct Worker<'a> {
     touched: Vec<u32>,
     sess: Vec<Sess>,
     day_first: Vec<u32>,
+    /// L1-resident half-hour bins for fused 1-pass whale/heavy-user sessionization (672*16B = 10.75 KB).
+    agg_bins: Vec<AggBin>,
+    /// Intrusive per-bin linked list of purchases `(pc, next_idx)` (touched on only ~3% of events).
+    bin_purch: Vec<(u32, u32)>,
     cols: [Column; 6],
     done_cols: Vec<[Column; 6]>,
 }
@@ -669,6 +717,8 @@ impl<'a> Worker<'a> {
             touched: Vec::new(),
             sess: Vec::new(),
             day_first: vec![0; ndays + 1],
+            agg_bins: vec![AGG_BIN_EMPTY; ndays * 48],
+            bin_purch: Vec::new(),
             cols: new_user_cols(est_rows),
             done_cols: Vec::new(),
         }
@@ -737,27 +787,26 @@ impl<'a> Worker<'a> {
     }
 
     #[inline(always)]
-    fn flush_row(&mut self, person: Key8, day: u32, ns: u32, ne: u32, rev: u64) {
+    fn flush_row(&mut self, pslice: &[u8], day: u32, ns: u32, ne: u32, rev: u64) {
         let mut top = -1i32;
         let mut best = 0u64;
         for &c in &self.touched {
-            let v = self.cat_rev[c as usize];
+            let v = unsafe { *self.cat_rev.get_unchecked(c as usize) };
             if v > best || (v == best && (c as i32) < top) {
                 best = v;
                 top = c as i32;
             }
-            self.cat_rev[c as usize] = 0;
+            unsafe { *self.cat_rev.get_unchecked_mut(c as usize) = 0 };
         }
         self.touched.clear();
         if self.cols[0].len() == MAX_ROWS_PER_FILE {
             let prev = std::mem::replace(&mut self.cols, new_user_cols(32_768));
             self.done_cols.push(prev);
         }
-        let mut buf = [0u8; 16];
-        self.cols[0].push_str(person.as_slice(&mut buf));
+        self.cols[0].push_str(pslice);
         self.cols[1].push_date((self.ctx.day0 + day as i64) as i32);
-        self.cols[2].push_i64(ns as i64);
-        self.cols[3].push_i64(ne as i64);
+        self.cols[2].push_i32(ns as i32);
+        self.cols[3].push_i32(ne as i32);
         self.cols[4].push_i64(rev as i64);
         self.cols[5].push_opt_str(if top >= 0 { Some(self.ctx.cat_names[top as usize]) } else { None });
     }
@@ -785,9 +834,11 @@ impl<'a> Worker<'a> {
 
     /// One person: events in session-preserving order, clicks unsorted (sorted lazily when nsess >= 2).
     fn person(&mut self, person: Key8, evs: &[Ev8], clicks: &mut [Cl24], ctmp: &mut Vec<Cl24>) {
+        let mut pbuf = [0u8; 16];
+        let pslice = person.as_slice(&mut pbuf);
+        let day0ms = self.ctx.day0 * DAY_MS - self.ctx.base;
         if evs.len() == 1 && clicks.is_empty() {
             let e = unsafe { *evs.get_unchecked(0) };
-            let day0ms = self.ctx.day0 * DAY_MS - self.ctx.base;
             let day = ((e.ts() as i64 - day0ms) / DAY_MS) as u32;
             let pc = e.pc();
             let (rev, top_opt) = if pc != 0 {
@@ -800,43 +851,93 @@ impl<'a> Worker<'a> {
                 let prev = std::mem::replace(&mut self.cols, new_user_cols(32_768));
                 self.done_cols.push(prev);
             }
-            let mut buf = [0u8; 16];
-            self.cols[0].push_str(person.as_slice(&mut buf));
+            self.cols[0].push_str(pslice);
             self.cols[1].push_date((self.ctx.day0 + day as i64) as i32);
-            self.cols[2].push_i64(1);
-            self.cols[3].push_i64(1);
+            self.cols[2].push_i32(1);
+            self.cols[3].push_i32(1);
             self.cols[4].push_i64(rev as i64);
             self.cols[5].push_opt_str(top_opt);
             self.add_session(0, day as usize, pc != 0, rev);
             return;
         }
+        let e0 = unsafe { *evs.get_unchecked(0) };
+        let ts0 = e0.ts() as i64;
+        let mut day_idx = ((ts0 - day0ms) / DAY_MS) as u32;
+        let mut next_day_ms = day0ms + (day_idx as i64 + 1) * DAY_MS;
+        let mut cur_day = day_idx;
+        let (mut ns, mut ne, mut rev) = (1u32, 1u32, 0u64);
+        let mut prev = ts0;
+        let mut s_start = ts0;
+        let mut s_rev = 0u64;
+        let mut s_purch = false;
+        let pc0 = e0.pc();
+        if pc0 != 0 {
+            let (p, c) = self.price_cat(pc0);
+            s_rev = p;
+            s_purch = true;
+            rev = p;
+            self.touched.push(c as u32);
+            unsafe { *self.cat_rev.get_unchecked_mut(c) = p };
+        }
+        if clicks.is_empty() {
+            // Fast organic-only path: zero `self.sess` writes or second pass!
+            for &e in &evs[1..] {
+                let ts = e.ts() as i64;
+                if ts - prev > GAP_MS {
+                    self.add_session(0, cur_day as usize, s_purch, s_rev);
+                    s_rev = 0;
+                    s_purch = false;
+                    if ts >= next_day_ms {
+                        while ts >= next_day_ms {
+                            day_idx += 1;
+                            next_day_ms += DAY_MS;
+                        }
+                        self.flush_row(pslice, cur_day, ns, ne, rev);
+                        cur_day = day_idx;
+                        ns = 0;
+                        ne = 0;
+                        rev = 0;
+                    }
+                    ns += 1;
+                }
+                prev = ts;
+                ne += 1;
+                let pc = e.pc();
+                if pc != 0 {
+                    let (p, c) = self.price_cat(pc);
+                    s_rev += p;
+                    s_purch = true;
+                    rev += p;
+                    let cr = unsafe { self.cat_rev.get_unchecked_mut(c) };
+                    if *cr == 0 {
+                        self.touched.push(c as u32);
+                    }
+                    *cr += p;
+                }
+            }
+            self.add_session(0, cur_day as usize, s_purch, s_rev);
+            self.flush_row(pslice, cur_day, ns, ne, rev);
+            return;
+        }
         self.sess.clear();
-        let day0ms = self.ctx.day0 * DAY_MS - self.ctx.base;
-        let mut day_idx = 0u32;
-        let mut next_day_ms = day0ms + DAY_MS;
-        let mut cur_day = u32::MAX;
-        let (mut ns, mut ne, mut rev) = (0u32, 0u32, 0u64);
-        let mut prev = i64::MIN;
-        for &e in evs {
+        for &e in &evs[1..] {
             let ts = e.ts() as i64;
-            if self.sess.is_empty() || ts - prev > GAP_MS {
+            if ts - prev > GAP_MS {
+                self.sess.push(Sess { start: s_start, rev: s_rev, day: cur_day, purch: s_purch });
+                s_start = ts;
+                s_rev = 0;
+                s_purch = false;
                 if ts >= next_day_ms {
                     while ts >= next_day_ms {
                         day_idx += 1;
                         next_day_ms += DAY_MS;
                     }
-                }
-                let day = day_idx;
-                if day != cur_day {
-                    if cur_day != u32::MAX {
-                        self.flush_row(person, cur_day, ns, ne, rev);
-                    }
-                    cur_day = day;
+                    self.flush_row(pslice, cur_day, ns, ne, rev);
+                    cur_day = day_idx;
                     ns = 0;
                     ne = 0;
                     rev = 0;
                 }
-                self.sess.push(Sess { start: ts, rev: 0, day, purch: false });
                 ns += 1;
             }
             prev = ts;
@@ -844,26 +945,132 @@ impl<'a> Worker<'a> {
             let pc = e.pc();
             if pc != 0 {
                 let (p, c) = self.price_cat(pc);
-                let s = self.sess.last_mut().unwrap();
-                s.rev += p;
-                s.purch = true;
+                s_rev += p;
+                s_purch = true;
                 rev += p;
-                if self.cat_rev[c] == 0 {
+                let cr = unsafe { self.cat_rev.get_unchecked_mut(c) };
+                if *cr == 0 {
                     self.touched.push(c as u32);
                 }
-                self.cat_rev[c] += p;
+                *cr += p;
             }
         }
-        self.flush_row(person, cur_day, ns, ne, rev);
+        self.sess.push(Sess { start: s_start, rev: s_rev, day: cur_day, purch: s_purch });
+        self.flush_row(pslice, cur_day, ns, ne, rev);
+        self.attribute_clicks(clicks, ctmp);
+    }
 
-        if clicks.is_empty() {
-            let n_s = self.sess.len();
-            for j in 0..n_s {
-                let s = unsafe { *self.sess.get_unchecked(j) };
-                self.add_session(0, s.day as usize, s.purch, s.rev);
+    /// Fused 1-pass L1 half-hour bin sessionizer for persons with >= BIN_AGG_MIN_EVENTS
+    /// unsorted events: zero sorting, zero 8MB temp scatter, single sequential read over `evs`!
+    fn person_binned(&mut self, person: Key8, evs: &[Ev8], clicks: &mut [Cl24], ctmp: &mut Vec<Cl24>) {
+        let mut pbuf = [0u8; 16];
+        let pslice = person.as_slice(&mut pbuf);
+        let day0_off = (self.ctx.day0 * DAY_MS - self.ctx.base) as u32;
+        const GAP_U32: u32 = GAP_MS as u32;
+        let n_bins = self.agg_bins.len();
+        let bptr = self.agg_bins.as_mut_ptr();
+        self.bin_purch.clear();
+        let (mut first_b, mut last_b) = (n_bins, 0usize);
+
+        // Single sequential pass over unsorted `evs`, updating 10.75 KB L1-resident bins.
+        for &e in evs {
+            let ts = e.ts();
+            let b = ((ts - day0_off) / GAP_U32) as usize;
+            let bin = unsafe { &mut *bptr.add(b) };
+            if bin.cnt == 0 {
+                bin.min_ts = ts;
+                bin.max_ts = ts;
+                bin.cnt = 1;
+                first_b = first_b.min(b);
+                last_b = last_b.max(b);
+            } else {
+                if ts < bin.min_ts {
+                    bin.min_ts = ts;
+                }
+                if ts > bin.max_ts {
+                    bin.max_ts = ts;
+                }
+                bin.cnt += 1;
             }
+            let pc = e.pc();
+            if pc != 0 {
+                let idx = self.bin_purch.len() as u32;
+                self.bin_purch.push((pc, bin.head));
+                bin.head = idx;
+            }
+        }
+
+        // Walk at most ~672 bins in chronological order, resetting each visited bin in place.
+        let organic_only = clicks.is_empty();
+        if !organic_only {
+            self.sess.clear();
+        }
+        let mut have_sess = false;
+        let mut prev_max = i64::MIN;
+        let mut cur_day = 0u32;
+        let (mut ns, mut ne, mut rev) = (0u32, 0u32, 0u64);
+        let (mut s_start, mut s_rev, mut s_purch) = (0i64, 0u64, false);
+
+        for b in first_b..=last_b {
+            let bin = unsafe { *bptr.add(b) };
+            if bin.cnt == 0 {
+                continue;
+            }
+            unsafe { *bptr.add(b) = AGG_BIN_EMPTY };
+            let min_ts = bin.min_ts as i64;
+            if !have_sess || min_ts - prev_max > GAP_MS {
+                let new_day = (b / 48) as u32;
+                if have_sess {
+                    if organic_only {
+                        self.add_session(0, cur_day as usize, s_purch, s_rev);
+                    } else {
+                        self.sess.push(Sess { start: s_start, rev: s_rev, day: cur_day, purch: s_purch });
+                    }
+                    if new_day != cur_day {
+                        self.flush_row(pslice, cur_day, ns, ne, rev);
+                        cur_day = new_day;
+                        ns = 0;
+                        ne = 0;
+                        rev = 0;
+                    }
+                } else {
+                    have_sess = true;
+                    cur_day = new_day;
+                }
+                s_start = min_ts;
+                s_rev = 0;
+                s_purch = false;
+                ns += 1;
+            }
+            prev_max = bin.max_ts as i64;
+            ne += bin.cnt;
+            let mut pi = bin.head;
+            while pi != u32::MAX {
+                let (pc, next_pi) = unsafe { *self.bin_purch.get_unchecked(pi as usize) };
+                let (p, c) = self.price_cat(pc);
+                s_rev += p;
+                s_purch = true;
+                rev += p;
+                let cr = unsafe { self.cat_rev.get_unchecked_mut(c) };
+                if *cr == 0 {
+                    self.touched.push(c as u32);
+                }
+                *cr += p;
+                pi = next_pi;
+            }
+        }
+        if organic_only {
+            self.add_session(0, cur_day as usize, s_purch, s_rev);
+            self.flush_row(pslice, cur_day, ns, ne, rev);
             return;
         }
+        self.sess.push(Sess { start: s_start, rev: s_rev, day: cur_day, purch: s_purch });
+        self.flush_row(pslice, cur_day, ns, ne, rev);
+        self.attribute_clicks(clicks, ctmp);
+    }
+
+    #[inline(always)]
+    fn attribute_clicks(&mut self, clicks: &mut [Cl24], ctmp: &mut Vec<Cl24>) {
         let nsess = self.sess.len();
         if nsess == 1 {
             // Single-session O(n) fast path: zero click sorting, zero day_first, zero close().
@@ -1154,14 +1361,13 @@ struct SolveScratch {
     pkeys_h: Vec<u64>,
     canon: Vec<CanonInfo>,
     link_probe: Vec<(u32, u64)>,
-    miss_clicks: Vec<Click>,
+    miss_clicks: Vec<(Click, u64)>,
     miss_probe: Vec<u32>,
     ev_off: Vec<u32>,
     ev_cur: Vec<u32>,
     ev_pids: Vec<u32>,
     evs: Vec<Ev8>,
     etmp: Vec<Ev8>,
-    bins: timebins::Scratch,
     cl_off: Vec<u32>,
     cl_cur: Vec<u32>,
     cl_pids: Vec<u32>,
@@ -1185,7 +1391,6 @@ impl SolveScratch {
             ev_pids: Vec::new(),
             evs: Vec::new(),
             etmp: Vec::new(),
-            bins: timebins::Scratch::new(),
             cl_off: Vec::new(),
             cl_cur: Vec::new(),
             cl_pids: Vec::new(),
@@ -1347,13 +1552,21 @@ impl SolveScratch {
             let ht_mask = self.ht_mask;
             for seg in cs.iter() {
                 let slen = seg.len();
+                let pre = slen.min(PF);
+                for ri in 0..pre {
+                    let h = unsafe { seg.get_unchecked(ri).person.hash(SEED_A) };
+                    hring[ri] = h;
+                    prefetch(unsafe { ht_ptr.add(h as usize & ht_mask) } as *const u8);
+                }
                 for ri in 0..slen {
+                    let h = hring[ri & (PF - 1)];
                     if ri + PF < slen {
-                        let fh = unsafe { seg.get_unchecked(ri + PF).phash };
+                        let fh = unsafe { seg.get_unchecked(ri + PF).person.hash(SEED_A) };
+                        hring[(ri + PF) & (PF - 1)] = fh;
                         prefetch(unsafe { ht_ptr.add(fh as usize & ht_mask) } as *const u8);
                     }
                     let c = unsafe { seg.get_unchecked(ri) };
-                    if let Some(pid) = self.lookup(c.person, c.phash) {
+                    if let Some(pid) = self.lookup(c.person, h) {
                         self.cl_pids.push(pid);
                         unsafe { *self.cl_off.get_unchecked_mut(pid as usize) += 1 };
                         ncl_kept += 1;
@@ -1396,11 +1609,10 @@ impl SolveScratch {
         }
         cs.free();
 
-        // Process each person cleanly in L1/L2 cache
+        // Process each person cleanly in L1/L2 cache (fused 1-pass L1 bins for >= BIN_AGG_MIN_EVENTS!)
         for pid in 0..np {
             let es0 = unsafe { *self.ev_off.get_unchecked(pid) } as usize;
             let es1 = unsafe { *self.ev_off.get_unchecked(pid + 1) } as usize;
-            let ordered = self.bins.order(unsafe { self.evs.get_unchecked_mut(es0..es1) }, &mut self.etmp);
             let cls_slice: &mut [Cl24] = if ncl_kept > 0 {
                 let cs0 = unsafe { *self.cl_off.get_unchecked(pid) } as usize;
                 let cs1 = unsafe { *self.cl_off.get_unchecked(pid + 1) } as usize;
@@ -1408,11 +1620,18 @@ impl SolveScratch {
             } else {
                 &mut []
             };
-            w.person(unsafe { *self.pkeys.get_unchecked(pid) }, ordered, cls_slice, &mut self.ctmp);
+            let pkey = unsafe { *self.pkeys.get_unchecked(pid) };
+            let ev_slice = unsafe { self.evs.get_unchecked_mut(es0..es1) };
+            if ev_slice.len() >= BIN_AGG_MIN_EVENTS {
+                w.person_binned(pkey, ev_slice, cls_slice, &mut self.ctmp);
+            } else {
+                sort_person_events(ev_slice, &mut self.etmp);
+                w.person(pkey, ev_slice, cls_slice, &mut self.ctmp);
+            }
         }
     }
 
-    fn flush_miss_clicks(&mut self, links: &LinkTable, lcl_w: &mut Scatter<'_, Click>, l_shift: u32) {
+    fn flush_miss_clicks<const STAGE: usize>(&mut self, links: &LinkTable, lcl_w: &mut Scatter<'_, Click, STAGE>, l_shift: u32) {
         let nm = self.miss_clicks.len();
         if nm == 0 {
             return;
@@ -1420,33 +1639,33 @@ impl SolveScratch {
         const PF: usize = 8;
         self.miss_probe.clear();
         for i in 0..nm.min(PF) {
-            links.prefetch_bloom(unsafe { self.miss_clicks.get_unchecked(i).phash });
+            links.prefetch_bloom(unsafe { self.miss_clicks.get_unchecked(i).1 });
         }
         for i in 0..nm {
             if i + PF < nm {
-                links.prefetch_bloom(unsafe { self.miss_clicks.get_unchecked(i + PF).phash });
+                links.prefetch_bloom(unsafe { self.miss_clicks.get_unchecked(i + PF).1 });
             }
-            if links.maybe(unsafe { self.miss_clicks.get_unchecked(i).phash }) {
+            if links.maybe(unsafe { self.miss_clicks.get_unchecked(i).1 }) {
                 self.miss_probe.push(i as u32);
             }
         }
         let npr = self.miss_probe.len();
         for j in 0..npr.min(PF) {
             let idx = unsafe { *self.miss_probe.get_unchecked(j) as usize };
-            links.prefetch(unsafe { self.miss_clicks.get_unchecked(idx).phash });
+            links.prefetch(unsafe { self.miss_clicks.get_unchecked(idx).1 });
         }
         for j in 0..npr {
             if j + PF < npr {
                 let fidx = unsafe { *self.miss_probe.get_unchecked(j + PF) as usize };
-                links.prefetch(unsafe { self.miss_clicks.get_unchecked(fidx).phash });
+                links.prefetch(unsafe { self.miss_clicks.get_unchecked(fidx).1 });
             }
             let idx = unsafe { *self.miss_probe.get_unchecked(j) as usize };
-            let c = unsafe { *self.miss_clicks.get_unchecked(idx) };
-            if let Some(cp) = links.lookup(c.phash, c.person) {
+            let (c, h) = unsafe { *self.miss_clicks.get_unchecked(idx) };
+            if let Some(cp) = links.lookup(h, c.person) {
                 let ch = cp.hash(SEED_A);
                 lcl_w.push(
                     (ch >> l_shift) as usize,
-                    Click { person: cp, cid: c.cid, phash: ch, ts: c.ts, camp: c.camp },
+                    Click { person: cp, cid: c.cid, ts: c.ts, camp: c.camp },
                 );
             }
         }
@@ -1456,14 +1675,14 @@ impl SolveScratch {
     /// Two-tier solve Tier 1: raw-uid shard. Resolves each distinct uid ONCE in `links`,
     /// solves truly unlinked users immediately in place, and forwards linked users'
     /// events and clicks (including 0-event-in-shard linked clicks!) to Tier 2.
-    fn run_tier1_shard(
+    fn run_tier1_shard<const STAGE: usize>(
         &mut self,
         es: Segs<PEv>,
         cs: Segs<Click>,
         links: &LinkTable,
         w: &mut Worker<'_>,
-        lev_w: &mut Scatter<'_, PEv>,
-        lcl_w: &mut Scatter<'_, Click>,
+        lev_w: &mut Scatter<'_, PEv, STAGE>,
+        lcl_w: &mut Scatter<'_, Click, 192>,
         l_shift: u32,
     ) {
         if links.is_empty() {
@@ -1475,7 +1694,9 @@ impl SolveScratch {
             if cs.len() > 0 {
                 self.miss_clicks.clear();
                 for seg in cs.iter() {
-                    self.miss_clicks.extend_from_slice(seg);
+                    for &c in seg {
+                        self.miss_clicks.push((c, c.person.hash(SEED_A)));
+                    }
                 }
                 self.flush_miss_clicks(links, lcl_w, l_shift);
             }
@@ -1552,15 +1773,12 @@ impl SolveScratch {
             }
         }
 
-        // Prefix sum counts ONLY for unlinked users (canon[pid].key == EMPTY).
+        // Prefix sum counts for ALL users (branchless Pass 2 event grouping!).
         self.ev_off.clear();
         self.ev_off.resize(np + 1, 0);
         for e in &self.ht {
             if !e.key.is_empty() {
-                let pid = e.pid as usize;
-                if unsafe { self.canon.get_unchecked(pid).key.is_empty() } {
-                    unsafe { *self.ev_off.get_unchecked_mut(pid) = e.cnt };
-                }
+                unsafe { *self.ev_off.get_unchecked_mut(e.pid as usize) = e.cnt };
             }
         }
         let mut sum = 0u32;
@@ -1573,34 +1791,27 @@ impl SolveScratch {
             sum += cnt;
         }
         unsafe { *self.ev_off.get_unchecked_mut(np) = sum };
-        let nev_unlinked = sum as usize;
 
-        // Pass 2 over events: unlinked -> local Ev8 buffer; linked -> Tier-2 Scatter (zero re-hashing!)
+        // Pass 2 over events: branchlessly group ALL events into L2-resident Ev8 runs by pid.
         self.evs.clear();
-        self.evs.reserve(nev_unlinked);
+        self.evs.reserve(nev);
         let eo = self.evs.as_mut_ptr();
         let mut k = 0usize;
         for seg in es.iter() {
             for e in seg {
                 unsafe {
                     let pid = *self.ev_pids.get_unchecked(k) as usize;
-                    let ci = *self.canon.get_unchecked(pid);
-                    if ci.key.is_empty() {
-                        let dst = self.ev_cur.get_unchecked_mut(pid);
-                        eo.add(*dst as usize).write(Ev8::new(e.ts, e.pc));
-                        *dst += 1;
-                    } else {
-                        lev_w.push((ci.hash >> l_shift) as usize, PEv { person: ci.key, ts: e.ts, pc: e.pc });
-                    }
+                    let dst = self.ev_cur.get_unchecked_mut(pid);
+                    eo.add(*dst as usize).write(Ev8::new(e.ts, e.pc));
+                    *dst += 1;
                 }
                 k += 1;
             }
         }
-        unsafe { self.evs.set_len(nev_unlinked) };
+        unsafe { self.evs.set_len(nev) };
         es.free();
 
-        // Clicks: keep unlinked-with-events locally, forward linked directly (zero re-hashing),
-        // and pipeline 0-event-in-shard clicks through Bloom+Table prefetch!
+        // Clicks: group all in-ht clicks branchlessly by pid; pipeline 0-event-in-shard clicks through LinkTable.
         let ncl_raw = cs.len();
         self.cl_off.clear();
         self.cl_off.resize(np + 1, 0);
@@ -1613,28 +1824,27 @@ impl SolveScratch {
             let ht_mask = self.ht_mask;
             for seg in cs.iter() {
                 let slen = seg.len();
+                let pre = slen.min(PF);
+                for ri in 0..pre {
+                    let h = unsafe { seg.get_unchecked(ri).person.hash(SEED_A) };
+                    hring[ri] = h;
+                    prefetch(unsafe { ht_ptr.add(h as usize & ht_mask) } as *const u8);
+                }
                 for ri in 0..slen {
+                    let h = hring[ri & (PF - 1)];
                     if ri + PF < slen {
-                        let fh = unsafe { seg.get_unchecked(ri + PF).phash };
+                        let fh = unsafe { seg.get_unchecked(ri + PF).person.hash(SEED_A) };
+                        hring[(ri + PF) & (PF - 1)] = fh;
                         prefetch(unsafe { ht_ptr.add(fh as usize & ht_mask) } as *const u8);
                     }
                     let c = unsafe { seg.get_unchecked(ri) };
-                    if let Some(pid) = self.lookup(c.person, c.phash) {
-                        let ci = unsafe { *self.canon.get_unchecked(pid as usize) };
-                        if ci.key.is_empty() {
-                            self.cl_pids.push(pid);
-                            unsafe { *self.cl_off.get_unchecked_mut(pid as usize) += 1 };
-                            ncl_kept += 1;
-                        } else {
-                            self.cl_pids.push(u32::MAX);
-                            lcl_w.push(
-                                (ci.hash >> l_shift) as usize,
-                                Click { person: ci.key, cid: c.cid, phash: ci.hash, ts: c.ts, camp: c.camp },
-                            );
-                        }
+                    if let Some(pid) = self.lookup(c.person, h) {
+                        self.cl_pids.push(pid);
+                        unsafe { *self.cl_off.get_unchecked_mut(pid as usize) += 1 };
+                        ncl_kept += 1;
                     } else {
                         self.cl_pids.push(u32::MAX);
-                        self.miss_clicks.push(*c);
+                        self.miss_clicks.push((*c, h));
                     }
                 }
             }
@@ -1673,22 +1883,48 @@ impl SolveScratch {
         }
         cs.free();
 
-        // Solve all unlinked users immediately in Tier 1!
+        // Per distinct user: solve unlinked in place, or forward contiguous event & click runs to ONE hoisted Tier-2 shard!
         for pid in 0..np {
             let es0 = unsafe { *self.ev_off.get_unchecked(pid) } as usize;
             let es1 = unsafe { *self.ev_off.get_unchecked(pid + 1) } as usize;
-            if es0 == es1 {
-                continue;
-            }
-            let ordered = self.bins.order(unsafe { self.evs.get_unchecked_mut(es0..es1) }, &mut self.etmp);
-            let cls_slice: &mut [Cl24] = if ncl_kept > 0 {
-                let cs0 = unsafe { *self.cl_off.get_unchecked(pid) } as usize;
-                let cs1 = unsafe { *self.cl_off.get_unchecked(pid + 1) } as usize;
-                unsafe { self.cls.get_unchecked_mut(cs0..cs1) }
+            let ci = unsafe { *self.canon.get_unchecked(pid) };
+            if ci.key.is_empty() {
+                let cls_slice: &mut [Cl24] = if ncl_kept > 0 {
+                    let cs0 = unsafe { *self.cl_off.get_unchecked(pid) } as usize;
+                    let cs1 = unsafe { *self.cl_off.get_unchecked(pid + 1) } as usize;
+                    unsafe { self.cls.get_unchecked_mut(cs0..cs1) }
+                } else {
+                    &mut []
+                };
+                let pkey = unsafe { *self.pkeys.get_unchecked(pid) };
+                let ev_slice = unsafe { self.evs.get_unchecked_mut(es0..es1) };
+                if ev_slice.len() >= BIN_AGG_MIN_EVENTS {
+                    w.person_binned(pkey, ev_slice, cls_slice, &mut self.ctmp);
+                } else {
+                    sort_person_events(ev_slice, &mut self.etmp);
+                    w.person(pkey, ev_slice, cls_slice, &mut self.ctmp);
+                }
             } else {
-                &mut []
-            };
-            w.person(unsafe { *self.pkeys.get_unchecked(pid) }, ordered, cls_slice, &mut self.ctmp);
+                let sh = (ci.hash >> l_shift) as usize;
+                let cp = ci.key;
+                lev_w.push_mapped(sh, unsafe { self.evs.get_unchecked(es0..es1) }, |e| PEv {
+                    person: cp,
+                    ts: e.ts(),
+                    pc: e.pc(),
+                });
+                if ncl_kept > 0 {
+                    let cs0 = unsafe { *self.cl_off.get_unchecked(pid) } as usize;
+                    let cs1 = unsafe { *self.cl_off.get_unchecked(pid + 1) } as usize;
+                    if cs0 < cs1 {
+                        lcl_w.push_mapped(sh, unsafe { self.cls.get_unchecked(cs0..cs1) }, |c| Click {
+                            person: cp,
+                            cid: c.cid,
+                            ts: c.ts,
+                            camp: c.camp,
+                        });
+                    }
+                }
+            }
         }
     }
 }
@@ -1716,7 +1952,7 @@ fn manifest_value(m: &str, key: &str) -> i64 {
     parse_ts(rest[q..e].as_bytes()).unwrap_or_else(|| panic!("bad manifest {key}"))
 }
 
-fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
+fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const P_STAGE: usize>(
     ctx: &Ctx,
     link_files: &[&'static [u8]],
     event_files: &[&'static [u8]],
@@ -1724,7 +1960,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
     threads: usize,
     est_user_rows: usize,
     mark: &mut impl FnMut(&'static str),
-) -> Vec<(Vec<[Column; 6]>, Vec<CampAcc>)> {
+) -> (Vec<(Vec<[Column; 6]>, Vec<CampAcc>)>, LinkTable) {
     let id_shards: usize = 1 << ID_BITS;
     let id_shift: u32 = 64 - ID_BITS;
     let p_shards: usize = 1 << P_BITS;
@@ -1744,7 +1980,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
     } else {
         None
     };
-    let (links, ev_set, click_set, wide_store) = std::thread::scope(|s| {
+    let (links_owned, ev_set, click_set, wide_store) = std::thread::scope(|s| {
         let links_job = if links_sync.is_none() {
             let lt_threads = if ID_BITS >= 10 { (threads / 4).max(1) } else { 1 };
             Some(s.spawn(move || links::build_links(link_files, lt_threads)))
@@ -1752,7 +1988,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
             None
         };
         par(threads, |_| {
-            let mut w = Scatter::new(&id_set);
+            let mut w = Scatter::<RawEv, EV_STAGE>::new(&id_set);
             let oob_ref = &oob_ingest;
             let wide_ref = &wide_store;
             loop {
@@ -1826,7 +2062,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
         let next = AtomicUsize::new(0);
         let oob_slice = &oob_ingest[..];
         par(threads, |_| {
-            let mut w = Scatter::new(&ev_set);
+            let mut w = Scatter::<PEv, P_STAGE>::new(&ev_set);
             let (mut t32, mut t64): (Vec<u32>, Vec<u64>) = (Vec::new(), Vec::new());
             let mut ctrls: Vec<u8> = Vec::new();
             loop {
@@ -1867,7 +2103,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
         let click_set: ShardSet<Click> = ShardSet::new_shared(p_shards);
         let next = AtomicUsize::new(0);
         par(threads, |_| {
-            let mut w = Scatter::new(&click_set);
+            let mut w = Scatter::<Click, 192>::new(&click_set);
             let mut tok = fixed::Tok::default();
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
@@ -1890,7 +2126,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
                     let uh = uid_k.hash(SEED_A);
                     w.push(
                         (uh >> p_shift) as usize,
-                        Click { person: uid_k, cid: Key8::new(cid), phash: uh, ts: (ts - ctx.base) as u32, camp },
+                        Click { person: uid_k, cid: Key8::new(cid), ts: (ts - ctx.base) as u32, camp },
                     );
                 });
                 release_chunk(d);
@@ -1909,7 +2145,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
         };
         (lt, ev_set, click_set, wide_store)
     });
-    let links = &links;
+    let links = &links_owned;
 
     // ---- Two-tier solve: Tier 1 resolves distinct uids once, solves unlinked in place,
     // forwards linked to Tier 2; Tier 2 solves linked canonical persons in the same Workers!
@@ -1930,8 +2166,8 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
         let mut w = Worker::new(ctx, wide_slice, est_user_rows);
         let mut sc = SolveScratch::new();
         {
-            let mut lev_w = Scatter::new(&linked_ev_set);
-            let mut lcl_w = Scatter::new(&linked_cl_set);
+            let mut lev_w = Scatter::<PEv, 128>::new(&linked_ev_set);
+            let mut lcl_w = Scatter::<Click, 192>::new(&linked_cl_set);
             loop {
                 let k = next1.fetch_add(1, Ordering::Relaxed);
                 if k >= p_shards {
@@ -1948,7 +2184,6 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
         if bar.wait().is_leader() {
             ev_set.release_blocks();
             click_set.release_blocks();
-            links.release_pages();
             if !links.is_empty() {
                 let mut o2: Vec<(usize, usize)> = (0..l_shards)
                     .map(|p| (p, linked_ev_set.count(p) * 2 + linked_cl_set.count(p)))
@@ -1984,7 +2219,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
     linked_ev_set.free_all();
     linked_cl_set.free_all();
     mark("solve");
-    results
+    (results, links_owned)
 }
 
 fn main() {
@@ -2071,14 +2306,14 @@ fn main() {
     mark("init", &mut marks);
 
     let event_bytes: usize = event_files.iter().map(|d| d.len()).sum();
-    let est_user_rows: usize = (event_bytes / (threads * 500)).clamp(1024, 512_000);
+    let est_user_rows: usize = (event_bytes / (threads * 700)).clamp(1024, 512_000);
     let force_10 = env("FORCE_SHARD_BITS").as_deref() == Some("10");
-    let results = if force_10 || event_bytes > (2500 << 20) {
+    let (results, links_owned) = if force_10 || event_bytes > (2500 << 20) {
         let mut m = |name: &'static str| mark(name, &mut marks);
-        run_pipeline::<10, 10>(ctx, &link_files, &event_files, &click_files, threads, est_user_rows, &mut m)
+        run_pipeline::<10, 10, 64, 128>(ctx, &link_files, &event_files, &click_files, threads, est_user_rows, &mut m)
     } else {
         let mut m = |name: &'static str| mark(name, &mut marks);
-        run_pipeline::<9, 9>(ctx, &link_files, &event_files, &click_files, threads, est_user_rows, &mut m)
+        run_pipeline::<9, 9, 128, 128>(ctx, &link_files, &event_files, &click_files, threads, est_user_rows, &mut m)
     };
 
     // ---- write (pooled blocks are released in parallel meanwhile)
@@ -2096,7 +2331,10 @@ fn main() {
     let jobs = &jobs;
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
-        let freer = s.spawn(|| arena::release_all(threads));
+        let freer = s.spawn(|| {
+            links_owned.release_pages();
+            arena::release_all(threads);
+        });
         let h = s.spawn(|| {
             // campaign_daily reduce + write
             let mut tot = vec![CampAcc::default(); k1 * ctx.ndays];

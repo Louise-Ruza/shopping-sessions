@@ -265,7 +265,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
     let sides: ShardSet<LSide> = ShardSet::new_shared(SIDE_SHARDS);
     // Per thread: number of edges.
     let edges: Vec<usize> = par(threads, |t| {
-        let mut w = Scatter::new(&sides);
+        let mut w = Scatter::<LSide, 128>::new(&sides);
         let mut tok = fixed::Tok::default();
         let mut ne = 0u64;
         loop {
@@ -537,7 +537,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
 /// multi-thread CAS/spawn overhead AND unsharded DRAM hash-table thrashing.
 fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
     let sides: ShardSet<LSide> = ShardSet::new_shared(SIDE_SHARDS);
-    let mut w = Scatter::new(&sides);
+    let mut w = Scatter::<LSide, 128>::new(&sides);
     let mut tok = fixed::Tok::default();
     let mut ne = 0u64;
     for &d in files {

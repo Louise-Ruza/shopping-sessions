@@ -289,19 +289,31 @@ impl DateCache {
             let ep = event.as_ptr();
             let ip = ingest.as_ptr();
             unsafe {
-                if *ep.add(19) == b'Z'
-                    && *ip.add(19) == b'Z'
-                    && (ep as *const u64).read_unaligned() == (ip as *const u64).read_unaligned()
-                    && (ep.add(8) as *const u16).read_unaligned() == (ip.add(8) as *const u16).read_unaligned()
-                {
-                    if let Some(day_ms) = self.cached_day(event) {
-                        let ev_ms = if *ep.add(10) == b'T' {
-                            Self::clock_strict(ep.add(11)).map(|ms| day_ms + ms)
-                        } else {
-                            None
-                        };
-                        let ing_ms = Some(day_ms + Self::clock_fast(ip.add(11)));
-                        return (ev_ms, ing_ms);
+                if *ep.add(19) == b'Z' {
+                    let d0 = (*ep.add(8)).wrapping_sub(b'0');
+                    let d1 = (*ep.add(9)).wrapping_sub(b'0');
+                    let d = (d0 as u32 * 10 + d1 as u32) as usize;
+                    if ((non_digit_bits(d0) | non_digit_bits(d1)) & 0xF0) == 0 && d < 32 {
+                        let slot = *self.slots.get_unchecked(d);
+                        let ep_pref = (ep as *const u64).read_unaligned();
+                        if slot.prefix != 0 && ep_pref == slot.prefix {
+                            let day_ms = slot.day_ms;
+                            let ev_ms = if *ep.add(10) == b'T' {
+                                Self::clock_strict(ep.add(11)).map(|ms| day_ms + ms)
+                            } else {
+                                None
+                            };
+                            let ing_ms = if *ip.add(19) == b'Z'
+                                && (ip as *const u64).read_unaligned() == ep_pref
+                                && (ip.add(8) as *const u16).read_unaligned()
+                                    == (ep.add(8) as *const u16).read_unaligned()
+                            {
+                                Some(day_ms + Self::clock_fast(ip.add(11)))
+                            } else {
+                                self.parse_f1_ingest(ingest)
+                            };
+                            return (ev_ms, ing_ms);
+                        }
                     }
                 }
             }

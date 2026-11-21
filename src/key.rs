@@ -72,25 +72,18 @@ impl Key8 {
     #[inline(always)]
     pub fn new(s: &[u8]) -> Key8 {
         let n = s.len();
-        if n == 9 {
+        // Combined branchless fast path for lengths 8 and 9 (~99.8% of generator IDs).
+        if n == 9 || n == 8 {
             let p = s.as_ptr();
             unsafe {
                 let w = u64::from_be((p as *const u64).read_unaligned());
                 if let Some(p56) = pack8_ascii(w) {
-                    let b8 = *p.add(8);
+                    // Always in-bounds: index 8 for n==9, index 7 (already validated in 1..=127) for n==8.
+                    let b8 = *p.add(n - 1);
                     if b8.wrapping_sub(1) < 127 {
-                        return Key8((p56 << 7) | b8 as u64);
+                        let mask9 = 0u64.wrapping_sub((n == 9) as u64);
+                        return Key8((p56 << 7) | (b8 as u64 & mask9));
                     }
-                }
-            }
-            return Key8::overflow(s);
-        }
-        if n == 8 {
-            let p = s.as_ptr();
-            unsafe {
-                let w = u64::from_be((p as *const u64).read_unaligned());
-                if let Some(p56) = pack8_ascii(w) {
-                    return Key8(p56 << 7);
                 }
             }
             return Key8::overflow(s);
@@ -120,18 +113,36 @@ impl Key8 {
         mum(self.0 ^ seed ^ P0, self.0.wrapping_add(P1) ^ seed)
     }
 
-    /// The ID bytes; inline keys are decoded into `buf`.
+    /// The ID bytes; inline keys are decoded into `buf` (single BMI2 `pdep` on x86-64-v3).
     #[inline(always)]
     pub fn as_slice<'a>(&self, buf: &'a mut [u8; 16]) -> &'a [u8] {
         if self.is_inline() {
-            let mut v = self.0 << 1;
-            let mut len = 0usize;
-            while v != 0 {
-                unsafe { *buf.get_unchecked_mut(len) = (v >> 57) as u8 };
-                len += 1;
-                v <<= 7;
+            #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+            unsafe {
+                let be = core::arch::x86_64::_pdep_u64(self.0 >> 7, 0x7F7F_7F7F_7F7F_7F7F);
+                (buf.as_mut_ptr() as *mut u64).write_unaligned(be.to_be());
+                let b8 = (self.0 & 0x7F) as u8;
+                *buf.get_unchecked_mut(8) = b8;
+                let len = if b8 != 0 {
+                    9
+                } else if be == 0 {
+                    0
+                } else {
+                    8 - (be.trailing_zeros() >> 3) as usize
+                };
+                return buf.get_unchecked(..len);
             }
-            unsafe { buf.get_unchecked(..len) }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+            {
+                let mut v = self.0 << 1;
+                let mut len = 0usize;
+                while v != 0 {
+                    unsafe { *buf.get_unchecked_mut(len) = (v >> 57) as u8 };
+                    len += 1;
+                    v <<= 7;
+                }
+                unsafe { buf.get_unchecked(..len) }
+            }
         } else {
             overflow_store().get(self.0 & !OVF_BIT)
         }

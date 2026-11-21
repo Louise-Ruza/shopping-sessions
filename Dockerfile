@@ -2,25 +2,31 @@
 # The scorer builds this natively on linux/amd64 (Intel Xeon, Cascade Lake or
 # newer). No FROM line pins a platform, so it also builds natively on arm64.
 
-FROM rust:1.85-slim-bookworm AS build
+FROM rust:slim-bookworm AS build
 ARG TARGETARCH
 ARG ENABLE_PGO=1
 WORKDIR /src
+# Install llvm-tools in its own cached layer before copying src so rebuilds don't
+# re-fetch it and any transient download hiccup is retried loudly (never silent).
+RUN set -eu; \
+    if [ "$ENABLE_PGO" = "1" ]; then \
+        rustup component add llvm-tools-preview || rustup component add llvm-tools-preview || echo "WARN: llvm-tools-preview unavailable, will fall back to non-PGO"; \
+    fi
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # x86-64-v3 (AVX2/BMI1/BMI2/LZCNT/POPCNT) is available on every Haswell-or-newer
-# Xeon, including all scorer CPUs. AVX-512 is never required.
+# Xeon, including all scorer CPUs. Pure AVX2 avoids Cascade Lake AVX-512 downclocking.
 # Build-time PGO trains on a self-contained synthetic dataset (zero external
-# downloads) and falls back cleanly to a standard release build if llvm-tools
-# cannot be fetched offline.
+# downloads) and falls back cleanly if llvm-profdata is unavailable offline.
 RUN set -eu; \
     BASE_FLAGS=""; \
     if [ "$TARGETARCH" = "amd64" ] || [ "$(uname -m)" = "x86_64" ]; then \
         BASE_FLAGS="-C target-cpu=x86-64-v3"; \
     fi; \
-    if [ "$ENABLE_PGO" = "1" ] && rustup component add llvm-tools-preview >/dev/null 2>&1; then \
-        HOST="$(rustc -vV | sed -n 's/^host: //p')"; \
-        PROFDATA="$(rustc --print sysroot)/lib/rustlib/$HOST/bin/llvm-profdata"; \
+    HOST="$(rustc -vV | sed -n 's/^host: //p')"; \
+    PROFDATA="$(rustc --print sysroot)/lib/rustlib/$HOST/bin/llvm-profdata"; \
+    if [ "$ENABLE_PGO" = "1" ] && [ -x "$PROFDATA" ]; then \
+        echo "=== PGO: ENABLED (host=$HOST rustc=$(rustc --version)) ==="; \
         WORK="$(mktemp -d)"; \
         rustc -O src/pgo_gen.rs -o "$WORK/pgo_gen"; \
         "$WORK/pgo_gen" "$WORK/data1" 1729; \
@@ -35,6 +41,7 @@ RUN set -eu; \
         strip -o /shopping-sessions "target/$HOST/release/shopping-sessions"; \
         rm -rf "$WORK"; \
     else \
+        echo "=== PGO: FALLBACK (ENABLE_PGO=$ENABLE_PGO profdata=$PROFDATA) ==="; \
         RUSTFLAGS="$BASE_FLAGS" cargo build --release --locked; \
         strip -o /shopping-sessions target/release/shopping-sessions; \
     fi

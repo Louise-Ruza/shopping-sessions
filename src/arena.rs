@@ -15,10 +15,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 pub const BLOCK: usize = 2 << 20;
-/// Segment size: a multiple of 192 and 64 (so 16/24/32/48-byte records and
-/// staging flushes never straddle a segment).
-pub const SEG: usize = 85 * 192; // 16320
-pub const SEGS_PER_BLOCK: usize = BLOCK / SEG; // 128
+/// Segment size: a multiple of 256, 192, 128, and 64 (so 16/24/32/48-byte records
+/// and 128B/192B staging flushes never straddle a segment).
+pub const SEG: usize = 84 * 192; // 16128 = 63 * 256 = 126 * 128 = 252 * 64
+pub const SEGS_PER_BLOCK: usize = BLOCK / SEG; // 130
 const SLAB_BLOCKS: usize = 16;
 
 // ---------------------------------------------------------------------------
@@ -298,24 +298,14 @@ impl<T: Copy> ShardSet<T> {
 // ---------------------------------------------------------------------------
 // scatter writer
 
-const fn stage_bytes(sz: usize) -> usize {
-    if 64 % sz == 0 {
-        64
-    } else if 192 % sz == 0 {
-        192
-    } else {
-        panic!("unsupported record size")
-    }
-}
-
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct Line([u8; 64]);
 
 #[derive(Clone, Copy)]
 struct Cur {
-    ptr: usize, // current segment (0 = none)
-    off: u32,   // bytes written into it
+    dst: usize, // next write address in current segment (0 = none)
+    rem: u32,   // bytes remaining in current segment (0 = full/unallocated)
     fill: u32,  // records in staging
 }
 
@@ -325,7 +315,7 @@ struct GroupCur {
     blocks: Vec<usize>,
 }
 
-pub struct Scatter<'a, T: Copy> {
+pub struct Scatter<'a, T: Copy, const STAGE: usize = 64> {
     set: &'a ShardSet<T>,
     stage: Vec<Line>,
     cur: Vec<Cur>,
@@ -333,19 +323,22 @@ pub struct Scatter<'a, T: Copy> {
     gcur: Vec<GroupCur>,
 }
 
-impl<'a, T: Copy> Scatter<'a, T> {
+impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
     const SZ: usize = std::mem::size_of::<T>();
-    const STAGE: usize = stage_bytes(std::mem::size_of::<T>());
-    const LINES: usize = Self::STAGE / 64;
-    const PER: u32 = (Self::STAGE / std::mem::size_of::<T>()) as u32;
+    const LINES: usize = STAGE / 64;
+    const PER: u32 = (STAGE / std::mem::size_of::<T>()) as u32;
 
-    pub fn new(set: &'a ShardSet<T>) -> Scatter<'a, T> {
+    pub fn new(set: &'a ShardSet<T>) -> Scatter<'a, T, STAGE> {
+        const {
+            assert!(STAGE >= 64 && STAGE % 64 == 0 && STAGE % std::mem::size_of::<T>() == 0);
+            assert!(SEG % STAGE == 0);
+        }
         let n = set.len();
         let ng = set.groups.len();
         Scatter {
             set,
             stage: vec![Line([0; 64]); n * Self::LINES],
-            cur: vec![Cur { ptr: 0, off: 0, fill: 0 }; n],
+            cur: vec![Cur { dst: 0, rem: 0, fill: 0 }; n],
             nt: nt_enabled(),
             gcur: (0..ng).map(|_| GroupCur { block: 0, next_seg: SEGS_PER_BLOCK, blocks: Vec::new() }).collect(),
         }
@@ -366,6 +359,15 @@ impl<'a, T: Copy> Scatter<'a, T> {
         p
     }
 
+    #[cold]
+    #[inline(never)]
+    fn swap_seg(&mut self, s: usize, prev_end: usize) -> usize {
+        if prev_end != 0 {
+            self.set.push_seg(s, Seg { ptr: prev_end - SEG, n: (SEG / Self::SZ) as u32 });
+        }
+        self.alloc_local_seg(s)
+    }
+
     #[inline(always)]
     pub fn push(&mut self, s: usize, x: T) {
         unsafe {
@@ -379,46 +381,75 @@ impl<'a, T: Copy> Scatter<'a, T> {
         }
     }
 
+    /// Streams a contiguous slice of items into one fixed shard `s`, hoisting the
+    /// shard metadata and staging pointer out of the loop (used for Tier-1 -> Tier-2 runs).
+    #[inline(always)]
+    pub fn push_mapped<U: Copy>(&mut self, s: usize, items: &[U], mut map: impl FnMut(U) -> T) {
+        if items.is_empty() {
+            return;
+        }
+        unsafe {
+            let mut c = *self.cur.get_unchecked(s);
+            let st = (self.stage.as_mut_ptr().add(s * Self::LINES)) as *mut T;
+            let src = st as *const u8;
+            let nt = self.nt;
+            for &item in items {
+                st.add(c.fill as usize).write(map(item));
+                c.fill += 1;
+                if c.fill == Self::PER {
+                    let mut dst = c.dst;
+                    let mut rem = c.rem;
+                    if rem == 0 {
+                        dst = self.swap_seg(s, dst);
+                        rem = SEG as u32;
+                    }
+                    copy_stage(nt, dst as *mut u8, src, STAGE);
+                    c = Cur { dst: dst + STAGE, rem: rem - STAGE as u32, fill: 0 };
+                }
+            }
+            *self.cur.get_unchecked_mut(s) = c;
+        }
+    }
+
     #[inline(never)]
     fn flush(&mut self, s: usize) {
-        let c = self.cur[s];
-        let (mut ptr, mut off) = (c.ptr, c.off as usize);
-        if ptr == 0 || off == SEG {
-            if ptr != 0 {
-                self.set.push_seg(s, Seg { ptr, n: (SEG / Self::SZ) as u32 });
-            }
-            ptr = self.alloc_local_seg(s);
-            off = 0;
+        let c = unsafe { *self.cur.get_unchecked(s) };
+        let mut dst = c.dst;
+        let mut rem = c.rem;
+        if rem == 0 {
+            dst = self.swap_seg(s, dst);
+            rem = SEG as u32;
         }
         let src = unsafe { self.stage.as_ptr().add(s * Self::LINES) } as *const u8;
-        unsafe { copy_stage(self.nt, (ptr + off) as *mut u8, src, Self::STAGE) };
-        self.cur[s] = Cur { ptr, off: (off + Self::STAGE) as u32, fill: 0 };
+        unsafe { copy_stage(self.nt, dst as *mut u8, src, STAGE) };
+        unsafe {
+            *self.cur.get_unchecked_mut(s) = Cur { dst: dst + STAGE, rem: rem - STAGE as u32, fill: 0 };
+        }
     }
 
     /// Writes out every partial staging area and publishes all segments.
     pub fn finish(mut self) {
         for s in 0..self.cur.len() {
             let c = self.cur[s];
-            let (mut ptr, mut off) = (c.ptr, c.off as usize);
+            let (mut dst, mut rem) = (c.dst, c.rem as usize);
             if c.fill > 0 {
-                if ptr == 0 || off == SEG {
-                    if ptr != 0 {
-                        self.set.push_seg(s, Seg { ptr, n: (SEG / Self::SZ) as u32 });
-                    }
-                    ptr = self.alloc_local_seg(s);
-                    off = 0;
+                if rem == 0 {
+                    dst = self.swap_seg(s, dst);
+                    rem = SEG;
                 }
                 let bytes = c.fill as usize * Self::SZ;
                 unsafe {
                     let src = self.stage.as_ptr().add(s * Self::LINES) as *const u8;
-                    std::ptr::copy_nonoverlapping(src, (ptr + off) as *mut u8, bytes);
+                    std::ptr::copy_nonoverlapping(src, dst as *mut u8, bytes);
                 }
-                off += bytes;
+                dst += bytes;
+                rem -= bytes;
             }
-            if ptr != 0 {
-                self.set.push_seg(s, Seg { ptr, n: (off / Self::SZ) as u32 });
+            if dst != 0 {
+                let used = SEG - rem;
+                self.set.push_seg(s, Seg { ptr: dst - used, n: (used / Self::SZ) as u32 });
             }
-            self.cur[s] = Cur { ptr: 0, off: 0, fill: 0 };
+            self.cur[s] = Cur { dst: 0, rem: 0, fill: 0 };
         }
         sfence();
         for (g, gc) in self.gcur.iter().enumerate() {
@@ -465,6 +496,39 @@ unsafe fn copy_stage(nt: bool, dst: *mut u8, src: *const u8, bytes: usize) {
 #[target_feature(enable = "avx,avx2")]
 unsafe fn stream_avx2(dst: *mut u8, src: *const u8, bytes: usize) {
     use core::arch::x86_64::*;
+    if bytes == 64 {
+        let a = _mm256_load_si256(src as *const __m256i);
+        let b = _mm256_load_si256(src.add(32) as *const __m256i);
+        _mm256_stream_si256(dst as *mut __m256i, a);
+        _mm256_stream_si256(dst.add(32) as *mut __m256i, b);
+        return;
+    }
+    if bytes == 128 {
+        let a = _mm256_load_si256(src as *const __m256i);
+        let b = _mm256_load_si256(src.add(32) as *const __m256i);
+        let c = _mm256_load_si256(src.add(64) as *const __m256i);
+        let d = _mm256_load_si256(src.add(96) as *const __m256i);
+        _mm256_stream_si256(dst as *mut __m256i, a);
+        _mm256_stream_si256(dst.add(32) as *mut __m256i, b);
+        _mm256_stream_si256(dst.add(64) as *mut __m256i, c);
+        _mm256_stream_si256(dst.add(96) as *mut __m256i, d);
+        return;
+    }
+    if bytes == 192 {
+        let a = _mm256_load_si256(src as *const __m256i);
+        let b = _mm256_load_si256(src.add(32) as *const __m256i);
+        let c = _mm256_load_si256(src.add(64) as *const __m256i);
+        let d = _mm256_load_si256(src.add(96) as *const __m256i);
+        let e = _mm256_load_si256(src.add(128) as *const __m256i);
+        let f = _mm256_load_si256(src.add(160) as *const __m256i);
+        _mm256_stream_si256(dst as *mut __m256i, a);
+        _mm256_stream_si256(dst.add(32) as *mut __m256i, b);
+        _mm256_stream_si256(dst.add(64) as *mut __m256i, c);
+        _mm256_stream_si256(dst.add(96) as *mut __m256i, d);
+        _mm256_stream_si256(dst.add(128) as *mut __m256i, e);
+        _mm256_stream_si256(dst.add(160) as *mut __m256i, f);
+        return;
+    }
     let mut i = 0;
     while i < bytes {
         let a = _mm256_load_si256(src.add(i) as *const __m256i);
@@ -506,7 +570,7 @@ mod tests {
             for t in 0..4u64 {
                 let set = &set;
                 s.spawn(move || {
-                    let mut w = Scatter::new(set);
+                    let mut w = Scatter::<R48, 192>::new(set);
                     for i in 0..per_thread {
                         let shard = if i % 10 < 9 { 7 } else { (i % 256) as usize };
                         let v = t * 1_000_000 + i;
@@ -547,7 +611,7 @@ mod tests {
         // Freed blocks are reused by the next set.
         let before = mapped_bytes();
         let set2: ShardSet<R24> = ShardSet::new(4);
-        let mut w = Scatter::new(&set2);
+        let mut w = Scatter::<R24, 192>::new(&set2);
         for i in 0..100_000u64 {
             w.push((i % 3) as usize, R24 { a: i, b: !i, c: i ^ 5 });
         }
@@ -569,7 +633,7 @@ mod tests {
 
         // Shared-block ShardSet reuses blocks and returns all of them on free_all().
         let set3: ShardSet<R24> = ShardSet::new_shared(64);
-        let mut w3 = Scatter::new(&set3);
+        let mut w3 = Scatter::<R24, 192>::new(&set3);
         for i in 0..50_000u64 {
             w3.push((i % 64) as usize, R24 { a: i, b: !i, c: i ^ 9 });
         }
