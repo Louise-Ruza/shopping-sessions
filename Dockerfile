@@ -14,14 +14,13 @@ RUN set -eu; \
     fi
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-# x86-64-v3 (AVX2/BMI1/BMI2/LZCNT/POPCNT) is available on every Haswell-or-newer
-# Xeon, including all scorer CPUs. Pure AVX2 avoids Cascade Lake AVX-512 downclocking.
+# target-cpu=native tunes codegen for the build host's CPU.
 # Build-time PGO trains on a self-contained synthetic dataset (zero external
 # downloads) and falls back cleanly if llvm-profdata is unavailable offline.
 RUN set -eu; \
     BASE_FLAGS=""; \
     if [ "$TARGETARCH" = "amd64" ] || [ "$(uname -m)" = "x86_64" ]; then \
-        BASE_FLAGS="-C target-cpu=x86-64-v3 -C llvm-args=-x86-align-branch-boundary=32 -C llvm-args=-x86-align-branch=fused+jcc+jmp -C llvm-args=-align-all-functions=5"; \
+        BASE_FLAGS="-C target-cpu=native"; \
     fi; \
     HOST="$(rustc -vV | sed -n 's/^host: //p')"; \
     PROFDATA="$(rustc --print sysroot)/lib/rustlib/$HOST/bin/llvm-profdata"; \
@@ -51,6 +50,6 @@ FROM gcr.io/distroless/cc-debian12
 COPY --from=build /shopping-sessions /shopping-sessions
 # Scorer env: DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch NCPU=8 MEM_GB=24.
 # The binary writes only under OUTPUT_DIR and needs no writable root or /tmp.
-ENV DATA_DIR=/data OUTPUT_DIR=/output GLIBC_TUNABLES=glibc.malloc.hugetlb=1
+ENV DATA_DIR=/data OUTPUT_DIR=/output
 USER 1000:1000
 ENTRYPOINT ["/shopping-sessions"]
