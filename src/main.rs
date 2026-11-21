@@ -24,6 +24,8 @@ mod parquet;
 
 mod ts;
 
+mod small_sort;
+
 mod group_dedup;
 
 
@@ -33,7 +35,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use arena::{ShardSet, Scatter, Segs};
-use key::Key8;
+use key::{Key8, UserKey, ClickKey};
 use links::{prefetch, Resolver, SEED_A};
 use parquet::{Column, Kind};
 use ts::{parse_ts, DateCache, DAY_MS};
@@ -328,7 +330,7 @@ const INGEST_NONE: u32 = u32::MAX;
 #[repr(C)]
 struct RawEv {
     eid: Key8,
-    uid: Key8,
+    uid: UserKey,
     ts: u32,
     price: u32,
     ingest: u32,
@@ -393,7 +395,7 @@ fn ingest_less_slow(a: u32, b: u32, base: i64, oob: &[i64]) -> bool {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PEv {
-    person: Key8,
+    person: UserKey,
     ts: u32,
     pc: u32,
 }
@@ -402,8 +404,8 @@ struct PEv {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Click {
-    person: Key8,
-    cid: Key8,
+    person: UserKey,
+    cid: ClickKey,
     phash: u64,
     ts: u32,
     camp: u32,
@@ -433,7 +435,7 @@ impl Ev8 {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Cl24 {
-    cid: Key8,
+    cid: ClickKey,
     ts: u32,
     camp: u32,
 }
@@ -608,7 +610,9 @@ struct Worker<'a> {
     cat_rev: Vec<u64>,
     touched: Vec<u32>,
     sess: Vec<Sess>,
-    day_first: Vec<u32>,
+
+
+    day_end: Vec<u32>,
     cols: [Column; 6],
     done_cols: Vec<[Column; 6]>,
 
@@ -628,7 +632,9 @@ impl<'a> Worker<'a> {
             cat_rev: vec![0; ctx.cat_names.len()],
             touched: Vec::new(),
             sess: Vec::new(),
-            day_first: vec![0; ctx.ndays + 1],
+
+
+            day_end: vec![0; ctx.ndays],
             cols: new_user_cols(32_768),
             done_cols: Vec::new(),
 
@@ -647,7 +653,7 @@ impl<'a> Worker<'a> {
     }
 
     #[inline(always)]
-    fn flush_row(&mut self, person: Key8, day: u32, ns: u32, ne: u32, rev: u64) {
+    fn flush_row(&mut self, person: UserKey, day: u32, ns: u32, ne: u32, rev: u64) {
         let mut top = -1i32;
         let mut best = 0u64;
         for &c in &self.touched {
@@ -677,20 +683,22 @@ impl<'a> Worker<'a> {
         if a >= b {
             return;
         }
-        let first = self.sess[a as usize].day as usize;
-        let last = self.sess[b as usize - 1].day as usize;
-        for d in first..=last {
-            let lo = a.max(self.day_first[d]);
-            let hi = b.min(self.day_first[d + 1]);
-            if hi > lo {
-                self.acc[d * self.k1 + camp].assisted += hi - lo;
+
+        {
+            let mut i = a;
+            while i < b {
+                let day = self.sess[i as usize].day as usize;
+                let end = b.min(self.day_end[day]);
+                self.acc[day * self.k1 + camp].assisted += end - i;
+                i = end;
             }
         }
+
     }
 
     /// Event order preserves session boundaries and minima. It may be a full
     /// timestamp order or minimum-first/maximum-last order within time bins.
-    fn person(&mut self, person: Key8, evs: &[Ev8], clicks: &mut [Cl24], ctmp: &mut Vec<Cl24>) {
+    fn person(&mut self, person: UserKey, evs: &[Ev8], clicks: &mut [Cl24], ctmp: &mut Vec<Cl24>) {
         self.sess.clear();
         let day0ms = self.ctx.day0 * DAY_MS - self.ctx.base;
         let mut day_idx = 0u32;
@@ -753,17 +761,14 @@ impl<'a> Worker<'a> {
             }
             return;
         }
-        // day_first[d] = first session index with day >= d
         let nsess = self.sess.len();
-        {
-            let mut j = 0usize;
-            for d in 0..=self.ctx.ndays {
-                while j < nsess && (self.sess[j].day as usize) < d {
-                    j += 1;
-                }
-                self.day_first[d] = j as u32;
-            }
+        // Session days are monotone. Overwrite only occupied days. Every
+        // lookup starts at an actual session, so stale empty days are unread.
+
+        for (i, session) in self.sess.iter().enumerate() {
+            self.day_end[session.day as usize] = i as u32 + 1;
         }
+
         let n = clicks.len();
         let (mut cl, mut cr) = (0usize, 0usize);
         let mut latest_ts = i64::MIN;
@@ -860,6 +865,8 @@ fn radix_by_u32<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u32)
 
 #[inline(always)]
 fn sort_person_events(sl: &mut [Ev8], tmp: &mut Vec<Ev8>) {
+
+    if small_sort::try_sort(sl) { return; }
     let n = sl.len();
     if n < 2 {
         return;
@@ -939,7 +946,7 @@ impl EventRows for Segs<PEv> {
 struct SolveScratch {
     ht: Vec<u32>,
     ht_mask: usize,
-    pkeys: Vec<Key8>,
+    pkeys: Vec<UserKey>,
     ev_off: Vec<u32>,
     ev_cur: Vec<u32>,
     ev_pids: Vec<u32>,
@@ -980,7 +987,7 @@ impl SolveScratch {
     }
 
     #[inline(always)]
-    fn intern(&mut self, person: Key8, first_unknown: usize) -> u32 {
+    fn intern(&mut self, person: UserKey, first_unknown: usize) -> u32 {
         // Grow if load > 50%
         if (self.pkeys.len() - first_unknown) * 2 >= self.ht.len() {
             self.grow_ht(first_unknown);
@@ -1020,7 +1027,7 @@ impl SolveScratch {
     }
 
     #[inline(always)]
-    fn lookup(&self, person: Key8, phash: u64) -> Option<u32> {
+    fn lookup(&self, person: UserKey, phash: u64) -> Option<u32> {
         let mask = self.ht_mask;
         let mut i = phash as usize & mask;
         loop {
@@ -1197,6 +1204,7 @@ fn manifest_value(m: &str, key: &str) -> i64 {
 }
 
 fn main() {
+
     let t0 = Instant::now();
     let mut marks: Vec<(&str, f64)> = Vec::new();
     let mut last = t0;
@@ -1319,14 +1327,14 @@ fn main() {
 
                 let (event_ts, ingest) = ctx.dates.parse_event_ingest(f[2], f[3]);
 
-                let ek = Key8::new(eid);
+                let ek = Key8::event_id(eid);
                 let eh = ek.hash(SEED_ID);
 
 
                 let ing_u32 = enc_ingest_fast(ingest, ctx.base, oob_ref);
                 let mut r = RawEv {
                     eid: ek,
-                    uid: Key8::EMPTY,
+                    uid: UserKey::EMPTY,
                     ts: TS_INVALID,
                     price: 0,
                     ingest: ing_u32,
@@ -1373,7 +1381,7 @@ fn main() {
 
                     let late = ing - ts > LATE_MS;
                     if late { break 'v; }
-                    r.uid = Key8::new(uid);
+                    r.uid = UserKey::new(uid);
                     r.ts = (ts - ctx.base) as u32;
                     r.price = price_enc;
                 }
@@ -1398,7 +1406,7 @@ fn main() {
     par(threads, |_| {
         let mut w = Scatter::new(&ev_set);
         let mut res = Resolver::new(&links, Ev8(0));
-        let mut emit = |e: Ev8, person: Key8, phash: u64| {
+        let mut emit = |e: Ev8, person: UserKey, phash: u64| {
             w.push((phash >> (64 - P_BITS)) as usize, PEv { person, ts: e.ts(), pc: e.pc() });
         };
         let (mut t32, mut t64): (Vec<u32>, Vec<u64>) = (Vec::new(), Vec::new());
@@ -1456,10 +1464,10 @@ fn main() {
     let next = AtomicUsize::new(0);
     par(threads, |_| {
         let mut w = Scatter::new(&click_set);
-        let zero = Cl24 { cid: Key8::EMPTY, ts: 0, camp: 0 };
+        let zero = Cl24 { cid: ClickKey::EMPTY, ts: 0, camp: 0 };
         let mut res = Resolver::new(links, zero);
         let mut tok = fixed::Tok::default();
-        let mut emit = |c: Cl24, person: Key8, phash: u64| {
+        let mut emit = |c: Cl24, person: UserKey, phash: u64| {
             w.push((phash >> (64 - P_BITS)) as usize, Click { person, cid: c.cid, phash, ts: c.ts, camp: c.camp });
         };
         loop {
@@ -1479,8 +1487,8 @@ fn main() {
                     Some(t) if t >= cws && t < ctx.we => t,
                     _ => return,
                 };
-                let c = Cl24 { cid: Key8::new(cid), ts: (ts - ctx.base) as u32, camp };
-                res.push(c, Key8::new(uid), &mut emit);
+                let c = Cl24 { cid: ClickKey::new(cid), ts: (ts - ctx.base) as u32, camp };
+                res.push(c, UserKey::new(uid), &mut emit);
             });
             release_chunk(d);
         }
@@ -1607,5 +1615,6 @@ fn main() {
     }
     line.push_str(&format!(" threads={threads} simd={} peak_rss_mb={:.1}", csv::simd_backend(), peak_rss_mb()));
     eprintln!("{line}");
+
     std::process::exit(0);
 }

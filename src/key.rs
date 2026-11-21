@@ -43,6 +43,90 @@ const OVF_SHARDS: usize = 1 << OVF_SHARD_BITS;
 #[repr(transparent)]
 pub struct Key8(pub u64);
 
+// User/click namespaces are distinct types when specialized; catalog and
+// event keys keep Key8. Even identical raw payloads cannot cross these domains.
+
+
+
+pub type UserKey = PrefixedKey<b'u'>;
+
+pub type ClickKey = PrefixedKey<b'k'>;
+
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+#[repr(transparent)]
+pub struct PrefixedKey<const PREFIX: u8>(pub(crate) u64);
+
+
+impl<const PREFIX: u8> PrefixedKey<PREFIX> {
+    pub const EMPTY: Self = Self(0);
+
+    #[inline(always)]
+    pub fn new(s: &[u8]) -> Self {
+        #[inline(always)]
+        fn ascii_word(word: u64) -> bool {
+            (word | word.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080 == 0
+        }
+        let n = s.len();
+        if n == 9 && s[0] == PREFIX {
+            let word = u64::from_be_bytes(s[1..9].try_into().unwrap());
+            if ascii_word(word) { return Self(word); }
+        } else if n == 8 && s[0] == PREFIX {
+            let word = u64::from_be_bytes(s[..8].try_into().unwrap());
+            if ascii_word(word) { return Self(word << 8); }
+        } else if (2..8).contains(&n) && s[0] == PREFIX {
+            let mut word = 0u64;
+            for (i, &byte) in s[1..].iter().enumerate() {
+                if byte.wrapping_sub(1) >= 127 { return Self(Key8::overflow(s).0); }
+                word |= (byte as u64) << (56 - i * 8);
+            }
+            return Self(word);
+        } else if n == 0 {
+            return Self::EMPTY;
+        }
+        Self(Key8::overflow(s).0)
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool { self.0 == 0 }
+
+    #[inline(always)]
+    pub fn is_inline(&self) -> bool { self.0 & OVF_BIT == 0 }
+
+    #[inline(always)]
+    pub fn hash(&self, seed: u64) -> u64 {
+        mum(self.0 ^ seed ^ P0, self.0.wrapping_add(P1) ^ seed)
+    }
+
+    #[inline(always)]
+    pub fn as_slice<'a>(&self, buf: &'a mut [u8; 16]) -> &'a [u8] {
+        if self.0 & OVF_BIT != 0 { return overflow_store().get(self.0 & !OVF_BIT); }
+        if self.0 == 0 { return &buf[..0]; }
+        let bytes = self.0.to_be_bytes();
+        let len = 8 - self.0.trailing_zeros() as usize / 8;
+        buf[0] = PREFIX;
+        buf[1..9].copy_from_slice(&bytes);
+        &buf[..len + 1]
+    }
+
+    #[inline(always)]
+    pub fn cmp_bytes(&self, other: &Self) -> Ordering {
+        if ((self.0 | other.0) & OVF_BIT) == 0 { return self.0.cmp(&other.0); }
+        self.cmp_slow(other)
+    }
+
+    #[cold]
+    fn cmp_slow(&self, other: &Self) -> Ordering {
+        if self == other { return Ordering::Equal; }
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        self.as_slice(&mut a).cmp(other.as_slice(&mut b))
+    }
+}
+
+// Reserved internal tokens are consumed only by dense_people and resolved to
+// real UserKey names before comparison/output. Nonempty prefix keys >= 2^56.
+
+
 /// Pack eight big-endian nonzero ASCII bytes directly into 56 ordered bits.
 
 #[inline(always)]
@@ -61,6 +145,41 @@ fn pack8_ascii(word: u64) -> Option<u64> {
 
 impl Key8 {
     pub const EMPTY: Key8 = Key8(0);
+
+    /// Equality/hash-only event-ID namespace. Never compare these with `new`
+    /// keys or pass them to `as_slice`/`cmp_bytes`: inline event keys deliberately
+    /// use a different representation. All production callers reject empty raw
+    /// event IDs before this constructor. Fallbacks (including direct empty
+    /// test inputs) are exact interned strings, tagged outside the inline range.
+
+    #[inline(always)]
+    pub fn event_id(s: &[u8]) -> Key8 {
+        #[inline(always)]
+        fn ascii_word(word: u64) -> bool {
+            (word | word.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080 == 0
+        }
+        let n = s.len();
+        if n == 9 && s[0] == b'e' {
+            // The explicit length guard proves that all eight suffix bytes exist.
+            let word = u64::from_be_bytes(s[1..9].try_into().unwrap());
+            if ascii_word(word) { return Key8(word); }
+        } else if n == 8 && s[0] == b'e' {
+            // Validate the known nonzero prefix together with seven suffix bytes,
+            // then discard that prefix and append one padding byte.
+            let word = u64::from_be_bytes(s[..8].try_into().unwrap());
+            if ascii_word(word) { return Key8(word << 8); }
+        } else if (2..8).contains(&n) && s[0] == b'e' {
+            let mut word = 0u64;
+            for (i, &byte) in s[1..].iter().enumerate() {
+                if byte.wrapping_sub(1) >= 127 { return Key8::overflow(s); }
+                word |= (byte as u64) << (56 - i * 8);
+            }
+            return Key8(word);
+        }
+        Key8::overflow(s)
+    }
+
+
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
@@ -200,6 +319,158 @@ impl OverflowStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn user_and_click_domains_roundtrip_all_bytes_and_keep_widths() {
+        fn check<const PREFIX: u8>() {
+            let mut seen: HashMap<u64, Vec<u8>> = HashMap::new();
+            let mut verify = |s: &[u8]| {
+                let key = PrefixedKey::<PREFIX>::new(s);
+                let mut buf = [0; 16];
+                assert_eq!(key.as_slice(&mut buf), s);
+                assert_eq!(key, PrefixedKey::<PREFIX>::new(&s.to_vec()));
+                let inline = s.is_empty() || ((2..=9).contains(&s.len()) && s[0] == PREFIX
+                    && s[1..].iter().all(|&b| b != 0 && b < 128));
+                assert_eq!(key.is_inline(), inline, "{s:?}");
+                assert_eq!(key.is_empty(), s.is_empty());
+                if !s.is_empty() && inline { assert!(key.0 >= 1u64 << 56); }
+                if let Some(old) = seen.insert(key.0, s.to_vec()) { assert_eq!(old, s); }
+            };
+            verify(b"");
+            for len in 1..=12 {
+                let mut s = vec![b'a'; len]; s[0] = PREFIX;
+                verify(&s);
+                for pos in 0..len {
+                    let old = s[pos];
+                    for byte in 0..=255u8 { s[pos] = byte; verify(&s); }
+                    s[pos] = old;
+                }
+            }
+        }
+        check::<b'u'>(); check::<b'k'>();
+        assert_eq!(std::mem::size_of::<UserKey>(), 8);
+        assert_eq!(std::mem::size_of::<ClickKey>(), 8);
+        assert_eq!(std::mem::size_of::<crate::RawEv>(), 32);
+        assert_eq!(std::mem::size_of::<crate::PEv>(), 16);
+        assert_eq!(std::mem::size_of::<crate::Click>(), 32);
+        assert_eq!(std::mem::size_of::<crate::Cl24>(), 16);
+    }
+
+
+    #[test]
+    fn prefix_domains_order_inline_overflow_and_empty_exactly() {
+        fn check<const PREFIX: u8>() {
+            let mut strings = vec![vec![], vec![PREFIX]];
+            for first in 0..=255u8 {
+                strings.push(vec![first]);
+                strings.push(vec![PREFIX, first]);
+            }
+            for suffix in [b"a".as_slice(), b"a\0", b"a\0\0", b"\0a", b"\x01", b"\x7f",
+                b"1234567", b"12345678", b"123456789", b"a-long-identifier", "é".as_bytes()] {
+                let mut s = vec![PREFIX]; s.extend_from_slice(suffix); strings.push(s);
+            }
+            let keys: Vec<_> = strings.iter().map(|s| PrefixedKey::<PREFIX>::new(s)).collect();
+            for (i, a) in keys.iter().enumerate() {
+                for (j, b) in keys.iter().enumerate() {
+                    assert_eq!(a == b, strings[i] == strings[j]);
+                    assert_eq!(a.cmp_bytes(b), strings[i].cmp(&strings[j]), "{:?} {:?}", strings[i], strings[j]);
+                    if a == b { assert_eq!(a.hash(17), b.hash(17)); }
+                }
+            }
+        }
+        check::<b'u'>(); check::<b'k'>();
+        // Deliberately equal payloads belong to different typed namespaces.
+        assert_eq!(UserKey::new(b"u12345678").0, ClickKey::new(b"k12345678").0);
+        let mut b = [0; 16];
+        assert_eq!(Key8::new(b"u12345678").as_slice(&mut b), b"u12345678");
+    }
+
+
+    #[test]
+    fn prefix_key_short_loads_do_not_cross_guard_pages() {
+        unsafe {
+            let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            let ptr = libc::mmap(std::ptr::null_mut(), 2 * page, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0);
+            assert_ne!(ptr, libc::MAP_FAILED);
+            let bytes = ptr.cast::<u8>();
+            assert_eq!(libc::mprotect(bytes.add(page).cast(), page, libc::PROT_NONE), 0);
+            for prefix in [b'u', b'k'] {
+                for len in 0..=12 {
+                    let start = bytes.add(page - len);
+                    for i in 0..len { start.add(i).write(if i == 0 { prefix } else { b'a' }); }
+                    let s = std::slice::from_raw_parts(start, len);
+                    let mut b = [0; 16];
+                    if prefix == b'u' { assert_eq!(UserKey::new(s).as_slice(&mut b), s); }
+                    else { assert_eq!(ClickKey::new(s).as_slice(&mut b), s); }
+                }
+            }
+            assert_eq!(libc::munmap(ptr, 2 * page), 0);
+        }
+    }
+
+
+    #[test]
+    fn event_keys_are_exact_across_prefix_lengths_and_all_byte_values() {
+        assert_eq!(std::mem::size_of::<Key8>(), 8);
+        assert_eq!(std::mem::size_of::<crate::RawEv>(), 32);
+        let mut seen: HashMap<u64, Vec<u8>> = HashMap::new();
+        let mut check = |s: &[u8]| {
+            let key = Key8::event_id(s);
+            let inline = (2..=9).contains(&s.len()) && s[0] == b'e'
+                && s[1..].iter().all(|&c| c != 0 && c < 128);
+            assert_eq!(key.is_inline(), inline, "{s:?}");
+            if inline {
+                let mut expected = [0u8; 8]; expected[..s.len()-1].copy_from_slice(&s[1..]);
+                assert_eq!(key.0, u64::from_be_bytes(expected));
+                assert_ne!(key, Key8::EMPTY);
+            } else {
+                assert_eq!(overflow_store().get(key.0 & !OVF_BIT), s);
+            }
+            assert_eq!(key, Key8::event_id(&s.to_vec()));
+            if let Some(old) = seen.insert(key.0, s.to_vec()) { assert_eq!(old, s); }
+        };
+        check(b"");
+        for fill in [1u8, 127] {
+            for n in 1..=12 {
+                let mut s = vec![fill; n]; s[0] = b'e';
+                check(&s);
+                for position in 0..n {
+                    let old = s[position];
+                    for byte in 0..=255u8 { s[position] = byte; check(&s); }
+                    s[position] = old;
+                }
+            }
+        }
+        for s in [b"e".as_slice(), b"ea", b"ea\0", b"ea\0\0", b"e\0a", b"e\0\x01", b"e\x01\0",
+            b"e1234567", b"e12345678", b"e123456789", b"12345678", b"E12345678", b"e- _\r\x7f", "eé".as_bytes()] {
+            check(s);
+        }
+    }
+
+
+    #[test]
+    fn event_key_short_loads_stop_before_an_inaccessible_page() {
+        unsafe {
+            let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            let ptr = libc::mmap(std::ptr::null_mut(), 2*page, libc::PROT_READ|libc::PROT_WRITE,
+                libc::MAP_PRIVATE|libc::MAP_ANON, -1, 0);
+            assert_ne!(ptr, libc::MAP_FAILED);
+            let bytes = ptr.cast::<u8>();
+            assert_eq!(libc::mprotect(bytes.add(page).cast(), page, libc::PROT_NONE), 0);
+            for n in 0..=12 {
+                let start = bytes.add(page-n);
+                for i in 0..n { start.add(i).write(if i==0 {b'e'} else {b'a'+i as u8}); }
+                let s = std::slice::from_raw_parts(start, n);
+                let expected = Key8::event_id(&s.to_vec());
+                assert_eq!(Key8::event_id(s), expected);
+            }
+            assert_eq!(libc::munmap(ptr, 2*page), 0);
+        }
+    }
+
+
 
 
     #[test]

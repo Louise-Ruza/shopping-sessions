@@ -122,7 +122,7 @@ pub(super) fn mark_losers<S: Slot + Default + Clone>(
 # [cfg (test)]
 mod tests {
     use super::*;
-    use crate::{arena::{Scatter, ShardSet}, key::Key8, INGEST_NONE, INGEST_OOB_BASE, TS_INVALID};
+    use crate::{arena::{Scatter, ShardSet}, key::{Key8, UserKey}, INGEST_NONE, INGEST_OOB_BASE, TS_INVALID};
 
     fn shard(rows: &[RawEv]) -> Segs<RawEv> {
         let set = ShardSet::new(1);
@@ -133,7 +133,7 @@ mod tests {
     }
 
     fn row(id: &[u8], ingest: u32, h: u32) -> RawEv {
-        RawEv { eid: Key8::new(id), uid: Key8::new(b"u"), ts: 10, price: 0, ingest, ehash: h }
+        RawEv { eid: Key8::event_id(id), uid: UserKey::new(b"u"), ts: 10, price: 0, ingest, ehash: h }
     }
 
     fn check<S: Slot + Default + Clone>(rows: &[RawEv], table: &mut Vec<S>, controls: &mut Vec<u8>) {
@@ -191,7 +191,7 @@ mod tests {
         for n in [0, 1, 15, 17, 80, 1200, 2, 700] {
             let mut rows: Vec<_> = (0..n).map(|i| row(format!("event-{i}\0long").as_bytes(), 100, 0xffff_fff0)).collect();
             for i in (0..n).step_by(3) {
-                let mut copy = rows[i]; copy.ingest = 50; copy.uid = Key8::new(b"changed-person");
+                let mut copy = rows[i]; copy.ingest = 50; copy.uid = UserKey::new(b"changed-person");
                 if i % 2 == 0 { copy.ts = TS_INVALID; }
                 rows.push(copy);
             }
@@ -202,13 +202,14 @@ mod tests {
 
     #[test]
     fn ingestion_ties_oob_invalid_and_missing_winners() {
-        let ids: &[&[u8]] = &[b"a", b"a\0", b"a\r", b"a-long-identifier", "é".as_bytes()];
+        let ids: &[&[u8]] = &[b"a", b"a\0", b"a\r", b"a-long-identifier", "é".as_bytes(),
+            b"e", b"ea", b"ea\0", b"ea\0\0", b"e1234567", b"e12345678", b"e123456789"];
         let mut rows = Vec::new();
         for &id in ids {
             for (i, ingest) in [INGEST_NONE, INGEST_OOB_BASE+2, 5, INGEST_OOB_BASE+1,
                 INGEST_OOB_BASE, INGEST_OOB_BASE, 0].into_iter().enumerate() {
                 let mut r = row(id, ingest, 0); r.ts = if i == 4 { TS_INVALID } else { 10 };
-                r.uid = Key8::new(if i % 2 == 0 { b"a" } else { b"z" }); rows.push(r);
+                r.uid = UserKey::new(if i % 2 == 0 { b"a" } else { b"z" }); rows.push(r);
             }
         }
         check(&rows, &mut Vec::<u32>::new(), &mut Vec::new());

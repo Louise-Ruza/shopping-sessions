@@ -51,7 +51,7 @@ impl Index {
     }
 
     #[inline(always)]
-    fn build<const WIDE: bool, M: Fn(&[u8; 64]) -> (u64, u64, u64)>(&mut self, data: &[u8], masks: &M) {
+    fn build<const WIDE: bool, M: Fn(&[u8; 64]) -> (u64, u64, u64), P: Fn(u64) -> u64>(&mut self, data: &[u8], masks: &M, prefix: &P) {
         self.nc = 0;
         self.nl = 0;
         let mut before = 0u64;
@@ -86,16 +86,8 @@ impl Index {
             let edges = (delimiters << 1) | previous_delimiter
                 | (delimiters >> 1) | next_delimiter;
             let bad = quotes & !edges;
-            let mut parity = quotes;
-            if quotes != 0 {
-                parity ^= parity << 1;
-                parity ^= parity << 2;
-                parity ^= parity << 4;
-                parity ^= parity << 8;
-                parity ^= parity << 16;
-                parity ^= parity << 32;
-            }
-            parity ^= carry;
+            // Preserve the existing zero-quote bypass, including block carry.
+            let parity = if quotes == 0 { 0 } else { prefix(quotes) } ^ carry;
             let odd = parity & delimiters;
             self.quotes[block] = Quotes { bad, odd, before };
             before += ((bad.count_ones() as u64) << 32) + odd.count_ones() as u64;
@@ -153,6 +145,23 @@ impl Index {
 }
 
 #[inline(always)]
+fn prefix_scalar(mut q: u64) -> u64 {
+    q ^= q << 1; q ^= q << 2; q ^= q << 4;
+    q ^= q << 8; q ^= q << 16; q ^= q << 32;
+    q
+}
+
+# [cfg (target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "pclmulqdq")]
+unsafe fn prefix_clmul(q: u64) -> u64 {
+    use core::arch::x86_64::*;
+    // The low64 product bits against all ones are cumulative XOR of q's bits.
+    let bits = _mm_cvtsi64_si128(q as i64);
+    _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(bits, _mm_set1_epi64x(-1))) as u64
+}
+
+#[inline(always)]
 fn spill<const FIRST: usize>(out: &mut [Position], count: &mut usize, base: usize, mut bits: u64) {
     let n = bits.count_ones() as usize;
     let mut i = *count;
@@ -192,14 +201,14 @@ fn scalar_masks(bytes: &[u8; 64]) -> (u64, u64, u64) {
 }
 
 #[inline(always)]
-fn scan_with<'a, const N: usize, const WIDE: bool, F: FnMut(&[&'a [u8]; N]), M: Fn(&[u8; 64]) -> (u64, u64, u64)>(
-    mut data: &'a [u8], mut f: F, masks: M,
+fn scan_with<'a, const N: usize, const WIDE: bool, F: FnMut(&[&'a [u8]; N]), M: Fn(&[u8; 64]) -> (u64, u64, u64), P: Fn(u64) -> u64>(
+    mut data: &'a [u8], mut f: F, masks: M, prefix: P,
 ) {
     debug_assert!(N == 4 || N == 7);
     let mut index = Index::new(data.len());
     while !data.is_empty() {
         let size = data.len().min(BATCH);
-        index.build::<WIDE, _>(&data[..size], &masks);
+        index.build::<WIDE, _, _>(&data[..size], &masks, &prefix);
         let consumed = index.emit::<N, F>(&data[..size], &mut f);
         if consumed == 0 {
             // Unbounded rows and final non-LF tails stay on the validated general
@@ -219,23 +228,39 @@ pub(super) fn scan<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8],
     if super::simd_backend() == "avx2" {
 
         if wide::available() {
+
+            if is_x86_feature_detected!("pclmulqdq") {
+                unsafe { wide::scan_wide_clmul::<N, F>(data, f) };
+                return;
+            }
             unsafe { wide::scan_wide::<N, F>(data, f) };
             return;
         }
         if is_x86_feature_detected!("popcnt") {
+
+            if is_x86_feature_detected!("pclmulqdq") {
+                unsafe { scan_avx2_clmul::<N, F>(data, f) };
+                return;
+            }
             unsafe { scan_avx2::<N, F>(data, f) };
         } else {
             super::scan_baseline::<N, F>(data, f);
         }
         return;
     }
-    scan_with::<N, false, F, _>(data, f, scalar_masks);
+    scan_with::<N, false, F, _, _>(data, f, scalar_masks, prefix_scalar);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,popcnt")]
 unsafe fn scan_avx2<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) {
-    scan_with::<N, false, F, _>(data, f, |bytes| unsafe { avx2_masks(bytes) });
+    scan_with::<N, false, F, _, _>(data, f, |bytes| unsafe { avx2_masks(bytes) }, prefix_scalar);
+}
+
+# [cfg (target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,popcnt,pclmulqdq")]
+unsafe fn scan_avx2_clmul<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) {
+    scan_with::<N, false, F, _, _>(data, f, |bytes| avx2_masks(bytes), |q| prefix_clmul(q));
 }
 
 # [cfg (target_arch = "x86_64")]
@@ -249,11 +274,21 @@ mod wide {
 
     #[target_feature(enable = "avx512f,avx512bw,avx512vbmi2,popcnt")]
     pub(super) unsafe fn scan_wide<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) {
-        super::scan_with::<N, true, F, _>(data, f, |bytes| {
-            let v = _mm512_loadu_si512(bytes.as_ptr().cast());
-            let mask = |b| _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b));
-            (mask(b',' as i8), mask(b'\n' as i8), mask(b'"' as i8))
-        });
+        super::scan_with::<N, true, F, _, _>(data, f, |bytes| masks(bytes), super::prefix_scalar);
+    }
+
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi2,popcnt,pclmulqdq")]
+    pub(super) unsafe fn scan_wide_clmul<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) {
+        super::scan_with::<N, true, F, _, _>(data, f, |bytes| masks(bytes), |q| super::prefix_clmul(q));
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn masks(bytes: &[u8; 64]) -> (u64, u64, u64) {
+        let v = _mm512_loadu_si512(bytes.as_ptr().cast());
+        let mask = |b| _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b));
+        (mask(b',' as i8), mask(b'\n' as i8), mask(b'"' as i8))
     }
 
     #[inline]
@@ -294,6 +329,31 @@ unsafe fn avx2_masks(bytes: &[u8; 64]) -> (u64, u64, u64) {
 mod tests {
     use super::*;
 
+
+    fn polynomial_prefix(q: u64) -> u64 {
+        let mut product = 0;
+        for bit in 0..64 {
+            if q >> bit & 1 != 0 { product ^= u64::MAX << bit; }
+        }
+        product
+    }
+
+
+    #[test]
+    fn polynomial_prefix_matches_scalar_basis_and_mixed_masks() {
+        let mut state = 1u64;
+        for i in 0..4162 {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            let q = match i { 0 => 0, 1 => u64::MAX, 2..=65 => 1u64 << (i - 2), _ => state };
+            let expected = polynomial_prefix(q);
+            assert_eq!(prefix_scalar(q), expected);
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("pclmulqdq") {
+                assert_eq!(unsafe { prefix_clmul(q) }, expected);
+            }
+        }
+    }
+
     fn check<const N: usize>(input: &[u8]) {
         let mut expected = Vec::new();
         super::super::scan_byte_oracle::<N, _>(input, |f| {
@@ -305,10 +365,18 @@ mod tests {
         });
         assert_eq!(baseline, expected, "baseline input={input:?}");
         let mut scalar = Vec::new();
-        scan_with::<N, false, _, _>(input, |f| {
+        scan_with::<N, false, _, _, _>(input, |f| {
             scalar.push(f.iter().map(|x| x.to_vec()).collect::<Vec<_>>());
-        }, scalar_masks);
+        }, scalar_masks, prefix_scalar);
         assert_eq!(scalar, expected, "structural scalar input={input:?}");
+
+        {
+            let mut polynomial = Vec::new();
+            scan_with::<N, false, _, _, _>(input, |f| {
+                polynomial.push(f.iter().map(|x| x.to_vec()).collect::<Vec<_>>());
+            }, scalar_masks, polynomial_prefix);
+            assert_eq!(polynomial, expected, "polynomial quote input={input:?}");
+        }
         let mut selected = Vec::new();
         scan::<N, _>(input, |f| {
             selected.push(f.iter().map(|x| x.to_vec()).collect::<Vec<_>>());
