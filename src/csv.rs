@@ -10,6 +10,9 @@
 #[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
 
+#[cfg(feature = "fast-schema")]
+mod fast_schema;
+
 const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 
 #[inline(always)]
@@ -183,6 +186,16 @@ pub fn simd_backend() -> &'static str {
 /// with the unquoted fields of every well-formed line with exactly N fields.
 #[inline(always)]
 pub fn scan<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) {
+    #[cfg(feature = "fast-schema")]
+    if N == 4 || N == 7 {
+        fast_schema::scan::<N, F>(data, f);
+        return;
+    }
+    scan_baseline::<N, F>(data, f);
+}
+
+#[inline(always)]
+fn scan_baseline<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) {
     #[cfg(target_arch = "x86_64")]
     {
         if *USE_AVX2.get_or_init(|| {
@@ -200,7 +213,7 @@ pub fn scan<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) 
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi1,bmi2")]
+#[target_feature(enable = "avx2,bmi1")]
 unsafe fn scan_avx2<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], mut f: F) {
     use core::arch::x86_64::*;
 

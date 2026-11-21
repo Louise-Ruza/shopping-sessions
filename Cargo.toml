@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+fast-schema = []
+fast-fields = []
+default = ["fast-schema", "fast-fields"]
+
 [[bin]]
 name = "shopping-sessions"
 path = "src/main.rs"

@@ -1,6 +1,6 @@
 //! Shopping Sessions pipeline.
 //!
-//! Stages: init (manifest, products, campaigns, mmaps) -> links (exact Key16
+//! Stages: init (manifest, products, campaigns, mmaps) -> links (exact Key8
 //! interning, lock-free union-find, LinkTable + Bloom) -> clicks (parse, validate,
 //! resolve person, scatter to person shards) -> events (parse, validate, scatter a
 //! compact RawEv to event_id shards) -> dedup (per event_id shard: exact dedup,
@@ -26,8 +26,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use arena::{ShardSet, Scatter, Segs};
-use key::Key16;
-use links::{prefetch, LinkTable, Resolver, SEED_A};
+use key::Key8;
+use links::{prefetch, Resolver, SEED_A};
 use parquet::{Column, Kind};
 use ts::{parse_price, parse_ts, DateCache, DAY_MS};
 
@@ -181,20 +181,20 @@ pub(crate) fn release_chunk(d: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// inline Key16 string maps (products, campaigns) — zero pointer chase to CSV
+// inline Key8 string maps (products, campaigns) — zero pointer chase to CSV
 
 struct KeyMap {
-    slots: Vec<(Key16, u32)>,
+    slots: Vec<(Key8, u32)>,
     mask: usize,
 }
 
 impl KeyMap {
     fn new(n: usize) -> KeyMap {
         let cap = (n * 2).next_power_of_two().max(16);
-        KeyMap { slots: vec![(Key16::EMPTY, u32::MAX); cap], mask: cap - 1 }
+        KeyMap { slots: vec![(Key8::EMPTY, u32::MAX); cap], mask: cap - 1 }
     }
     fn insert(&mut self, k: &[u8], v: u32) {
-        let key = Key16::new(k);
+        let key = Key8::new(k);
         let mut i = key.hash(SEED_MAP) as usize & self.mask;
         loop {
             let s = &mut self.slots[i];
@@ -210,7 +210,7 @@ impl KeyMap {
     }
     #[inline(always)]
     fn get(&self, k: &[u8]) -> Option<u32> {
-        let key = Key16::new(k);
+        let key = Key8::new(k);
         let mut i = key.hash(SEED_MAP) as usize & self.mask;
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
@@ -253,8 +253,8 @@ const INGEST_NONE: u32 = u32::MAX;
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct RawEv {
-    eid: Key16,
-    uid: Key16,
+    eid: Key8,
+    uid: Key8,
     ts: u32,
     price: u32,
     ingest: u32,
@@ -313,7 +313,7 @@ fn ingest_less_slow(a: u32, b: u32, base: i64, oob: &[i64]) -> bool {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PEv {
-    person: Key16,
+    person: Key8,
     ts: u32,
     pc: u32,
 }
@@ -322,8 +322,8 @@ struct PEv {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Click {
-    person: Key16,
-    cid: Key16,
+    person: Key8,
+    cid: Key8,
     phash: u64,
     ts: u32,
     camp: u32,
@@ -353,16 +353,17 @@ impl Ev8 {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Cl24 {
-    cid: Key16,
+    cid: Key8,
     ts: u32,
     camp: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<RawEv>() == 48);
-const _: () = assert!(std::mem::size_of::<PEv>() == 24);
-const _: () = assert!(std::mem::size_of::<Click>() == 48);
+const _: () = assert!(std::mem::size_of::<RawEv>() == 32);
+const _: () = assert!(std::mem::size_of::<PEv>() == 16);
+const _: () = assert!(std::mem::size_of::<Click>() == 32);
 const _: () = assert!(std::mem::size_of::<Ev8>() == 8);
-const _: () = assert!(std::mem::size_of::<Cl24>() == 24);
+const _: () = assert!(std::mem::size_of::<Cl24>() == 16);
+const _: () = assert!(arena::SEG / std::mem::size_of::<RawEv>() <= 512);
 
 struct Ctx {
     ws: i64,
@@ -555,7 +556,7 @@ impl<'a> Worker<'a> {
     }
 
     #[inline(always)]
-    fn flush_row(&mut self, person: Key16, day: u32, ns: u32, ne: u32, rev: u64) {
+    fn flush_row(&mut self, person: Key8, day: u32, ns: u32, ne: u32, rev: u64) {
         let mut top = -1i32;
         let mut best = 0u64;
         for &c in &self.touched {
@@ -597,7 +598,7 @@ impl<'a> Worker<'a> {
     }
 
     /// One person: events sorted by ts, clicks sorted by (ts, click_id).
-    fn person(&mut self, person: Key16, evs: &[Ev8], clicks: &[Cl24]) {
+    fn person(&mut self, person: Key8, evs: &[Ev8], clicks: &[Cl24]) {
         self.sess.clear();
         let day0ms = self.ctx.day0 * DAY_MS - self.ctx.base;
         let mut day_idx = 0u32;
@@ -819,11 +820,24 @@ fn sort_person_clicks(sl: &mut [Cl24], tmp: &mut Vec<Cl24>) {
     }
 }
 
+/// Both ordinary and provisionally routed events expose only surviving rows.
+trait EventRows {
+    fn len(&self) -> usize;
+    fn rows(&self) -> impl Iterator<Item = &PEv>;
+    fn free(self);
+}
+
+impl EventRows for Segs<PEv> {
+    fn len(&self) -> usize { Segs::len(self) }
+    fn rows(&self) -> impl Iterator<Item = &PEv> { self.iter().flatten() }
+    fn free(self) { Segs::free(self); }
+}
+
 /// Scratch buffers reused across all shards handled by one solve worker.
 struct SolveScratch {
     ht: Vec<u32>,
     ht_mask: usize,
-    pkeys: Vec<Key16>,
+    pkeys: Vec<Key8>,
     ev_off: Vec<u32>,
     ev_cur: Vec<u32>,
     ev_pids: Vec<u32>,
@@ -862,7 +876,7 @@ impl SolveScratch {
     }
 
     #[inline(always)]
-    fn intern(&mut self, person: Key16) -> u32 {
+    fn intern(&mut self, person: Key8) -> u32 {
         // Grow if load > 50%
         if self.pkeys.len() * 2 >= self.ht.len() {
             self.grow_ht();
@@ -902,7 +916,7 @@ impl SolveScratch {
     }
 
     #[inline(always)]
-    fn lookup(&self, person: Key16, phash: u64) -> Option<u32> {
+    fn lookup(&self, person: Key8, phash: u64) -> Option<u32> {
         let mask = self.ht_mask;
         let mut i = phash as usize & mask;
         loop {
@@ -918,7 +932,7 @@ impl SolveScratch {
         }
     }
 
-    fn run_shard(&mut self, es: Segs<PEv>, cs: Segs<Click>, w: &mut Worker<'_>) {
+    fn run_shard(&mut self, es: impl EventRows, cs: Segs<Click>, w: &mut Worker<'_>) {
         let nev = es.len();
         if nev == 0 {
             es.free();
@@ -933,12 +947,10 @@ impl SolveScratch {
         self.ev_pids.clear();
         self.ev_pids.reserve(nev);
 
-        // Pass 1 over events: intern exact Key16 persons in L1/L2 hash table
-        for seg in es.iter() {
-            for e in seg {
-                let pid = self.intern(e.person);
-                self.ev_pids.push(pid);
-            }
+        // Pass 1 over events: intern exact Key8 persons in L1/L2 hash table
+        for e in es.rows() {
+            let pid = self.intern(e.person);
+            self.ev_pids.push(pid);
         }
         let np = self.pkeys.len();
 
@@ -959,16 +971,14 @@ impl SolveScratch {
         self.evs.reserve(nev);
         let eo = self.evs.as_mut_ptr();
         let mut k = 0usize;
-        for seg in es.iter() {
-            for e in seg {
-                unsafe {
-                    let pid = *self.ev_pids.get_unchecked(k) as usize;
-                    let dst = self.ev_cur.get_unchecked_mut(pid);
-                    eo.add(*dst as usize).write(Ev8::new(e.ts, e.pc));
-                    *dst += 1;
-                }
-                k += 1;
+        for e in es.rows() {
+            unsafe {
+                let pid = *self.ev_pids.get_unchecked(k) as usize;
+                let dst = self.ev_cur.get_unchecked_mut(pid);
+                eo.add(*dst as usize).write(Ev8::new(e.ts, e.pc));
+                *dst += 1;
             }
+            k += 1;
         }
         unsafe { self.evs.set_len(nev) };
         es.free();
@@ -1158,130 +1168,138 @@ fn main() {
     mark("links", &mut marks);
 
     // ---- events: parse + validate, scatter one RawEv per line by event_id
-    let chunks = make_chunks(&event_files, chunk_target(&event_files, threads));
-    let id_set: ShardSet<RawEv> = ShardSet::new(ID_SHARDS);
-    let oob_ingest: Mutex<Vec<i64>> = Mutex::new(Vec::new());
-    let wide_store: Mutex<Vec<(u32, u16)>> = Mutex::new(Vec::new());
-    let next = AtomicUsize::new(0);
-    par(threads, |_| {
-        let mut w = Scatter::new(&id_set);
-        let oob_ref = &oob_ingest;
-        let wide_ref = &wide_store;
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= chunks.len() {
-                break;
-            }
-            let d = chunks[i].data;
-            populate(d);
-            csv::scan::<7, _>(d, |f| {
-                let eid = f[0];
-                if eid.is_empty() {
-                    return;
+    let (ev_set, wide_store) = {
+        let chunks = make_chunks(&event_files, chunk_target(&event_files, threads));
+        let id_set: ShardSet<RawEv> = ShardSet::new(ID_SHARDS);
+        let oob_ingest: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+        let wide_store: Mutex<Vec<(u32, u16)>> = Mutex::new(Vec::new());
+        let next = AtomicUsize::new(0);
+        par(threads, |_| {
+            let mut w = Scatter::new(&id_set);
+            let oob_ref = &oob_ingest;
+            let wide_ref = &wide_store;
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= chunks.len() {
+                    break;
                 }
-                let ingest = ctx.dates.parse_f1_ingest(f[3]);
-                let ek = Key16::new(eid);
-                let eh = ek.hash(SEED_ID);
-                let ing_u32 = enc_ingest_fast(ingest, ctx.base, oob_ref);
-                let mut r = RawEv {
-                    eid: ek,
-                    uid: Key16::EMPTY,
-                    ts: TS_INVALID,
-                    price: 0,
-                    ingest: ing_u32,
-                    ehash: eh as u32,
-                };
-                'v: {
-                    let Some(ing) = ingest else { break 'v };
-                    let uid = f[1];
-                    if uid.is_empty() || f[5].is_empty() {
-                        break 'v;
+                let d = chunks[i].data;
+                populate(d);
+                csv::scan::<7, _>(d, |f| {
+                    let eid = f[0];
+                    if eid.is_empty() {
+                        return;
                     }
-                    let ts = match ctx.dates.parse_ts(f[2]) {
-                        Some(t) if t >= ctx.ws && t < ctx.we => t,
-                        _ => break 'v,
+                    #[cfg(feature = "fast-fields")]
+                    let (event_ts, ingest) = ctx.dates.parse_event_ingest(f[2], f[3]);
+                    #[cfg(not(feature = "fast-fields"))]
+                    let ingest = ctx.dates.parse_f1_ingest(f[3]);
+                    let ek = Key8::new(eid);
+                    let eh = ek.hash(SEED_ID);
+                    let ing_u32 = enc_ingest_fast(ingest, ctx.base, oob_ref);
+                    let mut r = RawEv {
+                        eid: ek,
+                        uid: Key8::EMPTY,
+                        ts: TS_INVALID,
+                        price: 0,
+                        ingest: ing_u32,
+                        ehash: eh as u32,
                     };
-                    let mut price_enc = 0u32;
-                    match f[4] {
-                        b"view" | b"cart" => {}
-                        b"purchase" => {
-                            let price = parse_price(f[6]);
-                            if price == 0 {
-                                break 'v;
-                            }
-                            let cat = ctx.products.get(f[5]).unwrap_or(ctx.unknown_cat);
-                            price_enc = if !ctx.wide {
-                                (price << 8) | cat
-                            } else {
-                                let mut g = wide_ref.lock().unwrap();
-                                g.push((price, cat as u16));
-                                g.len() as u32
-                            };
+                    'v: {
+                        let Some(ing) = ingest else { break 'v };
+                        let uid = f[1];
+                        if uid.is_empty() || f[5].is_empty() {
+                            break 'v;
                         }
-                        _ => break 'v,
+                        #[cfg(not(feature = "fast-fields"))]
+                        let event_ts = ctx.dates.parse_ts(f[2]);
+                        let ts = match event_ts {
+                            Some(t) if t >= ctx.ws && t < ctx.we => t,
+                            _ => break 'v,
+                        };
+                        let mut price_enc = 0u32;
+                        match f[4] {
+                            b"view" | b"cart" => {}
+                            b"purchase" => {
+                                let price = parse_price(f[6]);
+                                if price == 0 {
+                                    break 'v;
+                                }
+                                let cat = ctx.products.get(f[5]).unwrap_or(ctx.unknown_cat);
+                                price_enc = if !ctx.wide {
+                                    (price << 8) | cat
+                                } else {
+                                    let mut g = wide_ref.lock().unwrap();
+                                    g.push((price, cat as u16));
+                                    g.len() as u32
+                                };
+                            }
+                            _ => break 'v,
+                        }
+                        if ing - ts > LATE_MS {
+                            break 'v;
+                        }
+                        r.uid = Key8::new(uid);
+                        r.ts = (ts - ctx.base) as u32;
+                        r.price = price_enc;
                     }
-                    if ing - ts > LATE_MS {
-                        break 'v;
-                    }
-                    r.uid = Key16::new(uid);
-                    r.ts = (ts - ctx.base) as u32;
-                    r.price = price_enc;
-                }
-                w.push((eh >> (64 - ID_BITS)) as usize, r);
-            });
-            release_chunk(d);
-        }
-        w.finish();
-    });
-    let oob_ingest = oob_ingest.into_inner().unwrap();
-    let wide_store = wide_store.into_inner().unwrap();
-    mark("events", &mut marks);
+                    w.push((eh >> (64 - ID_BITS)) as usize, r);
+                });
+                release_chunk(d);
+            }
+            w.finish();
+        });
+        let oob_ingest = oob_ingest.into_inner().unwrap();
+        let wide_store = wide_store.into_inner().unwrap();
+        mark("events", &mut marks);
 
-    // ---- dedup (exact event_id) fused with person resolution and person scatter
-    let ev_set: ShardSet<PEv> = ShardSet::new_shared(P_SHARDS);
-    let next = AtomicUsize::new(0);
-    let oob_slice = &oob_ingest[..];
-    par(threads, |_| {
-        let mut w = Scatter::new(&ev_set);
-        let mut res = Resolver::new(links, Ev8(0));
-        let mut emit = |e: Ev8, person: Key16, phash: u64| {
-            w.push((phash >> (64 - P_BITS)) as usize, PEv { person, ts: e.ts(), pc: e.pc() });
-        };
-        let (mut t32, mut t64): (Vec<u32>, Vec<u64>) = (Vec::new(), Vec::new());
-        let mut loser: Vec<u64> = Vec::new();
-        loop {
-            let s = next.fetch_add(1, Ordering::Relaxed);
-            if s >= ID_SHARDS {
-                break;
-            }
-            let segs = id_set.take(s);
-            let nseg = segs.segs.len();
-            assert!(nseg < (1 << 22), "event_id shard too large");
-            let n = segs.len();
-            let cap = (n + n / 2).next_power_of_two().max(16);
-            loser.clear();
-            loser.resize((nseg << 9).div_ceil(64), 0);
-            if nseg < (1 << 15) - 1 {
-                mark_losers(&segs, &mut t32, cap, &mut loser, ctx.base, oob_slice);
-            } else {
-                mark_losers(&segs, &mut t64, cap, &mut loser, ctx.base, oob_slice);
-            }
-            for si in 0..nseg {
-                for (ri, r) in segs.seg(si).iter().enumerate() {
-                    let me = (si << 9) | ri;
-                    if r.ts == TS_INVALID || (loser[me >> 6] >> (me & 63)) & 1 != 0 {
-                        continue;
-                    }
-                    res.push(Ev8::new(r.ts, r.price), r.uid, &mut emit);
+        // ---- dedup (exact event_id) fused with person resolution and person scatter
+        let ev_set: ShardSet<PEv> = ShardSet::new_shared(P_SHARDS);
+        let next = AtomicUsize::new(0);
+        let oob_slice = &oob_ingest[..];
+        par(threads, |_| {
+            let mut w = Scatter::new(&ev_set);
+            let mut res = Resolver::new(links, Ev8(0));
+            let mut emit = |e: Ev8, person: Key8, phash: u64| {
+                w.push((phash >> (64 - P_BITS)) as usize, PEv { person, ts: e.ts(), pc: e.pc() });
+            };
+            let (mut t32, mut t64): (Vec<u32>, Vec<u64>) = (Vec::new(), Vec::new());
+            let mut loser: Vec<u64> = Vec::new();
+            loop {
+                let s = next.fetch_add(1, Ordering::Relaxed);
+                if s >= ID_SHARDS {
+                    break;
                 }
+                let segs = id_set.take(s);
+                let nseg = segs.segs.len();
+                assert!(nseg < (1 << 22), "event_id shard too large");
+                let n = segs.len();
+                let cap = (n + n / 2).next_power_of_two().max(16);
+                loser.clear();
+                loser.resize((nseg << 9).div_ceil(64), 0);
+                if nseg < (1 << 15) - 1 {
+                    mark_losers(&segs, &mut t32, cap, &mut loser, ctx.base, oob_slice);
+                } else {
+                    mark_losers(&segs, &mut t64, cap, &mut loser, ctx.base, oob_slice);
+                }
+                for si in 0..nseg {
+                    for (ri, r) in segs.seg(si).iter().enumerate() {
+                        let me = (si << 9) | ri;
+                        if r.ts == TS_INVALID || (loser[me >> 6] >> (me & 63)) & 1 != 0 {
+                            continue;
+                        }
+                        res.push(Ev8::new(r.ts, r.price), r.uid, &mut emit);
+                    }
+                }
+                segs.free();
             }
-            segs.free();
-        }
-        res.drain(&mut emit);
-        w.finish();
-    });
-    id_set.free_all();
-    mark("dedup", &mut marks);
+            res.drain(&mut emit);
+            w.finish();
+        });
+        id_set.free_all();
+        mark("dedup", &mut marks);
+        (ev_set, wide_store)
+    };
 
     // ---- clicks: parse, validate, resolve person, scatter by person
     //      Runs after dedup so click_set reuses 100% pre-faulted 2 MB blocks from id_set!
@@ -1291,9 +1309,9 @@ fn main() {
     let next = AtomicUsize::new(0);
     par(threads, |_| {
         let mut w = Scatter::new(&click_set);
-        let zero = Cl24 { cid: Key16::EMPTY, ts: 0, camp: 0 };
+        let zero = Cl24 { cid: Key8::EMPTY, ts: 0, camp: 0 };
         let mut res = Resolver::new(links, zero);
-        let mut emit = |c: Cl24, person: Key16, phash: u64| {
+        let mut emit = |c: Cl24, person: Key8, phash: u64| {
             w.push((phash >> (64 - P_BITS)) as usize, Click { person, cid: c.cid, phash, ts: c.ts, camp: c.camp });
         };
         loop {
@@ -1313,8 +1331,8 @@ fn main() {
                     Some(t) if t >= cws && t < ctx.we => t,
                     _ => return,
                 };
-                let c = Cl24 { cid: Key16::new(cid), ts: (ts - ctx.base) as u32, camp };
-                res.push(c, Key16::new(uid), &mut emit);
+                let c = Cl24 { cid: Key8::new(cid), ts: (ts - ctx.base) as u32, camp };
+                res.push(c, Key8::new(uid), &mut emit);
             });
             release_chunk(d);
         }
