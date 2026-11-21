@@ -170,7 +170,10 @@ pub fn simd_backend() -> &'static str {
             if std::env::var("FORCE_SIMD").ok().as_deref() == Some("scalar") {
                 false
             } else {
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi1")
+                is_x86_feature_detected!("avx2")
+                    && is_x86_feature_detected!("bmi1")
+                    && is_x86_feature_detected!("bmi2")
+                    && is_x86_feature_detected!("popcnt")
             }
         }) {
             return "avx2";
@@ -189,7 +192,10 @@ pub fn scan<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) 
             if std::env::var("FORCE_SIMD").ok().as_deref() == Some("scalar") {
                 false
             } else {
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi1")
+                is_x86_feature_detected!("avx2")
+                    && is_x86_feature_detected!("bmi1")
+                    && is_x86_feature_detected!("bmi2")
+                    && is_x86_feature_detected!("popcnt")
             }
         }) {
             unsafe { scan_avx2::<N, F>(data, f) };

@@ -224,25 +224,18 @@ impl DateCache {
             if ((non_digit_bits(d0) | non_digit_bits(d1)) & 0xF0) == 0 && d < 32 {
                 let slot = *self.slots.get_unchecked(d);
                 let pref = (p as *const u64).read_unaligned();
-                if pref == slot.prefix
-                    && ((*p.add(10) ^ b'T') | (*p.add(13) ^ b':') | (*p.add(16) ^ b':')) == 0
-                {
-                    let h0 = (*p.add(11)).wrapping_sub(b'0');
-                    let h1 = (*p.add(12)).wrapping_sub(b'0');
-                    let n0 = (*p.add(14)).wrapping_sub(b'0');
-                    let n1 = (*p.add(15)).wrapping_sub(b'0');
-                    let s0 = (*p.add(17)).wrapping_sub(b'0');
-                    let s1 = (*p.add(18)).wrapping_sub(b'0');
-                    let bad = non_digit_bits(h0)
-                        | non_digit_bits(h1)
-                        | non_digit_bits(n0)
-                        | non_digit_bits(n1)
-                        | non_digit_bits(s0)
-                        | non_digit_bits(s1);
-                    if (bad & 0xF0) == 0 {
-                        let h = h0 as u32 * 10 + h1 as u32;
-                        let mi = n0 as u32 * 10 + n1 as u32;
-                        let s = s0 as u32 * 10 + s1 as u32;
+                if slot.prefix != 0 && pref == slot.prefix && *p.add(10) == b'T' {
+                    let w = (p.add(11) as *const u64).read_unaligned();
+                    let x = w ^ u64::from_le_bytes(*b"00:00:00");
+                    let bad = (x & 0xF0F0_FFF0_F0FF_F0F0)
+                        | (x.wrapping_add(0x0606_0006_0600_0606) & 0xF0F0_00F0_F000_F0F0);
+                    if bad == 0 {
+                        let hi = x & 0x000F_0000_0F00_000F;
+                        let lo = (x >> 8) & 0x000F_0000_0F00_000F;
+                        let hms = hi * 10 + lo;
+                        let h = (hms & 0xFF) as u32;
+                        let mi = ((hms >> 24) & 0xFF) as u32;
+                        let s = ((hms >> 48) & 0xFF) as u32;
                         if h <= 23 && mi <= 59 && s <= 59 {
                             return Some(slot.day_ms + (h as i64 * 3600 + mi as i64 * 60 + s as i64) * 1000);
                         }
@@ -264,13 +257,14 @@ impl DateCache {
                     + (*p.add(9)).wrapping_sub(b'0') as usize;
                 if d < 32 {
                     let slot = *self.slots.get_unchecked(d);
-                    if (p as *const u64).read_unaligned() == slot.prefix {
-                        let h = (*p.add(11)).wrapping_sub(b'0') as i64 * 10
-                            + (*p.add(12)).wrapping_sub(b'0') as i64;
-                        let mi = (*p.add(14)).wrapping_sub(b'0') as i64 * 10
-                            + (*p.add(15)).wrapping_sub(b'0') as i64;
-                        let s = (*p.add(17)).wrapping_sub(b'0') as i64 * 10
-                            + (*p.add(18)).wrapping_sub(b'0') as i64;
+                    if slot.prefix != 0 && (p as *const u64).read_unaligned() == slot.prefix {
+                        let x = (p.add(11) as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00:00:00");
+                        let hi = x & 0x000F_0000_0F00_000F;
+                        let lo = (x >> 8) & 0x000F_0000_0F00_000F;
+                        let hms = hi * 10 + lo;
+                        let h = (hms & 0xFF) as i64;
+                        let mi = ((hms >> 24) & 0xFF) as i64;
+                        let s = ((hms >> 48) & 0xFF) as i64;
                         return Some(slot.day_ms + (h * 3600 + mi * 60 + s) * 1000);
                     }
                 }
@@ -318,53 +312,27 @@ impl DateCache {
 }
 
 #[inline(always)]
+fn swar_dec8(x: u64) -> u64 {
+    let a = (x & 0x00FF_00FF_00FF_00FF) * 10 + ((x >> 8) & 0x00FF_00FF_00FF_00FF);
+    let b = (a & 0x0000_FFFF_0000_FFFF) * 100 + ((a >> 16) & 0x0000_FFFF_0000_FFFF);
+    (b & 0xFFFF_FFFF) * 10_000 + (b >> 32)
+}
+
+#[inline(always)]
 fn parse_f3_13(b: &[u8]) -> Option<i64> {
     let p = b.as_ptr();
     unsafe {
-        let d0 = (*p).wrapping_sub(b'0');
-        let d1 = (*p.add(1)).wrapping_sub(b'0');
-        let d2 = (*p.add(2)).wrapping_sub(b'0');
-        let d3 = (*p.add(3)).wrapping_sub(b'0');
-        let d4 = (*p.add(4)).wrapping_sub(b'0');
-        let d5 = (*p.add(5)).wrapping_sub(b'0');
-        let d6 = (*p.add(6)).wrapping_sub(b'0');
-        let d7 = (*p.add(7)).wrapping_sub(b'0');
-        let d8 = (*p.add(8)).wrapping_sub(b'0');
-        let d9 = (*p.add(9)).wrapping_sub(b'0');
-        let d10 = (*p.add(10)).wrapping_sub(b'0');
-        let d11 = (*p.add(11)).wrapping_sub(b'0');
-        let d12 = (*p.add(12)).wrapping_sub(b'0');
-        let bad = non_digit_bits(d0)
-            | non_digit_bits(d1)
-            | non_digit_bits(d2)
-            | non_digit_bits(d3)
-            | non_digit_bits(d4)
-            | non_digit_bits(d5)
-            | non_digit_bits(d6)
-            | non_digit_bits(d7)
-            | non_digit_bits(d8)
-            | non_digit_bits(d9)
-            | non_digit_bits(d10)
-            | non_digit_bits(d11)
-            | non_digit_bits(d12);
-        if (bad & 0xF0) != 0 {
+        let x0 = (p as *const u64).read_unaligned() ^ 0x3030_3030_3030_3030;
+        let x1 = (p.add(5) as *const u64).read_unaligned() ^ 0x3030_3030_3030_3030;
+        let bad = ((x0 | x1) & 0xF0F0_F0F0_F0F0_F0F0)
+            | ((x0.wrapping_add(0x0606_0606_0606_0606) | x1.wrapping_add(0x0606_0606_0606_0606))
+                & 0xF0F0_F0F0_F0F0_F0F0);
+        if bad != 0 {
             return None;
         }
-        let hi = (d0 as u64 * 100_000
-            + d1 as u64 * 10_000
-            + d2 as u64 * 1_000
-            + d3 as u64 * 100
-            + d4 as u64 * 10
-            + d5 as u64)
-            * 10_000_000;
-        let lo = d6 as u64 * 1_000_000
-            + d7 as u64 * 100_000
-            + d8 as u64 * 10_000
-            + d9 as u64 * 1_000
-            + d10 as u64 * 100
-            + d11 as u64 * 10
-            + d12 as u64;
-        Some((hi + lo) as i64)
+        let hi8 = swar_dec8(x0);
+        let lo5 = swar_dec8(x1 & 0xFFFF_FFFF_FF00_0000);
+        Some((hi8 * 100_000 + lo5) as i64)
     }
 }
 
@@ -478,6 +446,48 @@ fn parse_price_slow(b: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn swar_hms_and_f3_reject_all_non_digits() {
+        let cache = DateCache::new(0, 14 * DAY_MS);
+        // Test every byte 0..=255 at every position of HH:MM:SS
+        for pos in [11usize, 12, 13, 14, 15, 16, 17, 18] {
+            for b in 0u8..=255 {
+                let mut s = *b"1970-01-02T12:34:56Z";
+                s[pos] = b;
+                let got = cache.parse_ts(&s);
+                let exp = parse_ts(&s);
+                assert_eq!(got, exp, "hms pos={pos} b={b:#x}");
+            }
+        }
+        // Test every byte 0..=255 at every position of 13-digit F3
+        for pos in 0..13 {
+            for b in 0u8..=255 {
+                let mut s = *b"1700000000123";
+                s[pos] = b;
+                let got = parse_f3_13(&s);
+                let is_dig = b.is_ascii_digit();
+                assert_eq!(got.is_some(), is_dig, "f3 pos={pos} b={b:#x}");
+                if is_dig {
+                    let expected: i64 = std::str::from_utf8(&s).unwrap().parse().unwrap();
+                    assert_eq!(got, Some(expected), "f3 val pos={pos} b={b:#x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_date_slots_reject_nul_prefixes() {
+        // Unpopulated slots have prefix 0; eight NUL bytes must not match them.
+        let cache = DateCache::new(0, 14 * DAY_MS);
+        for day in 0..=31 {
+            for zone in ["Z", "+00:00"] {
+                let text = format!("{}{day:02}T00:00:00{zone}", "\0".repeat(8));
+                assert_eq!(cache.parse_ts(text.as_bytes()), None, "day={day} zone={zone}");
+            }
+        }
+        assert_eq!(cache.parse_ts(b"1970-01-01T00:00:00Z"), Some(0));
+    }
+
     #[test]
     fn forms_and_lut_edges() {
         // Exhaustively verify non_digit_bits for all 256 u8 values

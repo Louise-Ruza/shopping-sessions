@@ -161,6 +161,11 @@ impl<T: Copy> Segs<T> {
         let s = self.segs[i];
         unsafe { std::slice::from_raw_parts(s.ptr as *const T, s.n as usize) }
     }
+    #[inline(always)]
+    pub fn seg_ptr_mut(&mut self, i: usize) -> (*mut T, usize) {
+        let s = unsafe { *self.segs.get_unchecked(i) };
+        (s.ptr as *mut T, s.n as usize)
+    }
     pub fn iter(&self) -> impl Iterator<Item = &[T]> + '_ {
         (0..self.segs.len()).map(move |i| self.seg(i))
     }

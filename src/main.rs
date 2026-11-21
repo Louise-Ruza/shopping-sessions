@@ -1,6 +1,6 @@
 //! Shopping Sessions pipeline.
 //!
-//! Stages: init (manifest, products, campaigns, mmaps) -> links (exact Key16
+//! Stages: init (manifest, products, campaigns, mmaps) -> links (exact Key8
 //! interning, lock-free union-find, LinkTable + Bloom) -> clicks (parse, validate,
 //! resolve person, scatter to person shards) -> events (parse, validate, scatter a
 //! compact RawEv to event_id shards) -> dedup (per event_id shard: exact dedup,
@@ -13,6 +13,7 @@
 
 mod arena;
 mod csv;
+mod fixed;
 #[allow(dead_code)]
 mod hash;
 mod key;
@@ -26,8 +27,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use arena::{ShardSet, Scatter, Segs};
-use key::Key16;
-use links::{prefetch, LinkTable, Resolver, SEED_A};
+use key::Key8;
+use links::{prefetch, Resolver, SEED_A};
 use parquet::{Column, Kind};
 use ts::{parse_price, parse_ts, DateCache, DAY_MS};
 
@@ -37,11 +38,6 @@ const LATE_MS: i64 = DAY_MS;
 
 const SEED_ID: u64 = 0x4b33_a62e_d433_d4a3;
 const SEED_MAP: u64 = 0x8bb8_4b93_962e_acc9;
-
-const ID_BITS: u32 = 9;
-const ID_SHARDS: usize = 1 << ID_BITS;
-const P_BITS: u32 = 9;
-const P_SHARDS: usize = 1 << P_BITS;
 
 const MAX_ROWS_PER_FILE: usize = 2_000_000;
 
@@ -137,7 +133,7 @@ pub(crate) fn make_chunks(files: &[&'static [u8]], target: usize) -> Vec<Chunk> 
 
 pub(crate) fn chunk_target(files: &[&'static [u8]], threads: usize) -> usize {
     let total: usize = files.iter().map(|d| d.len()).sum();
-    (total / (threads * 24)).clamp(256 << 10, 16 << 20)
+    (total / (threads * 12)).clamp(256 << 10, 16 << 20)
 }
 
 pub(crate) fn par<R: Send>(threads: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
@@ -181,20 +177,74 @@ pub(crate) fn release_chunk(d: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// inline Key16 string maps (products, campaigns) — zero pointer chase to CSV
+// inline Key8 string maps (products, campaigns) — zero pointer chase to CSV
 
 struct KeyMap {
-    slots: Vec<(Key16, u32)>,
+    slots: Vec<(Key8, u32)>,
     mask: usize,
+    fast_prefix: &'static [u8],
+    fast: Vec<u32>,
+}
+
+#[inline(always)]
+fn parse_canon_idx(s: &[u8], prefix: &[u8], limit: usize) -> Option<usize> {
+    let plen = prefix.len();
+    let n = s.len();
+    if n <= plen || n > plen + 6 {
+        return None;
+    }
+    let p = s.as_ptr();
+    unsafe {
+        for i in 0..plen {
+            if *p.add(i) != *prefix.get_unchecked(i) {
+                return None;
+            }
+        }
+        let d0 = (*p.add(plen)).wrapping_sub(b'0');
+        // Reject leading zero so "p01" / "c_01" always falls back to exact KeyMap.
+        if d0 == 0 || d0 > 9 {
+            return None;
+        }
+        let mut acc = d0 as usize;
+        let mut i = plen + 1;
+        while i < n {
+            let d = (*p.add(i)).wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            acc = acc * 10 + d as usize;
+            i += 1;
+        }
+        if acc < limit {
+            Some(acc)
+        } else {
+            None
+        }
+    }
 }
 
 impl KeyMap {
     fn new(n: usize) -> KeyMap {
+        Self::new_with_fast(n, b"", 0)
+    }
+    fn new_with_fast(n: usize, fast_prefix: &'static [u8], fast_cap: usize) -> KeyMap {
         let cap = (n * 2).next_power_of_two().max(16);
-        KeyMap { slots: vec![(Key16::EMPTY, u32::MAX); cap], mask: cap - 1 }
+        KeyMap {
+            slots: vec![(Key8::EMPTY, u32::MAX); cap],
+            mask: cap - 1,
+            fast_prefix,
+            fast: vec![u32::MAX; fast_cap],
+        }
     }
     fn insert(&mut self, k: &[u8], v: u32) {
-        let key = Key16::new(k);
+        if !self.fast.is_empty() {
+            if let Some(idx) = parse_canon_idx(k, self.fast_prefix, self.fast.len()) {
+                if self.fast[idx] == u32::MAX {
+                    self.fast[idx] = v;
+                }
+            }
+        }
+        let key = Key8::new(k);
         let mut i = key.hash(SEED_MAP) as usize & self.mask;
         loop {
             let s = &mut self.slots[i];
@@ -209,8 +259,8 @@ impl KeyMap {
         }
     }
     #[inline(always)]
-    fn get(&self, k: &[u8]) -> Option<u32> {
-        let key = Key16::new(k);
+    fn get_hash(&self, k: &[u8]) -> Option<u32> {
+        let key = Key8::new(k);
         let mut i = key.hash(SEED_MAP) as usize & self.mask;
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
@@ -222,6 +272,16 @@ impl KeyMap {
             }
             i = (i + 1) & self.mask;
         }
+    }
+    #[inline(always)]
+    fn get(&self, k: &[u8]) -> Option<u32> {
+        if !self.fast.is_empty() {
+            if let Some(idx) = parse_canon_idx(k, self.fast_prefix, self.fast.len()) {
+                let v = unsafe { *self.fast.get_unchecked(idx) };
+                return if v == u32::MAX { None } else { Some(v) };
+            }
+        }
+        self.get_hash(k)
     }
 }
 
@@ -253,8 +313,8 @@ const INGEST_NONE: u32 = u32::MAX;
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct RawEv {
-    eid: Key16,
-    uid: Key16,
+    eid: Key8,
+    uid: Key8,
     ts: u32,
     price: u32,
     ingest: u32,
@@ -313,7 +373,7 @@ fn ingest_less_slow(a: u32, b: u32, base: i64, oob: &[i64]) -> bool {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PEv {
-    person: Key16,
+    person: Key8,
     ts: u32,
     pc: u32,
 }
@@ -322,8 +382,8 @@ struct PEv {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Click {
-    person: Key16,
-    cid: Key16,
+    person: Key8,
+    cid: Key8,
     phash: u64,
     ts: u32,
     camp: u32,
@@ -353,16 +413,17 @@ impl Ev8 {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Cl24 {
-    cid: Key16,
+    cid: Key8,
     ts: u32,
     camp: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<RawEv>() == 48);
-const _: () = assert!(std::mem::size_of::<PEv>() == 24);
-const _: () = assert!(std::mem::size_of::<Click>() == 48);
+const _: () = assert!(std::mem::size_of::<RawEv>() == 32);
+const _: () = assert!(std::mem::size_of::<PEv>() == 16);
+const _: () = assert!(std::mem::size_of::<Click>() == 32);
 const _: () = assert!(std::mem::size_of::<Ev8>() == 8);
-const _: () = assert!(std::mem::size_of::<Cl24>() == 24);
+const _: () = assert!(std::mem::size_of::<Cl24>() == 16);
+const _: () = assert!(arena::SEG / std::mem::size_of::<RawEv>() <= 512);
 
 struct Ctx {
     ws: i64,
@@ -426,14 +487,12 @@ impl Slot for u64 {
     }
 }
 
-/// Exact event_id dedup of one shard: marks in `loser` (bit per record index
-/// `seg << 9 | rec`) every copy that is not the one with the smallest ingest_ts
-/// (the first one read on a tie). Uses cached `ehash` + software prefetching.
+/// Exact event_id dedup of one shard: marks losers in-place by setting `ts = TS_INVALID`
+/// (zero separate loser bitset!), keeping the copy with the smallest ingest_ts (first on tie).
 fn mark_losers<S: Slot + Default + Clone>(
-    segs: &Segs<RawEv>,
+    segs: &mut Segs<RawEv>,
     table: &mut Vec<S>,
     cap: usize,
-    loser: &mut [u64],
     base: i64,
     oob: &[i64],
 ) {
@@ -441,40 +500,43 @@ fn mark_losers<S: Slot + Default + Clone>(
     table.clear();
     table.resize(cap, S::default());
     let tptr = table.as_mut_ptr();
-    let rec = |idx: u32| -> &RawEv { unsafe { segs.seg((idx >> 9) as usize).get_unchecked((idx & 511) as usize) } };
+    let seg_meta = segs.segs.as_ptr();
+    let nseg = segs.segs.len();
     const PF: usize = 16;
-    for si in 0..segs.segs.len() {
-        let seg = segs.seg(si);
-        let slen = seg.len();
+    for si in 0..nseg {
+        let (rptr, slen) = segs.seg_ptr_mut(si);
         for ri in 0..slen {
-            if ri + PF < slen {
-                let fh = unsafe { seg.get_unchecked(ri + PF).ehash };
-                prefetch(unsafe { tptr.add(fh as usize & mask) } as *const u8);
-            }
-            let r = unsafe { seg.get_unchecked(ri) };
-            let h = r.ehash;
-            let me = ((si << 9) | ri) as u32;
-            let mut i = h as usize & mask;
-            loop {
-                let slot = unsafe { *tptr.add(i) };
-                if slot.is_empty() {
-                    unsafe { *tptr.add(i) = S::make(h, me) };
-                    break;
+            unsafe {
+                if ri + PF < slen {
+                    let fh = (*rptr.add(ri + PF)).ehash;
+                    prefetch(tptr.add(fh as usize & mask) as *const u8);
                 }
-                if slot.tag_eq(h) {
-                    let oi = slot.idx();
-                    let o = rec(oi);
-                    if o.eid == r.eid {
-                        if ingest_less(r.ingest, o.ingest, base, oob) {
-                            loser[(oi >> 6) as usize] |= 1 << (oi & 63);
-                            unsafe { *tptr.add(i) = S::make(h, me) };
-                        } else {
-                            loser[(me >> 6) as usize] |= 1 << (me & 63);
-                        }
+                let r = rptr.add(ri);
+                let h = (*r).ehash;
+                let me = ((si << 9) | ri) as u32;
+                let mut i = h as usize & mask;
+                loop {
+                    let slot = *tptr.add(i);
+                    if slot.is_empty() {
+                        *tptr.add(i) = S::make(h, me);
                         break;
                     }
+                    if slot.tag_eq(h) {
+                        let oi = slot.idx();
+                        let os = *seg_meta.add((oi >> 9) as usize);
+                        let o = (os.ptr as *mut RawEv).add((oi & 511) as usize);
+                        if (*o).eid == (*r).eid {
+                            if ingest_less((*r).ingest, (*o).ingest, base, oob) {
+                                (*o).ts = TS_INVALID;
+                                *tptr.add(i) = S::make(h, me);
+                            } else {
+                                (*r).ts = TS_INVALID;
+                            }
+                            break;
+                        }
+                    }
+                    i = (i + 1) & mask;
                 }
-                i = (i + 1) & mask;
             }
         }
     }
@@ -526,7 +588,7 @@ struct Worker<'a> {
 }
 
 impl<'a> Worker<'a> {
-    fn new(ctx: &'a Ctx, wide_store: &'a [(u32, u16)]) -> Worker<'a> {
+    fn new(ctx: &'a Ctx, wide_store: &'a [(u32, u16)], est_rows: usize) -> Worker<'a> {
         let k1 = ctx.camp_ids.len();
         Worker {
             ctx,
@@ -539,7 +601,7 @@ impl<'a> Worker<'a> {
             touched: Vec::new(),
             sess: Vec::new(),
             day_first: vec![0; ctx.ndays + 1],
-            cols: new_user_cols(32_768),
+            cols: new_user_cols(est_rows),
             done_cols: Vec::new(),
         }
     }
@@ -555,7 +617,7 @@ impl<'a> Worker<'a> {
     }
 
     #[inline(always)]
-    fn flush_row(&mut self, person: Key16, day: u32, ns: u32, ne: u32, rev: u64) {
+    fn flush_row(&mut self, person: Key8, day: u32, ns: u32, ne: u32, rev: u64) {
         let mut top = -1i32;
         let mut best = 0u64;
         for &c in &self.touched {
@@ -597,7 +659,7 @@ impl<'a> Worker<'a> {
     }
 
     /// One person: events sorted by ts, clicks sorted by (ts, click_id).
-    fn person(&mut self, person: Key16, evs: &[Ev8], clicks: &[Cl24]) {
+    fn person(&mut self, person: Key8, evs: &[Ev8], clicks: &[Cl24]) {
         self.sess.clear();
         let day0ms = self.ctx.day0 * DAY_MS - self.ctx.base;
         let mut day_idx = 0u32;
@@ -715,19 +777,22 @@ impl<'a> Worker<'a> {
 // ---------------------------------------------------------------------------
 // per-shard direct person interning + compact L2 solve (8B Ev8 + 24B Cl24)
 
-/// Stable LSD radix sort of `v` by a 32-bit key (3 passes of 11 bits; passes in
-/// which every key has the same digit are skipped).
+/// Stable L1-resident LSD radix sort of `v` by a 32-bit key (4 passes of 8 bits,
+/// only 4 KB of stack histograms; passes in which every key shares the same byte are skipped).
 fn radix_by_u32<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u32) {
     let n = v.len();
     tmp.clear();
     tmp.reserve(n);
     unsafe { tmp.set_len(n) };
-    let mut cnt = [[0u32; 2048]; 3];
+    let mut cnt = [[0u32; 256]; 4];
     for x in v.iter() {
         let k = key(x);
-        cnt[0][(k & 2047) as usize] += 1;
-        cnt[1][((k >> 11) & 2047) as usize] += 1;
-        cnt[2][(k >> 22) as usize] += 1;
+        unsafe {
+            *cnt[0].get_unchecked_mut((k & 255) as usize) += 1;
+            *cnt[1].get_unchecked_mut(((k >> 8) & 255) as usize) += 1;
+            *cnt[2].get_unchecked_mut(((k >> 16) & 255) as usize) += 1;
+            *cnt[3].get_unchecked_mut((k >> 24) as usize) += 1;
+        }
     }
     let mut in_v = true;
     for (pass, c) in cnt.iter_mut().enumerate() {
@@ -740,13 +805,16 @@ fn radix_by_u32<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u32)
             *x = sum;
             sum += t;
         }
-        let sh = pass as u32 * 11;
+        let sh = pass as u32 * 8;
         let (src, dst): (&[T], &mut [T]) = if in_v { (&*v, &mut tmp[..]) } else { (&tmp[..], &mut *v) };
         let dst = dst.as_mut_ptr();
         for x in src {
-            let d = ((key(x) >> sh) & 2047) as usize;
-            unsafe { dst.add(c[d] as usize).write(*x) };
-            c[d] += 1;
+            let d = ((key(x) >> sh) & 255) as usize;
+            unsafe {
+                let slot = c.get_unchecked_mut(d);
+                dst.add(*slot as usize).write(*x);
+                *slot += 1;
+            }
         }
         in_v = !in_v;
     }
@@ -772,7 +840,27 @@ fn sort_person_events(sl: &mut [Ev8], tmp: &mut Vec<Ev8>) {
         }
         return;
     }
-    if n <= 24 {
+    if n == 3 {
+        unsafe {
+            let mut a = *sl.get_unchecked(0);
+            let mut b = *sl.get_unchecked(1);
+            let mut c = *sl.get_unchecked(2);
+            if a.0 > b.0 {
+                std::mem::swap(&mut a, &mut b);
+            }
+            if b.0 > c.0 {
+                std::mem::swap(&mut b, &mut c);
+            }
+            if a.0 > b.0 {
+                std::mem::swap(&mut a, &mut b);
+            }
+            *sl.get_unchecked_mut(0) = a;
+            *sl.get_unchecked_mut(1) = b;
+            *sl.get_unchecked_mut(2) = c;
+        }
+        return;
+    }
+    if n <= 32 {
         for i in 1..n {
             let x = unsafe { *sl.get_unchecked(i) };
             let mut j = i;
@@ -788,11 +876,16 @@ fn sort_person_events(sl: &mut [Ev8], tmp: &mut Vec<Ev8>) {
         }
         return;
     }
-    if n > 256 {
+    if n > 64 {
         radix_by_u32(sl, tmp, |e| e.ts());
     } else {
         sl.sort_unstable();
     }
+}
+
+#[inline(always)]
+fn click_gt(a: &Cl24, b: &Cl24) -> bool {
+    a.ts > b.ts || (a.ts == b.ts && a.cid.cmp_bytes(&b.cid) == std::cmp::Ordering::Greater)
 }
 
 #[inline(always)]
@@ -801,7 +894,34 @@ fn sort_person_clicks(sl: &mut [Cl24], tmp: &mut Vec<Cl24>) {
     if n < 2 {
         return;
     }
-    if n > 256 {
+    if n == 2 {
+        unsafe {
+            let a = *sl.get_unchecked(0);
+            let b = *sl.get_unchecked(1);
+            if click_gt(&a, &b) {
+                *sl.get_unchecked_mut(0) = b;
+                *sl.get_unchecked_mut(1) = a;
+            }
+        }
+        return;
+    }
+    if n <= 24 {
+        for i in 1..n {
+            let x = unsafe { *sl.get_unchecked(i) };
+            let mut j = i;
+            while j > 0 {
+                let prev = unsafe { *sl.get_unchecked(j - 1) };
+                if !click_gt(&prev, &x) {
+                    break;
+                }
+                unsafe { *sl.get_unchecked_mut(j) = prev };
+                j -= 1;
+            }
+            unsafe { *sl.get_unchecked_mut(j) = x };
+        }
+        return;
+    }
+    if n > 64 {
         radix_by_u32(sl, tmp, |c| c.ts);
         let mut i = 0;
         while i < n {
@@ -819,11 +939,23 @@ fn sort_person_clicks(sl: &mut [Cl24], tmp: &mut Vec<Cl24>) {
     }
 }
 
+/// 16-byte inline person-intern slot: single cacheline access gives key, pid, and count.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct HtEnt {
+    key: Key8,
+    pid: u32,
+    cnt: u32,
+}
+
+const HT_EMPTY: HtEnt = HtEnt { key: Key8::EMPTY, pid: 0, cnt: 0 };
+const _: () = assert!(std::mem::size_of::<HtEnt>() == 16);
+
 /// Scratch buffers reused across all shards handled by one solve worker.
 struct SolveScratch {
-    ht: Vec<u32>,
+    ht: Vec<HtEnt>,
     ht_mask: usize,
-    pkeys: Vec<Key16>,
+    pkeys: Vec<Key8>,
     ev_off: Vec<u32>,
     ev_cur: Vec<u32>,
     ev_pids: Vec<u32>,
@@ -857,30 +989,27 @@ impl SolveScratch {
 
     fn reset_ht(&mut self, cap: usize) {
         self.ht.clear();
-        self.ht.resize(cap, 0);
+        self.ht.resize(cap, HT_EMPTY);
         self.ht_mask = cap - 1;
     }
 
     #[inline(always)]
-    fn intern(&mut self, person: Key16) -> u32 {
-        // Grow if load > 50%
+    fn intern(&mut self, person: Key8) -> u32 {
         if self.pkeys.len() * 2 >= self.ht.len() {
             self.grow_ht();
         }
         let mask = self.ht_mask;
         let mut i = person.hash(SEED_A) as usize & mask;
         loop {
-            let slot = unsafe { *self.ht.get_unchecked(i) };
-            if slot == 0 {
+            let e = unsafe { self.ht.get_unchecked_mut(i) };
+            if e.key == person {
+                e.cnt += 1;
+                return e.pid;
+            }
+            if e.key.is_empty() {
                 let pid = self.pkeys.len() as u32;
                 self.pkeys.push(person);
-                self.ev_off.push(1);
-                unsafe { *self.ht.get_unchecked_mut(i) = pid + 1 };
-                return pid;
-            }
-            let pid = slot - 1;
-            if unsafe { *self.pkeys.get_unchecked(pid as usize) } == person {
-                unsafe { *self.ev_off.get_unchecked_mut(pid as usize) += 1 };
+                *e = HtEnt { key: person, pid, cnt: 1 };
                 return pid;
             }
             i = (i + 1) & mask;
@@ -890,29 +1019,31 @@ impl SolveScratch {
     #[cold]
     fn grow_ht(&mut self) {
         let new_cap = (self.ht.len() * 2).max(256);
-        self.reset_ht(new_cap);
+        let old = std::mem::replace(&mut self.ht, vec![HT_EMPTY; new_cap]);
+        self.ht_mask = new_cap - 1;
         let mask = self.ht_mask;
-        for (pid, &pk) in self.pkeys.iter().enumerate() {
-            let mut i = pk.hash(SEED_A) as usize & mask;
-            while self.ht[i] != 0 {
-                i = (i + 1) & mask;
+        for e in old {
+            if !e.key.is_empty() {
+                let mut i = e.key.hash(SEED_A) as usize & mask;
+                while !self.ht[i].key.is_empty() {
+                    i = (i + 1) & mask;
+                }
+                self.ht[i] = e;
             }
-            self.ht[i] = pid as u32 + 1;
         }
     }
 
     #[inline(always)]
-    fn lookup(&self, person: Key16, phash: u64) -> Option<u32> {
+    fn lookup(&self, person: Key8, phash: u64) -> Option<u32> {
         let mask = self.ht_mask;
         let mut i = phash as usize & mask;
         loop {
-            let slot = unsafe { *self.ht.get_unchecked(i) };
-            if slot == 0 {
-                return None;
+            let e = unsafe { self.ht.get_unchecked(i) };
+            if e.key == person {
+                return Some(e.pid);
             }
-            let pid = slot - 1;
-            if unsafe { *self.pkeys.get_unchecked(pid as usize) } == person {
-                return Some(pid);
+            if e.key.is_empty() {
+                return None;
             }
             i = (i + 1) & mask;
         }
@@ -929,30 +1060,43 @@ impl SolveScratch {
         let init_cap = ((nev / 6).next_power_of_two()).max(256);
         self.reset_ht(init_cap);
         self.pkeys.clear();
-        self.ev_off.clear();
         self.ev_pids.clear();
         self.ev_pids.reserve(nev);
 
-        // Pass 1 over events: intern exact Key16 persons in L1/L2 hash table
+        // Pass 1 over events: intern exact Key8 persons in inline 16B HtEnt with 8-ahead prefetch
+        const PF: usize = 8;
         for seg in es.iter() {
-            for e in seg {
+            let slen = seg.len();
+            for ri in 0..slen {
+                if ri + PF < slen {
+                    let fh = unsafe { seg.get_unchecked(ri + PF).person.hash(SEED_A) };
+                    prefetch(unsafe { self.ht.as_ptr().add(fh as usize & self.ht_mask) } as *const u8);
+                }
+                let e = unsafe { seg.get_unchecked(ri) };
                 let pid = self.intern(e.person);
                 self.ev_pids.push(pid);
             }
         }
         let np = self.pkeys.len();
 
-        // Prefix sums for events
+        // Populate per-person counts from inline HtEnt table, then prefix sum
+        self.ev_off.clear();
+        self.ev_off.resize(np + 1, 0);
+        for e in &self.ht {
+            if !e.key.is_empty() {
+                unsafe { *self.ev_off.get_unchecked_mut(e.pid as usize) = e.cnt };
+            }
+        }
         let mut sum = 0u32;
         self.ev_cur.clear();
         self.ev_cur.reserve(np);
-        for c in &mut self.ev_off {
-            let cnt = *c;
-            *c = sum;
+        for i in 0..np {
+            let cnt = unsafe { *self.ev_off.get_unchecked(i) };
+            unsafe { *self.ev_off.get_unchecked_mut(i) = sum };
             self.ev_cur.push(sum);
             sum += cnt;
         }
-        self.ev_off.push(sum);
+        unsafe { *self.ev_off.get_unchecked_mut(np) = sum };
 
         // Pass 2 over events: scatter compact 8-byte Ev8 into L2-resident buffer
         self.evs.clear();
@@ -973,7 +1117,7 @@ impl SolveScratch {
         unsafe { self.evs.set_len(nev) };
         es.free();
 
-        // Clicks: lookup in the same L1/L2 person table; drop clicks for persons with 0 events!
+        // Clicks: lookup in the same inline HtEnt table with 8-ahead prefetch; drop clicks for 0-event persons!
         let ncl_raw = cs.len();
         self.cl_off.clear();
         self.cl_off.resize(np + 1, 0);
@@ -981,8 +1125,16 @@ impl SolveScratch {
         self.cl_pids.reserve(ncl_raw);
         let mut ncl_kept = 0usize;
         if ncl_raw > 0 {
+            let ht_ptr = self.ht.as_ptr();
+            let ht_mask = self.ht_mask;
             for seg in cs.iter() {
-                for c in seg {
+                let slen = seg.len();
+                for ri in 0..slen {
+                    if ri + PF < slen {
+                        let fh = unsafe { seg.get_unchecked(ri + PF).phash };
+                        prefetch(unsafe { ht_ptr.add(fh as usize & ht_mask) } as *const u8);
+                    }
+                    let c = unsafe { seg.get_unchecked(ri) };
                     if let Some(pid) = self.lookup(c.person, c.phash) {
                         self.cl_pids.push(pid);
                         unsafe { *self.cl_off.get_unchecked_mut(pid as usize) += 1 };
@@ -1028,20 +1180,20 @@ impl SolveScratch {
 
         // Process each person cleanly in L1/L2 cache
         for pid in 0..np {
-            let es0 = self.ev_off[pid] as usize;
-            let es1 = self.ev_off[pid + 1] as usize;
-            sort_person_events(&mut self.evs[es0..es1], &mut self.etmp);
+            let es0 = unsafe { *self.ev_off.get_unchecked(pid) } as usize;
+            let es1 = unsafe { *self.ev_off.get_unchecked(pid + 1) } as usize;
+            sort_person_events(unsafe { self.evs.get_unchecked_mut(es0..es1) }, &mut self.etmp);
             let cls_slice: &[Cl24] = if ncl_kept > 0 {
-                let cs0 = self.cl_off[pid] as usize;
-                let cs1 = self.cl_off[pid + 1] as usize;
+                let cs0 = unsafe { *self.cl_off.get_unchecked(pid) } as usize;
+                let cs1 = unsafe { *self.cl_off.get_unchecked(pid + 1) } as usize;
                 if cs1 > cs0 {
-                    sort_person_clicks(&mut self.cls[cs0..cs1], &mut self.ctmp);
+                    sort_person_clicks(unsafe { self.cls.get_unchecked_mut(cs0..cs1) }, &mut self.ctmp);
                 }
-                &self.cls[cs0..cs1]
+                unsafe { self.cls.get_unchecked(cs0..cs1) }
             } else {
                 &[]
             };
-            w.person(self.pkeys[pid], &self.evs[es0..es1], cls_slice);
+            w.person(unsafe { *self.pkeys.get_unchecked(pid) }, unsafe { self.evs.get_unchecked(es0..es1) }, cls_slice);
         }
     }
 }
@@ -1067,6 +1219,222 @@ fn manifest_value(m: &str, key: &str) -> i64 {
     let q = rest.find('"').expect("manifest quote") + 1;
     let e = rest[q..].find('"').expect("manifest quote") + q;
     parse_ts(rest[q..e].as_bytes()).unwrap_or_else(|| panic!("bad manifest {key}"))
+}
+
+fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
+    ctx: &Ctx,
+    links: &links::LinkTable,
+    event_files: &[&'static [u8]],
+    click_files: &[&'static [u8]],
+    threads: usize,
+    est_user_rows: usize,
+    mark: &mut impl FnMut(&'static str),
+) -> Vec<(Vec<[Column; 6]>, Vec<CampAcc>)> {
+    let id_shards: usize = 1 << ID_BITS;
+    let id_shift: u32 = 64 - ID_BITS;
+    let p_shards: usize = 1 << P_BITS;
+    let p_shift: u32 = 64 - P_BITS;
+
+    // ---- events: parse + validate, scatter one RawEv per line by event_id
+    let chunks = make_chunks(event_files, chunk_target(event_files, threads));
+    let id_set: ShardSet<RawEv> = ShardSet::new(id_shards);
+    let oob_ingest: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+    let wide_store: Mutex<Vec<(u32, u16)>> = Mutex::new(Vec::new());
+    let next = AtomicUsize::new(0);
+    par(threads, |_| {
+        let mut w = Scatter::new(&id_set);
+        let mut tok = fixed::Tok::default();
+        let oob_ref = &oob_ingest;
+        let wide_ref = &wide_store;
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= chunks.len() {
+                break;
+            }
+            let d = chunks[i].data;
+            populate(d);
+            fixed::scan::<7, _>(&mut tok, d, |f| {
+                let eid = f[0];
+                if eid.is_empty() {
+                    return;
+                }
+                let ingest = ctx.dates.parse_f1_ingest(f[3]);
+                let ek = Key8::new(eid);
+                let eh = ek.hash(SEED_ID);
+                let ing_u32 = enc_ingest_fast(ingest, ctx.base, oob_ref);
+                let mut r = RawEv {
+                    eid: ek,
+                    uid: Key8::EMPTY,
+                    ts: TS_INVALID,
+                    price: 0,
+                    ingest: ing_u32,
+                    ehash: eh as u32,
+                };
+                'v: {
+                    let Some(ing) = ingest else { break 'v };
+                    let uid = f[1];
+                    if uid.is_empty() || f[5].is_empty() {
+                        break 'v;
+                    }
+                    let ts = match ctx.dates.parse_ts(f[2]) {
+                        Some(t) if t >= ctx.ws && t < ctx.we => t,
+                        _ => break 'v,
+                    };
+                    let mut price_enc = 0u32;
+                    let et = f[4];
+                    let et_len = et.len();
+                    if et_len == 4 {
+                        let w = unsafe { (et.as_ptr() as *const u32).read_unaligned() };
+                        if w != u32::from_ne_bytes(*b"view") && w != u32::from_ne_bytes(*b"cart") {
+                            break 'v;
+                        }
+                    } else if et_len == 8
+                        && unsafe { (et.as_ptr() as *const u64).read_unaligned() } == u64::from_ne_bytes(*b"purchase")
+                    {
+                        let price = parse_price(f[6]);
+                        if price == 0 {
+                            break 'v;
+                        }
+                        let cat = ctx.products.get(f[5]).unwrap_or(ctx.unknown_cat);
+                        price_enc = if !ctx.wide {
+                            (price << 8) | cat
+                        } else {
+                            let mut g = wide_ref.lock().unwrap();
+                            g.push((price, cat as u16));
+                            g.len() as u32
+                        };
+                    } else {
+                        break 'v;
+                    }
+                    if ing - ts > LATE_MS {
+                        break 'v;
+                    }
+                    r.uid = Key8::new(uid);
+                    r.ts = (ts - ctx.base) as u32;
+                    r.price = price_enc;
+                }
+                w.push((eh >> id_shift) as usize, r);
+            });
+            release_chunk(d);
+        }
+        w.finish();
+    });
+    let oob_ingest = oob_ingest.into_inner().unwrap();
+    let wide_store = wide_store.into_inner().unwrap();
+    mark("events");
+
+    // ---- dedup (exact event_id) fused with person resolution and person scatter
+    let ev_set: ShardSet<PEv> = ShardSet::new_shared(p_shards);
+    let next = AtomicUsize::new(0);
+    let oob_slice = &oob_ingest[..];
+    par(threads, |_| {
+        let mut w = Scatter::new(&ev_set);
+        let mut res = Resolver::new(links, Ev8(0));
+        let mut emit = |e: Ev8, person: Key8, phash: u64| {
+            w.push((phash >> p_shift) as usize, PEv { person, ts: e.ts(), pc: e.pc() });
+        };
+        let (mut t32, mut t64): (Vec<u32>, Vec<u64>) = (Vec::new(), Vec::new());
+        loop {
+            let s = next.fetch_add(1, Ordering::Relaxed);
+            if s >= id_shards {
+                break;
+            }
+            let mut segs = id_set.take(s);
+            let nseg = segs.segs.len();
+            assert!(nseg < (1 << 22), "event_id shard too large");
+            let n = segs.len();
+            let cap = (n + n / 2).next_power_of_two().max(16);
+            if nseg < (1 << 15) - 1 {
+                mark_losers(&mut segs, &mut t32, cap, ctx.base, oob_slice);
+            } else {
+                mark_losers(&mut segs, &mut t64, cap, ctx.base, oob_slice);
+            }
+            // Reverse MRU scan reuses the hottest L2-resident tail segments from mark_losers!
+            for si in (0..nseg).rev() {
+                for r in segs.seg(si) {
+                    if r.ts == TS_INVALID {
+                        continue;
+                    }
+                    res.push(Ev8::new(r.ts, r.price), r.uid, &mut emit);
+                }
+            }
+            segs.free();
+        }
+        res.drain(&mut emit);
+        w.finish();
+    });
+    id_set.free_all();
+    mark("dedup");
+
+    // ---- clicks: parse, validate, resolve person, scatter by person
+    let cws = ctx.ws - SEVEN_DAYS_MS;
+    let chunks = make_chunks(click_files, chunk_target(click_files, threads));
+    let click_set: ShardSet<Click> = ShardSet::new_shared(p_shards);
+    let next = AtomicUsize::new(0);
+    par(threads, |_| {
+        let mut w = Scatter::new(&click_set);
+        let zero = Cl24 { cid: Key8::EMPTY, ts: 0, camp: 0 };
+        let mut res = Resolver::new(links, zero);
+        let mut tok = fixed::Tok::default();
+        let mut emit = |c: Cl24, person: Key8, phash: u64| {
+            w.push((phash >> p_shift) as usize, Click { person, cid: c.cid, phash, ts: c.ts, camp: c.camp });
+        };
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= chunks.len() {
+                break;
+            }
+            let d = chunks[i].data;
+            populate(d);
+            fixed::scan::<4, _>(&mut tok, d, |f| {
+                let (cid, uid) = (f[0], f[1]);
+                if cid.is_empty() || uid.is_empty() {
+                    return;
+                }
+                let Some(camp) = ctx.camps.get(f[2]) else { return };
+                let ts = match ctx.dates.parse_ts(f[3]) {
+                    Some(t) if t >= cws && t < ctx.we => t,
+                    _ => return,
+                };
+                let c = Cl24 { cid: Key8::new(cid), ts: (ts - ctx.base) as u32, camp };
+                res.push(c, Key8::new(uid), &mut emit);
+            });
+            release_chunk(d);
+        }
+        res.drain(&mut emit);
+        w.finish();
+    });
+    mark("clicks");
+
+    // ---- solve
+    let mut order: Vec<(usize, usize)> =
+        (0..p_shards).map(|p| (p, ev_set.count(p) * 2 + click_set.count(p))).collect();
+    order.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let wide_slice = &wide_store[..];
+    let next = AtomicUsize::new(0);
+    let results: Vec<(Vec<[Column; 6]>, Vec<CampAcc>)> = par(threads, |_| {
+        let mut w = Worker::new(ctx, wide_slice, est_user_rows);
+        let mut sc = SolveScratch::new();
+        loop {
+            let k = next.fetch_add(1, Ordering::Relaxed);
+            if k >= p_shards {
+                break;
+            }
+            let p = order[k].0;
+            let es = ev_set.take(p);
+            let cs = click_set.take(p);
+            sc.run_shard(es, cs, &mut w);
+        }
+        if w.cols[0].len() > 0 {
+            let last = std::mem::replace(&mut w.cols, new_user_cols(0));
+            w.done_cols.push(last);
+        }
+        (std::mem::take(&mut w.done_cols), std::mem::take(&mut w.acc))
+    });
+    ev_set.free_all();
+    click_set.free_all();
+    mark("solve");
+    results
 }
 
 fn main() {
@@ -1111,7 +1479,7 @@ fn main() {
         catmap.insert(c, i as u32);
     }
     let unknown_cat = catmap.get(b"unknown").unwrap();
-    let mut products = KeyMap::new(prod_rows.len());
+    let mut products = KeyMap::new_with_fast(prod_rows.len(), b"p", 65_536);
     for (p, c) in &prod_rows {
         products.insert(p, catmap.get(c).unwrap());
     }
@@ -1121,7 +1489,7 @@ fn main() {
     let mut camp_channels: Vec<&'static [u8]> = vec![b"organic"];
     let mut camp_rows: Vec<(&'static [u8], &'static [u8])> = Vec::new();
     csv::scan::<2, _>(body(cdata), |f| camp_rows.push((f[0], f[1])));
-    let mut camps = KeyMap::new(camp_rows.len());
+    let mut camps = KeyMap::new_with_fast(camp_rows.len(), b"c_", 8_192);
     for (id, ch) in camp_rows {
         if camps.get(id).is_none() {
             camps.insert(id, camp_ids.len() as u32);
@@ -1157,200 +1525,15 @@ fn main() {
     let links = &links;
     mark("links", &mut marks);
 
-    // ---- events: parse + validate, scatter one RawEv per line by event_id
-    let chunks = make_chunks(&event_files, chunk_target(&event_files, threads));
-    let id_set: ShardSet<RawEv> = ShardSet::new(ID_SHARDS);
-    let oob_ingest: Mutex<Vec<i64>> = Mutex::new(Vec::new());
-    let wide_store: Mutex<Vec<(u32, u16)>> = Mutex::new(Vec::new());
-    let next = AtomicUsize::new(0);
-    par(threads, |_| {
-        let mut w = Scatter::new(&id_set);
-        let oob_ref = &oob_ingest;
-        let wide_ref = &wide_store;
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= chunks.len() {
-                break;
-            }
-            let d = chunks[i].data;
-            populate(d);
-            csv::scan::<7, _>(d, |f| {
-                let eid = f[0];
-                if eid.is_empty() {
-                    return;
-                }
-                let ingest = ctx.dates.parse_f1_ingest(f[3]);
-                let ek = Key16::new(eid);
-                let eh = ek.hash(SEED_ID);
-                let ing_u32 = enc_ingest_fast(ingest, ctx.base, oob_ref);
-                let mut r = RawEv {
-                    eid: ek,
-                    uid: Key16::EMPTY,
-                    ts: TS_INVALID,
-                    price: 0,
-                    ingest: ing_u32,
-                    ehash: eh as u32,
-                };
-                'v: {
-                    let Some(ing) = ingest else { break 'v };
-                    let uid = f[1];
-                    if uid.is_empty() || f[5].is_empty() {
-                        break 'v;
-                    }
-                    let ts = match ctx.dates.parse_ts(f[2]) {
-                        Some(t) if t >= ctx.ws && t < ctx.we => t,
-                        _ => break 'v,
-                    };
-                    let mut price_enc = 0u32;
-                    match f[4] {
-                        b"view" | b"cart" => {}
-                        b"purchase" => {
-                            let price = parse_price(f[6]);
-                            if price == 0 {
-                                break 'v;
-                            }
-                            let cat = ctx.products.get(f[5]).unwrap_or(ctx.unknown_cat);
-                            price_enc = if !ctx.wide {
-                                (price << 8) | cat
-                            } else {
-                                let mut g = wide_ref.lock().unwrap();
-                                g.push((price, cat as u16));
-                                g.len() as u32
-                            };
-                        }
-                        _ => break 'v,
-                    }
-                    if ing - ts > LATE_MS {
-                        break 'v;
-                    }
-                    r.uid = Key16::new(uid);
-                    r.ts = (ts - ctx.base) as u32;
-                    r.price = price_enc;
-                }
-                w.push((eh >> (64 - ID_BITS)) as usize, r);
-            });
-            release_chunk(d);
-        }
-        w.finish();
-    });
-    let oob_ingest = oob_ingest.into_inner().unwrap();
-    let wide_store = wide_store.into_inner().unwrap();
-    mark("events", &mut marks);
-
-    // ---- dedup (exact event_id) fused with person resolution and person scatter
-    let ev_set: ShardSet<PEv> = ShardSet::new_shared(P_SHARDS);
-    let next = AtomicUsize::new(0);
-    let oob_slice = &oob_ingest[..];
-    par(threads, |_| {
-        let mut w = Scatter::new(&ev_set);
-        let mut res = Resolver::new(links, Ev8(0));
-        let mut emit = |e: Ev8, person: Key16, phash: u64| {
-            w.push((phash >> (64 - P_BITS)) as usize, PEv { person, ts: e.ts(), pc: e.pc() });
-        };
-        let (mut t32, mut t64): (Vec<u32>, Vec<u64>) = (Vec::new(), Vec::new());
-        let mut loser: Vec<u64> = Vec::new();
-        loop {
-            let s = next.fetch_add(1, Ordering::Relaxed);
-            if s >= ID_SHARDS {
-                break;
-            }
-            let segs = id_set.take(s);
-            let nseg = segs.segs.len();
-            assert!(nseg < (1 << 22), "event_id shard too large");
-            let n = segs.len();
-            let cap = (n + n / 2).next_power_of_two().max(16);
-            loser.clear();
-            loser.resize((nseg << 9).div_ceil(64), 0);
-            if nseg < (1 << 15) - 1 {
-                mark_losers(&segs, &mut t32, cap, &mut loser, ctx.base, oob_slice);
-            } else {
-                mark_losers(&segs, &mut t64, cap, &mut loser, ctx.base, oob_slice);
-            }
-            for si in 0..nseg {
-                for (ri, r) in segs.seg(si).iter().enumerate() {
-                    let me = (si << 9) | ri;
-                    if r.ts == TS_INVALID || (loser[me >> 6] >> (me & 63)) & 1 != 0 {
-                        continue;
-                    }
-                    res.push(Ev8::new(r.ts, r.price), r.uid, &mut emit);
-                }
-            }
-            segs.free();
-        }
-        res.drain(&mut emit);
-        w.finish();
-    });
-    id_set.free_all();
-    mark("dedup", &mut marks);
-
-    // ---- clicks: parse, validate, resolve person, scatter by person
-    //      Runs after dedup so click_set reuses 100% pre-faulted 2 MB blocks from id_set!
-    let cws = ws - SEVEN_DAYS_MS;
-    let chunks = make_chunks(&click_files, chunk_target(&click_files, threads));
-    let click_set: ShardSet<Click> = ShardSet::new_shared(P_SHARDS);
-    let next = AtomicUsize::new(0);
-    par(threads, |_| {
-        let mut w = Scatter::new(&click_set);
-        let zero = Cl24 { cid: Key16::EMPTY, ts: 0, camp: 0 };
-        let mut res = Resolver::new(links, zero);
-        let mut emit = |c: Cl24, person: Key16, phash: u64| {
-            w.push((phash >> (64 - P_BITS)) as usize, Click { person, cid: c.cid, phash, ts: c.ts, camp: c.camp });
-        };
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= chunks.len() {
-                break;
-            }
-            let d = chunks[i].data;
-            populate(d);
-            csv::scan::<4, _>(d, |f| {
-                let (cid, uid) = (f[0], f[1]);
-                if cid.is_empty() || uid.is_empty() {
-                    return;
-                }
-                let Some(camp) = ctx.camps.get(f[2]) else { return };
-                let ts = match ctx.dates.parse_ts(f[3]) {
-                    Some(t) if t >= cws && t < ctx.we => t,
-                    _ => return,
-                };
-                let c = Cl24 { cid: Key16::new(cid), ts: (ts - ctx.base) as u32, camp };
-                res.push(c, Key16::new(uid), &mut emit);
-            });
-            release_chunk(d);
-        }
-        res.drain(&mut emit);
-        w.finish();
-    });
-    mark("clicks", &mut marks);
-
-    // ---- solve
-    let mut order: Vec<(usize, usize)> =
-        (0..P_SHARDS).map(|p| (p, ev_set.count(p) * 2 + click_set.count(p))).collect();
-    order.sort_by_key(|x| std::cmp::Reverse(x.1));
-    let wide_slice = &wide_store[..];
-    let next = AtomicUsize::new(0);
-    let results: Vec<(Vec<[Column; 6]>, Vec<CampAcc>)> = par(threads, |_| {
-        let mut w = Worker::new(ctx, wide_slice);
-        let mut sc = SolveScratch::new();
-        loop {
-            let k = next.fetch_add(1, Ordering::Relaxed);
-            if k >= P_SHARDS {
-                break;
-            }
-            let p = order[k].0;
-            let es = ev_set.take(p);
-            let cs = click_set.take(p);
-            sc.run_shard(es, cs, &mut w);
-        }
-        if w.cols[0].len() > 0 {
-            let last = std::mem::replace(&mut w.cols, new_user_cols(0));
-            w.done_cols.push(last);
-        }
-        (std::mem::take(&mut w.done_cols), std::mem::take(&mut w.acc))
-    });
-    ev_set.free_all();
-    click_set.free_all();
-    mark("solve", &mut marks);
+    let event_bytes: usize = event_files.iter().map(|d| d.len()).sum();
+    let est_user_rows: usize = (event_bytes / (threads * 500)).clamp(1024, 512_000);
+    let results = if event_bytes > (2500 << 20) {
+        let mut m = |name: &'static str| mark(name, &mut marks);
+        run_pipeline::<10, 10>(ctx, links, &event_files, &click_files, threads, est_user_rows, &mut m)
+    } else {
+        let mut m = |name: &'static str| mark(name, &mut marks);
+        run_pipeline::<9, 9>(ctx, links, &event_files, &click_files, threads, est_user_rows, &mut m)
+    };
 
     // ---- write (pooled blocks are released in parallel meanwhile)
     let ud = out_dir.join("user_daily");
