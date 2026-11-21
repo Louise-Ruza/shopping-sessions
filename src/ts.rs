@@ -53,7 +53,7 @@ fn non_digit_bits(d: u8) -> u8 {
 }
 
 /// Eight independent ASCII digit lanes, with no inter-byte carry for valid lanes.
-#[cfg(feature = "fast-fields")]
+
 #[inline(always)]
 fn digit_lanes(word: u64) -> Option<u64> {
     let digits = word ^ 0x3030_3030_3030_3030;
@@ -64,7 +64,7 @@ fn digit_lanes(word: u64) -> Option<u64> {
     }
 }
 
-#[cfg(feature = "fast-fields")]
+
 #[inline(always)]
 fn reduce_eight(digits: u64) -> u64 {
     let pairs = (digits & 0x00FF_00FF_00FF_00FF) * 10
@@ -76,7 +76,7 @@ fn reduce_eight(digits: u64) -> u64 {
 
 /// Decode the exactly eight bytes HH:MM:SS. Only ingest's guaranteed-valid F1
 /// path may skip validation; event/click timestamps always use STRICT=true.
-#[cfg(feature = "fast-fields")]
+
 #[inline(always)]
 fn clock_millis<const STRICT: bool>(word: u64) -> Option<i64> {
     let digits = word ^ u64::from_le_bytes(*b"00:00:00");
@@ -208,6 +208,20 @@ pub fn parse_f1_fast(b: &[u8]) -> Option<i64> {
     parse_ts(b)
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /// Direct-mapped 32-slot L1 date-prefix cache indexed by day-of-month (`1..=31`).
 /// For any <=27-day window (14d window + 7d click lookback + 6d late ingest), every
 /// calendar day-of-month is unique, so 100% of in-window F1/F2 dates hit with a
@@ -221,6 +235,8 @@ struct DateSlot {
 
 pub struct DateCache {
     slots: [DateSlot; 32],
+
+
 }
 
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
@@ -251,10 +267,15 @@ impl DateCache {
                 slots[d as usize] = DateSlot { prefix, day_ms: day * DAY_MS };
             }
         }
-        DateCache { slots }
+
+
+        DateCache { slots,
+
+
+        }
     }
 
-    #[cfg(feature = "fast-fields")]
+
     #[inline(always)]
     fn cached_day(&self, b: &[u8]) -> Option<i64> {
         // Callers establish at least ten bytes before reaching this method.
@@ -270,7 +291,7 @@ impl DateCache {
         None
     }
 
-    #[cfg(feature = "fast-fields")]
+
     #[inline(always)]
     fn calendar_cached(&self, b: &[u8]) -> Option<i64> {
         // Both callers establish at least 19 bytes before reaching this method.
@@ -284,9 +305,13 @@ impl DateCache {
         calendar(b)
     }
 
+
+
+
+
     /// Share one validated calendar lookup when F1 event and ingestion dates
     /// agree. Ingestion stays independent of event validity for global dedup.
-    #[cfg(feature = "fast-fields")]
+
     #[inline(always)]
     pub fn parse_event_ingest(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, Option<i64>) {
         if event.len() == 20 && ingest.len() == 20 && event[19] == b'Z'
@@ -307,46 +332,7 @@ impl DateCache {
         (self.parse_ts(event), self.parse_f1_ingest(ingest))
     }
 
-    #[cfg(not(feature = "fast-fields"))]
-    #[inline(always)]
-    fn calendar_cached(&self, b: &[u8]) -> Option<i64> {
-        let p = b.as_ptr();
-        unsafe {
-            let d0 = (*p.add(8)).wrapping_sub(b'0');
-            let d1 = (*p.add(9)).wrapping_sub(b'0');
-            let d = (d0 as u32 * 10 + d1 as u32) as usize;
-            if ((non_digit_bits(d0) | non_digit_bits(d1)) & 0xF0) == 0 && d < 32 {
-                let slot = *self.slots.get_unchecked(d);
-                let pref = (p as *const u64).read_unaligned();
-                if slot.prefix != 0 && pref == slot.prefix
-                    && ((*p.add(10) ^ b'T') | (*p.add(13) ^ b':') | (*p.add(16) ^ b':')) == 0
-                {
-                    let h0 = (*p.add(11)).wrapping_sub(b'0');
-                    let h1 = (*p.add(12)).wrapping_sub(b'0');
-                    let n0 = (*p.add(14)).wrapping_sub(b'0');
-                    let n1 = (*p.add(15)).wrapping_sub(b'0');
-                    let s0 = (*p.add(17)).wrapping_sub(b'0');
-                    let s1 = (*p.add(18)).wrapping_sub(b'0');
-                    let bad = non_digit_bits(h0)
-                        | non_digit_bits(h1)
-                        | non_digit_bits(n0)
-                        | non_digit_bits(n1)
-                        | non_digit_bits(s0)
-                        | non_digit_bits(s1);
-                    if (bad & 0xF0) == 0 {
-                        let h = h0 as u32 * 10 + h1 as u32;
-                        let mi = n0 as u32 * 10 + n1 as u32;
-                        let s = s0 as u32 * 10 + s1 as u32;
-                        if h <= 23 && mi <= 59 && s <= 59 {
-                            return Some(slot.day_ms + (h as i64 * 3600 + mi as i64 * 60 + s as i64) * 1000);
-                        }
-                    }
-                    return None;
-                }
-            }
-        }
-        calendar(b)
-    }
+
 
     /// Ultra-fast path for `ingest_ts` (guaranteed valid F1 per rules.md).
     #[inline(always)]
@@ -359,18 +345,9 @@ impl DateCache {
                 if d < 32 {
                     let slot = *self.slots.get_unchecked(d);
                     if (p as *const u64).read_unaligned() == slot.prefix {
-                        #[cfg(feature = "fast-fields")]
+
                         let time_ms = clock_millis::<false>(u64::from_le_bytes(b[11..19].try_into().unwrap())).unwrap();
-                        #[cfg(not(feature = "fast-fields"))]
-                        let time_ms = {
-                            let h = (*p.add(11)).wrapping_sub(b'0') as i64 * 10
-                                + (*p.add(12)).wrapping_sub(b'0') as i64;
-                            let mi = (*p.add(14)).wrapping_sub(b'0') as i64 * 10
-                                + (*p.add(15)).wrapping_sub(b'0') as i64;
-                            let s = (*p.add(17)).wrapping_sub(b'0') as i64 * 10
-                                + (*p.add(18)).wrapping_sub(b'0') as i64;
-                            (h * 3600 + mi * 60 + s) * 1000
-                        };
+
                         return Some(slot.day_ms + time_ms);
                     }
                 }
@@ -417,7 +394,7 @@ impl DateCache {
     }
 }
 
-#[cfg(feature = "fast-fields")]
+
 #[inline(always)]
 fn parse_f3_13(b: &[u8]) -> Option<i64> {
     // Two bounded overlapping loads cover all 13 digits. The first five digits
@@ -429,57 +406,7 @@ fn parse_f3_13(b: &[u8]) -> Option<i64> {
     Some((hi * 100_000_000 + reduce_eight(last)) as i64)
 }
 
-#[cfg(not(feature = "fast-fields"))]
-#[inline(always)]
-fn parse_f3_13(b: &[u8]) -> Option<i64> {
-    let p = b.as_ptr();
-    unsafe {
-        let d0 = (*p).wrapping_sub(b'0');
-        let d1 = (*p.add(1)).wrapping_sub(b'0');
-        let d2 = (*p.add(2)).wrapping_sub(b'0');
-        let d3 = (*p.add(3)).wrapping_sub(b'0');
-        let d4 = (*p.add(4)).wrapping_sub(b'0');
-        let d5 = (*p.add(5)).wrapping_sub(b'0');
-        let d6 = (*p.add(6)).wrapping_sub(b'0');
-        let d7 = (*p.add(7)).wrapping_sub(b'0');
-        let d8 = (*p.add(8)).wrapping_sub(b'0');
-        let d9 = (*p.add(9)).wrapping_sub(b'0');
-        let d10 = (*p.add(10)).wrapping_sub(b'0');
-        let d11 = (*p.add(11)).wrapping_sub(b'0');
-        let d12 = (*p.add(12)).wrapping_sub(b'0');
-        let bad = non_digit_bits(d0)
-            | non_digit_bits(d1)
-            | non_digit_bits(d2)
-            | non_digit_bits(d3)
-            | non_digit_bits(d4)
-            | non_digit_bits(d5)
-            | non_digit_bits(d6)
-            | non_digit_bits(d7)
-            | non_digit_bits(d8)
-            | non_digit_bits(d9)
-            | non_digit_bits(d10)
-            | non_digit_bits(d11)
-            | non_digit_bits(d12);
-        if (bad & 0xF0) != 0 {
-            return None;
-        }
-        let hi = (d0 as u64 * 100_000
-            + d1 as u64 * 10_000
-            + d2 as u64 * 1_000
-            + d3 as u64 * 100
-            + d4 as u64 * 10
-            + d5 as u64)
-            * 10_000_000;
-        let lo = d6 as u64 * 1_000_000
-            + d7 as u64 * 100_000
-            + d8 as u64 * 10_000
-            + d9 as u64 * 1_000
-            + d10 as u64 * 100
-            + d11 as u64 * 10
-            + d12 as u64;
-        Some((hi + lo) as i64)
-    }
-}
+
 
 /// Returns epoch ms, or None for a bad timestamp. A digits-only value too large
 /// for i64 is returned as i64::MAX (valid form, outside every window).
@@ -592,7 +519,13 @@ fn parse_price_slow(b: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "fast-fields")]
+
+
+
+
+
+
+
     #[test]
     fn packed_clock_matches_scalar_calendar_for_every_byte_pair() {
         let ws = parse_ts(b"2026-10-01T00:00:00Z").unwrap();
@@ -606,7 +539,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "fast-fields")]
+
     #[test]
     fn paired_dates_preserve_independent_ingestion_and_strict_event_validation() {
         let ingest = b"2026-10-03T12:34:56Z";
@@ -638,7 +571,7 @@ mod tests {
         assert_eq!(cache.parse_event_ingest(b"2026-10-03T24:00:00Z", ingest), (None, parse_ts(ingest)));
     }
 
-    #[cfg(feature = "fast-fields")]
+
     #[test]
     fn packed_thirteen_digits_match_independent_integer_parsing() {
         for position in 0..13 {

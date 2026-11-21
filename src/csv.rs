@@ -10,7 +10,7 @@
 #[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
 
-#[cfg(feature = "fast-schema")]
+
 mod fast_schema;
 
 const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
@@ -173,7 +173,10 @@ pub fn simd_backend() -> &'static str {
             if std::env::var("FORCE_SIMD").ok().as_deref() == Some("scalar") {
                 false
             } else {
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi1")
+                is_x86_feature_detected!("avx2")
+                    && is_x86_feature_detected!("bmi1")
+                    && is_x86_feature_detected!("bmi2")
+                    && is_x86_feature_detected!("popcnt")
             }
         }) {
             return "avx2";
@@ -186,7 +189,7 @@ pub fn simd_backend() -> &'static str {
 /// with the unquoted fields of every well-formed line with exactly N fields.
 #[inline(always)]
 pub fn scan<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) {
-    #[cfg(feature = "fast-schema")]
+
     if N == 4 || N == 7 {
         fast_schema::scan::<N, F>(data, f);
         return;
@@ -202,7 +205,10 @@ fn scan_baseline<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f
             if std::env::var("FORCE_SIMD").ok().as_deref() == Some("scalar") {
                 false
             } else {
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi1")
+                is_x86_feature_detected!("avx2")
+                    && is_x86_feature_detected!("bmi1")
+                    && is_x86_feature_detected!("bmi2")
+                    && is_x86_feature_detected!("popcnt")
             }
         }) {
             unsafe { scan_avx2::<N, F>(data, f) };

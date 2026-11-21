@@ -4,13 +4,6 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[features]
-fast-schema = []
-fast-fields = []
-event-front = []
-ascii-keys = []
-default = ["fast-schema", "fast-fields", "event-front", "ascii-keys"]
-
 [[bin]]
 name = "shopping-sessions"
 path = "src/main.rs"
@@ -25,8 +18,3 @@ codegen-units = 1
 panic = "abort"
 debug = false
 incremental = false
-
-[profile.prof]
-inherits = "release"
-debug = "line-tables-only"
-strip = false

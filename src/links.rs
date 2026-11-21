@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arena::{ShardSet, Scatter};
 use crate::key::Key8;
-use crate::{csv, make_chunks, chunk_target, par, populate, release_chunk, SyncPtr};
+use crate::{csv, fixed, make_chunks, chunk_target, par, populate, release_chunk, SyncPtr};
 
 pub const SEED_L: u64 = 0x9e37_79b9_7f4a_7c15;
 pub const SEED_A: u64 = SEED_L;
@@ -36,6 +36,7 @@ pub struct LinkTable {
     rbits: u32, // log2 slots per region
     bloom: Vec<u64>,
     bloom_mask: usize,
+
 }
 
 #[inline(always)]
@@ -44,7 +45,7 @@ fn bloom_word(h: u64, mask: usize) -> usize {
 }
 #[inline(always)]
 fn bloom_bits(h: u64) -> u64 {
-    (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63))
+    (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63)) | (1u64 << ((h >> 12) & 63))
 }
 
 #[inline(always)]
@@ -60,6 +61,15 @@ pub fn prefetch(p: *const u8) {
 }
 
 impl LinkTable {
+
+
+    #[inline(always)]
+    fn resolved_hash(&self, person: Key8) -> u64 {
+
+
+        { person.hash(SEED_A) }
+    }
+
     #[inline(always)]
     fn slot(&self, h: u64) -> usize {
         (((h >> (64 - REGION_BITS)) as usize) << self.rbits) | (h as usize & ((1 << self.rbits) - 1))
@@ -100,7 +110,10 @@ impl LinkTable {
         if !self.maybe(h) {
             return uid;
         }
-        self.lookup(h, uid).unwrap_or(uid)
+        let person = self.lookup(h, uid).unwrap_or(uid);
+
+
+        { person }
     }
 }
 
@@ -114,7 +127,7 @@ struct CEnt {
     phash: u64,
 }
 
-const CACHE: usize = 128;
+const CACHE: usize = 512;
 /// Items between the Bloom-word prefetch and the Bloom test.
 const RA: usize = 8;
 /// Items between the table-slot prefetch and the table probe.
@@ -161,11 +174,11 @@ impl<'a, R: Copy> Resolver<'a, R> {
         }
         prefetch(unsafe { self.lt.bloom.as_ptr().add(bloom_word(h, self.lt.bloom_mask)) } as *const u8);
         if self.at - self.ah == RA {
-            let x = self.a[self.ah % RA];
+            let x = unsafe { *self.a.get_unchecked(self.ah & (RA - 1)) };
             self.ah += 1;
             self.stage_b(x, emit);
         }
-        self.a[self.at % RA] = (item, uid, h);
+        unsafe { *self.a.get_unchecked_mut(self.at & (RA - 1)) = (item, uid, h) };
         self.at += 1;
     }
 
@@ -173,17 +186,17 @@ impl<'a, R: Copy> Resolver<'a, R> {
     fn stage_b(&mut self, x: Item<R>, emit: &mut impl FnMut(R, Key8, u64)) {
         let (item, uid, h) = x;
         if !self.lt.maybe(h) {
-            self.cache[(h as usize) & (CACHE - 1)] = CEnt { uid, person: uid, phash: h };
+            unsafe { *self.cache.get_unchecked_mut((h as usize) & (CACHE - 1)) = CEnt { uid, person: uid, phash: h } };
             emit(item, uid, h);
             return;
         }
         self.lt.prefetch(h);
         if self.bt - self.bh == RB {
-            let y = self.b[self.bh % RB];
+            let y = unsafe { *self.b.get_unchecked(self.bh & (RB - 1)) };
             self.bh += 1;
             self.finish_one(y, emit);
         }
-        self.b[self.bt % RB] = x;
+        unsafe { *self.b.get_unchecked_mut(self.bt & (RB - 1)) = x };
         self.bt += 1;
     }
 
@@ -191,21 +204,21 @@ impl<'a, R: Copy> Resolver<'a, R> {
     fn finish_one(&mut self, y: Item<R>, emit: &mut impl FnMut(R, Key8, u64)) {
         let (item, uid, h) = y;
         let (person, phash) = match self.lt.lookup(h, uid) {
-            Some(p) => (p, p.hash(SEED_A)),
+            Some(p) => (p, self.lt.resolved_hash(p)),
             None => (uid, h),
         };
-        self.cache[(h as usize) & (CACHE - 1)] = CEnt { uid, person, phash };
+        unsafe { *self.cache.get_unchecked_mut((h as usize) & (CACHE - 1)) = CEnt { uid, person, phash } };
         emit(item, person, phash);
     }
 
     pub fn drain(&mut self, emit: &mut impl FnMut(R, Key8, u64)) {
         while self.ah < self.at {
-            let x = self.a[self.ah % RA];
+            let x = unsafe { *self.a.get_unchecked(self.ah & (RA - 1)) };
             self.ah += 1;
             self.stage_b(x, emit);
         }
         while self.bh < self.bt {
-            let y = self.b[self.bh % RB];
+            let y = unsafe { *self.b.get_unchecked(self.bh & (RB - 1)) };
             self.bh += 1;
             self.finish_one(y, emit);
         }
@@ -230,6 +243,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
     // Per thread: number of edges.
     let edges: Vec<usize> = par(threads, |t| {
         let mut w = Scatter::new(&sides);
+        let mut tok = fixed::Tok::default();
         let mut ne = 0u64;
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
@@ -238,7 +252,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
             }
             let d = chunks[i].data;
             populate(d);
-            csv::scan::<2, _>(d, |f| {
+            fixed::scan::<2, _>(&mut tok, d, |f| {
                 let (a, b) = (f[0], f[1]);
                 if a.is_empty() || b.is_empty() {
                     return;
@@ -400,13 +414,15 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
     }
     drop(eps);
 
+
+
     // Non-root nodes, grouped by table region (per thread, per region).
     let step = n.div_ceil(threads).max(1);
     let groups: Vec<Vec<Vec<u64>>> = par(threads, |t| {
         let mut g: Vec<Vec<u64>> = (0..REGIONS).map(|_| Vec::new()).collect();
         for x in (t * step).min(n)..((t + 1) * step).min(n) {
             let r = find(x as u32);
-            if r != x as u32 {
+            if false || r != x as u32 {
                 let h = keys[x].hash(SEED_L);
                 g[(h >> (64 - REGION_BITS)) as usize].push(((r as u64) << 32) | x as u64);
             }
@@ -460,13 +476,18 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
                         while !(*tab.add((r << rbits) + i)).key.is_empty() {
                             i = (i + 1) & rmask;
                         }
-                        *tab.add((r << rbits) + i) = LEnt { key, person: keys[root] };
+
+
+                        let person = keys[root];
+                        *tab.add((r << rbits) + i) = LEnt { key, person };
                     }
                 }
             }
         });
     }
-    LinkTable { tab, rbits, bloom: bloom.into_iter().map(|a| a.into_inner()).collect(), bloom_mask }
+    LinkTable { tab, rbits, bloom: bloom.into_iter().map(|a| a.into_inner()).collect(), bloom_mask,
+
+    }
 }
 
 /// Fast zero-sync single-threaded link-table builder (retained for reference/tests).
@@ -562,11 +583,12 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
     drop(tab);
 
     let n = keys.len();
+
     let mut counts = [0usize; REGIONS];
     let mut non_roots: Vec<(u32, u32, u64)> = Vec::with_capacity(n / 2 + 16);
     for x in 0..n {
         let r = find_seq(&mut parent, x as u32);
-        if r != x as u32 {
+        if false || r != x as u32 {
             let h = unsafe { keys.get_unchecked(x) }.hash(SEED_L);
             counts[(h >> (64 - REGION_BITS)) as usize] += 1;
             non_roots.push((x as u32, r, h));
@@ -604,11 +626,15 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
             }
             *lptr.add(base + i) = LEnt {
                 key: *keys.get_unchecked(x as usize),
+
+
                 person: *keys.get_unchecked(root as usize),
             };
         }
     }
-    LinkTable { tab: ltab, rbits, bloom, bloom_mask }
+    LinkTable { tab: ltab, rbits, bloom, bloom_mask,
+
+    }
 }
 
 #[cfg(test)]

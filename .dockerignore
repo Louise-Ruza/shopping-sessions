@@ -1,5 +1,9 @@
 *
 !Cargo.toml
 !Cargo.lock
+!Dockerfile
 !src/
 !src/**
+!LICENSE
+!third_party/
+!third_party/**

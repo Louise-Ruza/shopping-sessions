@@ -295,6 +295,7 @@ pub struct Scatter<'a, T: Copy> {
     set: &'a ShardSet<T>,
     stage: Vec<Line>,
     cur: Vec<Cur>,
+
     nt: bool,
     shared: bool,
     local_block: usize,
@@ -306,14 +307,16 @@ impl<'a, T: Copy> Scatter<'a, T> {
     const SZ: usize = std::mem::size_of::<T>();
     const STAGE: usize = stage_bytes(std::mem::size_of::<T>());
     const LINES: usize = Self::STAGE / 64;
+
     const PER: u32 = (Self::STAGE / std::mem::size_of::<T>()) as u32;
 
     pub fn new(set: &'a ShardSet<T>) -> Scatter<'a, T> {
         let n = set.len();
         Scatter {
             set,
-            stage: vec![Line([0; 64]); n * Self::LINES],
+            stage: if false { Vec::new() } else { vec![Line([0; 64]); n * Self::LINES] },
             cur: vec![Cur { ptr: 0, off: 0, fill: 0 }; n],
+
             nt: nt_enabled(),
             shared: set.is_shared(),
             local_block: 0,
@@ -337,6 +340,8 @@ impl<'a, T: Copy> Scatter<'a, T> {
 
     #[inline(always)]
     pub fn push(&mut self, s: usize, x: T) {
+
+
         unsafe {
             let c = self.cur.get_unchecked_mut(s);
             let st = (self.stage.as_mut_ptr().add(s * Self::LINES)) as *mut T;
@@ -348,7 +353,10 @@ impl<'a, T: Copy> Scatter<'a, T> {
         }
     }
 
+
+
     #[inline(never)]
+
     fn flush(&mut self, s: usize) {
         let c = self.cur[s];
         let (mut ptr, mut off) = (c.ptr, c.off as usize);
@@ -411,6 +419,7 @@ impl<'a, T: Copy> Scatter<'a, T> {
     }
 }
 
+
 fn nt_enabled() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -432,6 +441,7 @@ fn sfence() {
 
 /// Copies `bytes` (a multiple of 64) from 64-byte-aligned `src` to 64-byte-aligned `dst`.
 #[inline(always)]
+
 unsafe fn copy_stage(nt: bool, dst: *mut u8, src: *const u8, bytes: usize) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -444,7 +454,7 @@ unsafe fn copy_stage(nt: bool, dst: *mut u8, src: *const u8, bytes: usize) {
     std::ptr::copy_nonoverlapping(src, dst, bytes);
 }
 
-#[cfg(target_arch = "x86_64")]
+# [cfg (target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2")]
 unsafe fn stream_avx2(dst: *mut u8, src: *const u8, bytes: usize) {
     use core::arch::x86_64::*;

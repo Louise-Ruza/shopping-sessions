@@ -8,6 +8,10 @@
 
 const BATCH: usize = 16 * 1024;
 
+type Position = u16;
+
+const _: () = assert!(BATCH + 64 < Position::MAX as usize);
+
 #[derive(Clone, Copy, Default)]
 struct Quotes {
     bad: u64,
@@ -17,8 +21,8 @@ struct Quotes {
 }
 
 struct Index {
-    commas: Vec<u32>,
-    lines: Vec<u32>,
+    commas: Vec<Position>,
+    lines: Vec<Position>,
     quotes: Vec<Quotes>,
     nc: usize,
     nl: usize,
@@ -47,7 +51,7 @@ impl Index {
     }
 
     #[inline(always)]
-    fn build<M: Fn(&[u8; 64]) -> (u64, u64, u64)>(&mut self, data: &[u8], masks: &M) {
+    fn build<const WIDE: bool, M: Fn(&[u8; 64]) -> (u64, u64, u64)>(&mut self, data: &[u8], masks: &M) {
         self.nc = 0;
         self.nl = 0;
         let mut before = 0u64;
@@ -64,6 +68,14 @@ impl Index {
                 &tail
             };
             let (commas, lines, quotes) = masks(bytes);
+            # [cfg (target_arch = "x86_64")]
+            if WIDE {
+                // scan_wide checks the CPU features before entering this loop.
+                unsafe { wide::append(&mut self.commas, &mut self.nc, off, commas); }
+            } else {
+                spill::<4>(&mut self.commas, &mut self.nc, off, commas);
+            }
+            # [cfg (not (target_arch = "x86_64"))]
             spill::<4>(&mut self.commas, &mut self.nc, off, commas);
             spill::<1>(&mut self.lines, &mut self.nl, off, lines);
             let delimiters = commas | lines;
@@ -91,7 +103,7 @@ impl Index {
             previous_delimiter = delimiters >> 63;
         }
         self.quotes[data.len().div_ceil(64)] = Quotes { before, ..Quotes::default() };
-        self.commas[self.nc..self.nc + 16].fill(u32::MAX);
+        self.commas[self.nc..self.nc + 16].fill(Position::MAX);
     }
 
     #[inline(always)]
@@ -141,7 +153,7 @@ impl Index {
 }
 
 #[inline(always)]
-fn spill<const FIRST: usize>(out: &mut [u32], count: &mut usize, base: usize, mut bits: u64) {
+fn spill<const FIRST: usize>(out: &mut [Position], count: &mut usize, base: usize, mut bits: u64) {
     let n = bits.count_ones() as usize;
     let mut i = *count;
     // Writes after the real population are ignored and overwritten; Index owns
@@ -149,12 +161,12 @@ fn spill<const FIRST: usize>(out: &mut [u32], count: &mut usize, base: usize, mu
     for _ in 0..FIRST {
         // Previous populations plus this block's hits cannot exceed the byte
         // count. Any speculative stores are covered by the 16 spare entries.
-        unsafe { *out.get_unchecked_mut(i) = (base + bits.trailing_zeros() as usize) as u32; }
+        unsafe { *out.get_unchecked_mut(i) = (base + bits.trailing_zeros() as usize) as Position; }
         i += 1;
         bits &= bits.wrapping_sub(1);
     }
     while bits != 0 {
-        unsafe { *out.get_unchecked_mut(i) = (base + bits.trailing_zeros() as usize) as u32; }
+        unsafe { *out.get_unchecked_mut(i) = (base + bits.trailing_zeros() as usize) as Position; }
         i += 1;
         bits &= bits - 1;
     }
@@ -180,14 +192,14 @@ fn scalar_masks(bytes: &[u8; 64]) -> (u64, u64, u64) {
 }
 
 #[inline(always)]
-fn scan_with<'a, const N: usize, F: FnMut(&[&'a [u8]; N]), M: Fn(&[u8; 64]) -> (u64, u64, u64)>(
+fn scan_with<'a, const N: usize, const WIDE: bool, F: FnMut(&[&'a [u8]; N]), M: Fn(&[u8; 64]) -> (u64, u64, u64)>(
     mut data: &'a [u8], mut f: F, masks: M,
 ) {
     debug_assert!(N == 4 || N == 7);
     let mut index = Index::new(data.len());
     while !data.is_empty() {
         let size = data.len().min(BATCH);
-        index.build(&data[..size], &masks);
+        index.build::<WIDE, _>(&data[..size], &masks);
         let consumed = index.emit::<N, F>(&data[..size], &mut f);
         if consumed == 0 {
             // Unbounded rows and final non-LF tails stay on the validated general
@@ -205,6 +217,11 @@ fn scan_with<'a, const N: usize, F: FnMut(&[&'a [u8]; N]), M: Fn(&[u8; 64]) -> (
 pub(super) fn scan<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) {
     #[cfg(target_arch = "x86_64")]
     if super::simd_backend() == "avx2" {
+
+        if wide::available() {
+            unsafe { wide::scan_wide::<N, F>(data, f) };
+            return;
+        }
         if is_x86_feature_detected!("popcnt") {
             unsafe { scan_avx2::<N, F>(data, f) };
         } else {
@@ -212,13 +229,50 @@ pub(super) fn scan<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8],
         }
         return;
     }
-    scan_with::<N, F, _>(data, f, scalar_masks);
+    scan_with::<N, false, F, _>(data, f, scalar_masks);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,popcnt")]
 unsafe fn scan_avx2<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) {
-    scan_with::<N, F, _>(data, f, |bytes| unsafe { avx2_masks(bytes) });
+    scan_with::<N, false, F, _>(data, f, |bytes| unsafe { avx2_masks(bytes) });
+}
+
+# [cfg (target_arch = "x86_64")]
+mod wide {
+    use core::arch::x86_64::*;
+
+    pub(super) fn available() -> bool {
+        is_x86_feature_detected!("avx512vbmi2") && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("popcnt")
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi2,popcnt")]
+    pub(super) unsafe fn scan_wide<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8], f: F) {
+        super::scan_with::<N, true, F, _>(data, f, |bytes| {
+            let v = _mm512_loadu_si512(bytes.as_ptr().cast());
+            let mask = |b| _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b));
+            (mask(b',' as i8), mask(b'\n' as i8), mask(b'"' as i8))
+        });
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi2,popcnt")]
+    pub(super) unsafe fn append(out: &mut [u16], count: &mut usize, base: usize, mask: u64) {
+        const LANES: [i16; 32] = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+                                  16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31];
+        let indices = _mm512_add_epi16(_mm512_loadu_si512(LANES.as_ptr().cast()), _mm512_set1_epi16(base as i16));
+        let lo = mask as u32;
+        let hi = (mask >> 32) as u32;
+        // Compress-store writes exactly popcount(mask) lanes. Every lane is an
+        // input byte in this batch, and each byte contributes at most one index.
+        debug_assert!(*count + mask.count_ones() as usize <= out.len());
+        let dest = out.as_mut_ptr().add(*count).cast();
+        _mm512_mask_compressstoreu_epi16(dest, lo, indices);
+        _mm512_mask_compressstoreu_epi16(dest.add(lo.count_ones() as usize), hi,
+            _mm512_add_epi16(indices, _mm512_set1_epi16(32)));
+        *count += mask.count_ones() as usize;
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -251,7 +305,7 @@ mod tests {
         });
         assert_eq!(baseline, expected, "baseline input={input:?}");
         let mut scalar = Vec::new();
-        scan_with::<N, _, _>(input, |f| {
+        scan_with::<N, false, _, _>(input, |f| {
             scalar.push(f.iter().map(|x| x.to_vec()).collect::<Vec<_>>());
         }, scalar_masks);
         assert_eq!(scalar, expected, "structural scalar input={input:?}");
@@ -282,6 +336,26 @@ mod tests {
         }
         for (byte, expected) in [(b',', (u64::MAX, 0, 0)), (b'\n', (0, u64::MAX, 0)), (b'"', (0, 0, u64::MAX))] {
             assert_eq!(scalar_masks(&[byte; 64]), expected);
+        }
+    }
+
+    # [cfg (target_arch = "x86_64")]
+    #[test]
+    fn compressed_positions_match_bit_iteration() {
+        if !wide::available() { return; }
+        let mut bits = 1u64;
+        for i in 0..4096 {
+            bits ^= bits << 13;
+            bits ^= bits >> 7;
+            bits ^= bits << 17;
+            let mask = match i { 0 => 0, 1 => u64::MAX, _ => bits };
+            let mut output = [17u16; 68];
+            let mut count = 3;
+            unsafe { wide::append(&mut output, &mut count, BATCH - 64, mask); }
+            let expected: Vec<_> = (0..64).filter(|&lane| mask >> lane & 1 != 0)
+                .map(|lane| (BATCH - 64 + lane) as u16).collect();
+            assert_eq!(&output[3..count], expected);
+            assert_eq!((output[2], output[count]), (17, 17));
         }
     }
 
