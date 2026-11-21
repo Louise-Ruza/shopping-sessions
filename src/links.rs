@@ -7,7 +7,7 @@
 //! lets unlinked/root IDs skip the DRAM table probe, and `Resolver` adds a 64-entry
 //! direct-mapped per-thread cache (whale IDs) plus a prefetch delay ring.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::arena::{ShardSet, Scatter};
 use crate::key::Key8;
@@ -36,6 +36,7 @@ pub struct LinkTable {
     rbits: u32, // log2 slots per region
     bloom: Vec<u64>,
     bloom_mask: usize,
+    empty: bool,
 }
 
 #[inline(always)]
@@ -60,6 +61,35 @@ pub fn prefetch(p: *const u8) {
 }
 
 impl LinkTable {
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.empty
+    }
+
+    #[inline(always)]
+    pub fn prefetch_bloom(&self, h: u64) {
+        prefetch(unsafe { self.bloom.as_ptr().add(bloom_word(h, self.bloom_mask)) } as *const u8);
+    }
+
+    /// Release LinkTable backing pages back to the OS once Tier 1 finishes.
+    pub fn release_pages(&self) {
+        #[cfg(all(target_os = "linux", not(test)))]
+        {
+            for (ptr, bytes) in [
+                (self.tab.as_ptr() as usize, self.tab.len() * std::mem::size_of::<LEnt>()),
+                (self.bloom.as_ptr() as usize, self.bloom.len() * std::mem::size_of::<u64>()),
+            ] {
+                if bytes >= 131_072 {
+                    let a = (ptr + 4095) & !4095;
+                    let e = (ptr + bytes) & !4095;
+                    if e > a {
+                        unsafe { libc::madvise(a as *mut libc::c_void, e - a, libc::MADV_DONTNEED) };
+                    }
+                }
+            }
+        }
+    }
+
     #[inline(always)]
     fn slot(&self, h: u64) -> usize {
         (((h >> (64 - REGION_BITS)) as usize) << self.rbits) | (h as usize & ((1 << self.rbits) - 1))
@@ -107,24 +137,26 @@ impl LinkTable {
 // ---------------------------------------------------------------------------
 // per-thread resolver: L1 direct-mapped cache + Bloom + prefetch ring
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
+#[repr(C, align(32))]
 struct CEnt {
     uid: Key8,
     person: Key8,
     phash: u64,
 }
 
+#[allow(dead_code)]
 const CACHE: usize = 512;
-/// Items between the Bloom-word prefetch and the Bloom test.
+#[allow(dead_code)]
 const RA: usize = 8;
-/// Items between the table-slot prefetch and the table probe.
+#[allow(dead_code)]
 const RB: usize = 16;
 
+#[allow(dead_code)]
 type Item<R> = (R, Key8, u64);
 
-/// Two-stage software pipeline: push -> (cache hit: emit) -> prefetch Bloom word ->
-/// RA items later: Bloom test (negative: emit uid itself) -> prefetch table slot ->
-/// RB items later: exact table probe -> emit. Output order differs from input order.
+#[allow(dead_code)]
 pub struct Resolver<'a, R: Copy> {
     lt: &'a LinkTable,
     cache: [CEnt; CACHE],
@@ -136,6 +168,7 @@ pub struct Resolver<'a, R: Copy> {
     bt: usize,
 }
 
+#[allow(dead_code)]
 impl<'a, R: Copy> Resolver<'a, R> {
     pub fn new(lt: &'a LinkTable, zero: R) -> Self {
         Resolver {
@@ -409,19 +442,31 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
     }
     drop(eps);
 
-    // Non-root nodes, grouped by table region (per thread, per region).
+    // Every node belonging to a component of size >= 2 (both aliases AND their canonical root)
+    // is stored in LinkTable so Tier-1 solve can tell truly unlinked users apart from linked roots.
     let step = n.div_ceil(threads).max(1);
-    let groups: Vec<Vec<Vec<u64>>> = par(threads, |t| {
-        let mut g: Vec<Vec<u64>> = (0..REGIONS).map(|_| Vec::new()).collect();
+    let has_alias: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+    par(threads, |t| {
         for x in (t * step).min(n)..((t + 1) * step).min(n) {
             let r = find(x as u32);
             if r != x as u32 {
+                has_alias[r as usize].store(1, Ordering::Relaxed);
+                parent[x].store(r, Ordering::Relaxed);
+            }
+        }
+    });
+    let groups: Vec<Vec<Vec<u64>>> = par(threads, |t| {
+        let mut g: Vec<Vec<u64>> = (0..REGIONS).map(|_| Vec::new()).collect();
+        for x in (t * step).min(n)..((t + 1) * step).min(n) {
+            let r = parent[x].load(Ordering::Relaxed);
+            if r != x as u32 || has_alias[x].load(Ordering::Relaxed) != 0 {
                 let h = keys[x].hash(SEED_L);
                 g[(h >> (64 - REGION_BITS)) as usize].push(((r as u64) << 32) | x as u64);
             }
         }
         g
     });
+    drop(has_alias);
     let mut counts = vec![0usize; REGIONS];
     for g in &groups {
         for (r, v) in g.iter().enumerate() {
@@ -475,7 +520,13 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
             }
         });
     }
-    LinkTable { tab, rbits, bloom: bloom.into_iter().map(|a| a.into_inner()).collect(), bloom_mask }
+    LinkTable {
+        tab,
+        rbits,
+        bloom: bloom.into_iter().map(|a| a.into_inner()).collect(),
+        bloom_mask,
+        empty: total_nr == 0,
+    }
 }
 
 /// Fast zero-sync single-threaded link-table builder (retained for reference/tests).
@@ -571,20 +622,27 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
     drop(tab);
 
     let n = keys.len();
-    let mut counts = [0usize; REGIONS];
-    let mut non_roots: Vec<(u32, u32, u64)> = Vec::with_capacity(n / 2 + 16);
+    let mut has_alias = vec![false; n];
     for x in 0..n {
         let r = find_seq(&mut parent, x as u32);
         if r != x as u32 {
+            has_alias[r as usize] = true;
+        }
+    }
+    let mut counts = [0usize; REGIONS];
+    let mut linked: Vec<(u32, u32, u64)> = Vec::with_capacity(n + 16);
+    for x in 0..n {
+        let r = find_seq(&mut parent, x as u32);
+        if r != x as u32 || has_alias[x] {
             let h = unsafe { keys.get_unchecked(x) }.hash(SEED_L);
             counts[(h >> (64 - REGION_BITS)) as usize] += 1;
-            non_roots.push((x as u32, r, h));
+            linked.push((x as u32, r, h));
         }
     }
     drop(parent);
 
-    let total_nr = non_roots.len();
-    let bloom_words = ((total_nr * 12 / 64).next_power_of_two()).clamp(1 << 10, 1 << 18);
+    let total_nr = linked.len();
+    let bloom_words = ((total_nr * 12 / 64).next_power_of_two()).clamp(1 << 10, 1 << 20);
     let bloom_mask = bloom_words - 1;
     let maxc = counts.iter().copied().max().unwrap_or(0);
     let rbits = ((maxc + maxc / 2 + 1).next_power_of_two().max(4)).trailing_zeros();
@@ -602,7 +660,7 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
     let mut bloom = vec![0u64; bloom_words];
     let rmask = (1usize << rbits) - 1;
     let lptr = ltab.as_mut_ptr();
-    for &(x, root, h) in &non_roots {
+    for &(x, root, h) in &linked {
         unsafe {
             *bloom.get_unchecked_mut(bloom_word(h, bloom_mask)) |= bloom_bits(h);
             let r = (h >> (64 - REGION_BITS)) as usize;
@@ -617,7 +675,7 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
             };
         }
     }
-    LinkTable { tab: ltab, rbits, bloom, bloom_mask }
+    LinkTable { tab: ltab, rbits, bloom, bloom_mask, empty: total_nr == 0 }
 }
 
 #[cfg(test)]
@@ -656,6 +714,14 @@ mod tests {
             assert_eq!(lt.resolve(Key8::new(b"M")), Key8::new(long_b.as_bytes()));
             assert_eq!(lt.resolve(Key8::new(b"q")), Key8::new(b"q"));
             assert_eq!(lt.resolve(Key8::new(b"unlinked")), Key8::new(b"unlinked"));
+            // Two-tier invariant: component roots of size >= 2 MUST be present in LinkTable,
+            // while self-links and unlinked IDs must NOT be present.
+            let k_root = Key8::new(b"n0000");
+            assert_eq!(lt.lookup(k_root.hash(SEED_L), k_root), Some(k_root));
+            let k_self = Key8::new(b"q");
+            assert_eq!(lt.lookup(k_self.hash(SEED_L), k_self), None);
+            let k_un = Key8::new(b"unlinked");
+            assert_eq!(lt.lookup(k_un.hash(SEED_L), k_un), None);
         }
     }
 }

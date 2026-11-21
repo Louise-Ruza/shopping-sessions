@@ -1,18 +1,19 @@
 //! Exact 8-byte keys for IDs (`Key8`).
 //!
-//! Any ID of length 1..=10 using the 63-character sorted ASCII alphabet
-//! `0-9`, `A-Z`, `_`, `a-z` is packed inline into 60 big-endian 6-bit slots
-//! (codes 1..=63; 0 = end-of-string padding; bit 63 = 0). Because the 6-bit
-//! codes are strictly monotonically increasing in ASCII order and 0 < 1,
-//! comparing two inline `Key8` values as plain `u64` is **100% identical**
-//! to byte-wise lexicographic comparison, and equality is plain `u64` equality.
+//! Any ID of length 1..=9 consisting of nonzero 7-bit ASCII bytes (`0x01..=0x7F`)
+//! is packed directly into 63 big-endian bits (9 x 7-bit slots, zero-padded on
+//! the right; bit 63 = 0). Because `0 < 0x01 <= byte <= 0x7F`, comparing two
+//! inline `Key8` values as plain `u64` is **100% identical** to byte-wise
+//! lexicographic comparison, and equality is plain `u64` equality.
 //!
-//! Any longer ID (>10 bytes) or ID containing any byte outside `[0-9A-Za-z_]`
-//! (embedded NULs, hyphens, Unicode, spaces, etc.) is interned in a global,
-//! thread-safe sharded `OverflowStore` with bit 63 = 1 (`OVF_BIT`). Equal
-//! overflow IDs always receive the exact same index, so equality remains a
-//! single `u64` comparison everywhere, while `cmp_bytes` falls back to exact
-//! byte slice comparison whenever either operand has `OVF_BIT` set.
+//! On x86_64 with BMI2, packing the first 8 bytes uses a single `_pext_u64`
+//! instruction with mask `0x7F7F_7F7F_7F7F_7F7F` (zero lookup tables!).
+//!
+//! Any longer ID (>9 bytes) or ID containing NUL (`0x00`) or high bytes (`>= 0x80`)
+//! is interned in a global, thread-safe sharded `OverflowStore` with bit 63 = 1
+//! (`OVF_BIT`). Equal overflow IDs always receive the exact same index, so
+//! equality remains a single `u64` comparison everywhere, while `cmp_bytes`
+//! falls back to exact byte slice comparison whenever either operand has `OVF_BIT`.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -31,83 +32,28 @@ const OVF_BIT: u64 = 1u64 << 63;
 const OVF_SHARD_BITS: u32 = 6;
 const OVF_SHARDS: usize = 1 << OVF_SHARD_BITS;
 
-/// 6-bit order-preserving ASCII encoding table:
-/// 1..=10: '0'..='9' (48..=57)
-/// 11..=36: 'A'..='Z' (65..=90)
-/// 37: '_' (95)
-/// 38..=63: 'a'..='z' (97..=122)
-/// 0xFF: invalid (triggers overflow store)
-const ENC6: [u8; 256] = {
-    let mut t = [0xFFu8; 256];
-    let mut c = b'0';
-    while c <= b'9' {
-        t[c as usize] = (c - b'0') + 1;
-        c += 1;
-    }
-    let mut c = b'A';
-    while c <= b'Z' {
-        t[c as usize] = (c - b'A') + 11;
-        c += 1;
-    }
-    t[b'_' as usize] = 37;
-    let mut c = b'a';
-    while c <= b'z' {
-        t[c as usize] = (c - b'a') + 38;
-        c += 1;
-    }
-    t
-};
-
-const DEC6: [u8; 64] = {
-    let mut t = [0u8; 64];
-    let mut i = 0u8;
-    while i < 10 {
-        t[(i + 1) as usize] = b'0' + i;
-        i += 1;
-    }
-    let mut i = 0u8;
-    while i < 26 {
-        t[(i + 11) as usize] = b'A' + i;
-        i += 1;
-    }
-    t[37] = b'_';
-    let mut i = 0u8;
-    while i < 26 {
-        t[(i + 38) as usize] = b'a' + i;
-        i += 1;
-    }
-    t
-};
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Debug)]
 #[repr(transparent)]
 pub struct Key8(pub u64);
 
-/// Packs 8 big-endian ASCII bytes in `[0-9a-z]` into 48 bits (8 x 6-bit ENC6 codes)
-/// using zero table lookups (SWAR range check + BMI2 `pext` on x86_64).
-/// Returns `None` if any byte is outside `[0-9a-z]`.
+/// Packs 8 big-endian nonzero 7-bit ASCII bytes (`1..=127`) into 56 ordered bits.
+/// Returns `None` if any byte is `0` or `>= 128`.
 #[inline(always)]
-fn pack8_alnum(w: u64) -> Option<u64> {
-    const HI: u64 = 0x8080_8080_8080_8080;
-    if (w & HI) != 0 {
+fn pack8_ascii(word: u64) -> Option<u64> {
+    // Valid bytes are 1..=127: subtracting 1 never borrows across lanes.
+    // A zero byte sets bit 7 after wrapping_sub(1); any byte >= 128 already has bit 7 set.
+    if (word | word.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080 != 0 {
         return None;
     }
-    let wh = w | HI;
-    let in_09 = (wh.wrapping_sub(0x3030_3030_3030_3030) & 0xB9B9_B9B9_B9B9_B9B9u64.wrapping_sub(w)) & HI;
-    let in_az = (wh.wrapping_sub(0x6161_6161_6161_6161) & 0xFAFA_FAFA_FAFA_FAFAu64.wrapping_sub(w)) & HI;
-    if (in_09 | in_az) != HI {
-        return None;
-    }
-    let codes8 = w - 0x2F2F_2F2F_2F2F_2F2F - ((in_az >> 4) | (in_az >> 5));
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    let packed48 = unsafe { core::arch::x86_64::_pext_u64(codes8, 0x3F3F_3F3F_3F3F_3F3F) };
+    let packed = unsafe { core::arch::x86_64::_pext_u64(word, 0x7F7F_7F7F_7F7F_7F7F) };
     #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
-    let packed48 = {
-        let a = (codes8 & 0x003F_003F_003F_003F) | ((codes8 >> 2) & 0x0FC0_0FC0_0FC0_0FC0);
-        let b = (a & 0x0000_0FFF_0000_0FFF) | ((a >> 4) & 0x00FF_F000_00FF_F000);
-        (b & 0x0000_0000_00FF_FFFF) | ((b >> 8) & 0x0000_FFFF_FF00_0000)
+    let packed = {
+        let pairs = (word & 0x007F_007F_007F_007F) | ((word >> 1) & 0x3F80_3F80_3F80_3F80);
+        let quads = (pairs & 0x0000_3FFF_0000_3FFF) | ((pairs >> 2) & 0x0FFF_C000_0FFF_C000);
+        (quads & 0x0000_0000_0FFF_FFFF) | ((quads >> 4) & 0x00FF_FFFF_F000_0000)
     };
-    Some(packed48)
+    Some(packed)
 }
 
 impl Key8 {
@@ -130,48 +76,34 @@ impl Key8 {
             let p = s.as_ptr();
             unsafe {
                 let w = u64::from_be((p as *const u64).read_unaligned());
-                if let Some(p48) = pack8_alnum(w) {
-                    let c8 = *ENC6.get_unchecked(*p.add(8) as usize);
-                    if (c8 & 0xC0) == 0 {
-                        return Key8((p48 << 12) | ((c8 as u64) << 6));
+                if let Some(p56) = pack8_ascii(w) {
+                    let b8 = *p.add(8);
+                    if b8.wrapping_sub(1) < 127 {
+                        return Key8((p56 << 7) | b8 as u64);
                     }
                 }
             }
-            return Key8::new_general(s);
+            return Key8::overflow(s);
         }
         if n == 8 {
             let p = s.as_ptr();
             unsafe {
                 let w = u64::from_be((p as *const u64).read_unaligned());
-                if let Some(p48) = pack8_alnum(w) {
-                    return Key8(p48 << 12);
+                if let Some(p56) = pack8_ascii(w) {
+                    return Key8(p56 << 7);
                 }
             }
-            return Key8::new_general(s);
+            return Key8::overflow(s);
         }
-        if n == 0 {
-            return Key8::EMPTY;
-        }
-        Key8::new_general(s)
-    }
-
-    #[inline(always)]
-    fn new_general(s: &[u8]) -> Key8 {
-        let n = s.len();
-        if n <= 10 {
-            let p = s.as_ptr();
+        if n < 8 {
             let mut acc = 0u64;
-            let mut bad = 0u8;
-            let mut i = 0usize;
-            while i < n {
-                let c = unsafe { *ENC6.get_unchecked(*p.add(i) as usize) };
-                bad |= c;
-                acc = (acc << 6) | (c as u64);
-                i += 1;
+            for &b in s {
+                if b.wrapping_sub(1) >= 127 {
+                    return Key8::overflow(s);
+                }
+                acc = (acc << 7) | b as u64;
             }
-            if (bad & 0xC0) == 0 {
-                return Key8(acc << ((10 - n) * 6));
-            }
+            return Key8(acc << ((9 - n) * 7));
         }
         Key8::overflow(s)
     }
@@ -192,13 +124,12 @@ impl Key8 {
     #[inline(always)]
     pub fn as_slice<'a>(&self, buf: &'a mut [u8; 16]) -> &'a [u8] {
         if self.is_inline() {
-            let mut v = self.0 << 4;
+            let mut v = self.0 << 1;
             let mut len = 0usize;
             while v != 0 {
-                let code = (v >> 58) as usize;
-                unsafe { *buf.get_unchecked_mut(len) = *DEC6.get_unchecked(code) };
+                unsafe { *buf.get_unchecked_mut(len) = (v >> 57) as u8 };
                 len += 1;
-                v <<= 6;
+                v <<= 7;
             }
             unsafe { buf.get_unchecked(..len) }
         } else {
@@ -275,6 +206,47 @@ mod tests {
     }
 
     #[test]
+    fn ascii_pack8_all_adjacent_byte_pairs() {
+        for fill in [1u8, 127] {
+            for pos in 0..7 {
+                for pair in 0..=u16::MAX {
+                    let mut bytes = [fill; 8];
+                    bytes[pos..pos + 2].copy_from_slice(&pair.to_le_bytes());
+                    let expected = bytes.iter().try_fold(0u64, |acc, &c| {
+                        (c != 0 && c < 128).then_some((acc << 7) | c as u64)
+                    });
+                    assert_eq!(pack8_ascii(u64::from_be_bytes(bytes)), expected, "{bytes:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_key_boundaries_and_ordering() {
+        assert_eq!(std::mem::size_of::<Key8>(), 8);
+        assert_eq!(Key8::new(&[]), Key8::EMPTY);
+        assert_eq!(Key8::new(&[127; 9]).0, OVF_BIT - 1);
+        let bg = [1, 127, b'A', b' ', b'_', b'z', b'\r', b'a', b'X', b'3', b'4'];
+        for n in 1..=11 {
+            for pos in 0..n {
+                for b in 0..=255u8 {
+                    let mut s = bg[..n].to_vec();
+                    s[pos] = b;
+                    let k = Key8::new(&s);
+                    let inline = n <= 9 && s.iter().all(|&c| c != 0 && c < 128);
+                    assert_eq!(k.is_inline(), inline, "{s:?}");
+                    if inline {
+                        let v = s.iter().fold(0u64, |acc, &c| (acc << 7) | c as u64);
+                        assert_eq!(k.0, v << ((9 - n) * 7));
+                    }
+                    assert_eq!(rt(&k), s);
+                    assert_eq!(k, Key8::new(&s));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn nul_ordering_is_bytewise() {
         let ids: Vec<&[u8]> = vec![
             b"", b"\0", b"\0\0", b"a", b"a\0", b"a\0\0", b"a\0b", b"a\x01", b"ab", b"b", b"\xff",
@@ -310,7 +282,6 @@ mod tests {
         assert_eq!(ka, Key8::new(&a.clone()));
         assert_eq!(rt(&ka), a);
         assert_eq!(ka.cmp_bytes(&kb), Ordering::Less);
-        // Concurrent interning returns one index per distinct string.
         let ks: Vec<Vec<Key8>> = std::thread::scope(|s| {
             let hs: Vec<_> = (0..8)
                 .map(|_| s.spawn(|| (0..500).map(|i| Key8::new(format!("long-identifier-{i:08}").as_bytes())).collect()))
@@ -333,20 +304,6 @@ mod tests {
             }
             let s = &buf[off - n..off];
             assert_eq!(rt(&Key8::new(s)), s.to_vec());
-        }
-    }
-
-    #[test]
-    fn swar_pack8_matches_general_all_bytes() {
-        for len in [8usize, 9] {
-            for pos in 0..len {
-                for b in 0u8..=255 {
-                    let mut buf = [b'a'; 9];
-                    buf[pos] = b;
-                    let s = &buf[..len];
-                    assert_eq!(Key8::new(s), Key8::new_general(s), "len={len} pos={pos} b={b:#x}");
-                }
-            }
         }
     }
 

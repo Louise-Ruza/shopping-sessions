@@ -11,6 +11,7 @@
 //!   to the shard's segment with non-temporal stores (AVX2 on x86_64).
 
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 pub const BLOCK: usize = 2 << 20;
@@ -134,9 +135,15 @@ struct ShardState {
     segs: Vec<Seg>,
 }
 
+struct GroupPool {
+    remaining: AtomicUsize,
+    blocks: Mutex<Vec<usize>>,
+}
+
 pub struct ShardSet<T> {
     shards: Vec<Mutex<ShardState>>,
-    shared_blocks: Option<Mutex<Vec<usize>>>,
+    groups: Vec<GroupPool>,
+    group_shift: u32,
     _t: PhantomData<T>,
 }
 
@@ -176,38 +183,50 @@ impl<T: Copy> Segs<T> {
 }
 
 impl<T: Copy> ShardSet<T> {
-    /// Per-shard 2 MB blocks: each shard owns its own blocks and returns them
-    /// immediately on `Segs::free()` (ideal for large phases whose freed blocks
-    /// are reused incrementally by the next phase).
-    pub fn new(n: usize) -> ShardSet<T> {
+    /// Thread-local 2 MB blocks carved lock-free into 16 KB segments across `ngroups`
+    /// contiguous shard groups (`ngroups` must be a power of 2 <= `n` and divide `n`).
+    /// When `ngroups > 1`, calling `mark_shard_done(s)` after consuming shard `s`
+    /// returns each group's blocks to `POOL` as soon as that group finishes, enabling
+    /// incremental hugepage reuse by the next phase while keeping active TLB footprint tiny.
+    pub fn new_grouped(n: usize, ngroups: usize) -> ShardSet<T> {
         assert!(SEG % std::mem::size_of::<T>() == 0);
+        let ng = if n >= ngroups && n.is_power_of_two() && ngroups.is_power_of_two() {
+            ngroups
+        } else {
+            1
+        };
+        let per_group = n / ng;
+        let group_shift = if ng == 1 { 63 } else { per_group.trailing_zeros() };
         ShardSet {
             shards: (0..n)
                 .map(|_| Mutex::new(ShardState { blocks: Vec::new(), next_seg: SEGS_PER_BLOCK, segs: Vec::new() }))
                 .collect(),
-            shared_blocks: None,
+            groups: (0..ng)
+                .map(|_| GroupPool { remaining: AtomicUsize::new(per_group), blocks: Mutex::new(Vec::new()) })
+                .collect(),
+            group_shift,
             _t: PhantomData,
         }
     }
 
-    /// Thread-local 2 MB blocks carved into 16 KB segments with zero cross-thread
-    /// cursor locking or THP page-fault contention: avoids wasting half-empty 2 MB
-    /// blocks per shard when per-shard volume is < 2 MB. Call `free_all()` after
-    /// consuming all shards.
+    /// Single-group thread-local 2 MB block carving (`ngroups = 1`).
     pub fn new_shared(n: usize) -> ShardSet<T> {
-        assert!(SEG % std::mem::size_of::<T>() == 0);
-        ShardSet {
-            shards: (0..n)
-                .map(|_| Mutex::new(ShardState { blocks: Vec::new(), next_seg: SEGS_PER_BLOCK, segs: Vec::new() }))
-                .collect(),
-            shared_blocks: Some(Mutex::new(Vec::new())),
-            _t: PhantomData,
-        }
+        Self::new_grouped(n, 1)
+    }
+
+    /// Alias kept for tests.
+    #[cfg(test)]
+    pub fn new(n: usize) -> ShardSet<T> {
+        Self::new_grouped(n, 1)
     }
 
     #[inline(always)]
-    fn is_shared(&self) -> bool {
-        self.shared_blocks.is_some()
+    fn group_of(&self, s: usize) -> usize {
+        if self.groups.len() == 1 {
+            0
+        } else {
+            s >> self.group_shift
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -220,31 +239,23 @@ impl<T: Copy> ShardSet<T> {
         }
     }
 
-    fn register_shared_blocks(&self, blocks: &[usize]) {
-        if let Some(ref sb) = self.shared_blocks {
-            sb.lock().unwrap().extend_from_slice(blocks);
+    fn register_group_blocks(&self, g: usize, blocks: &[usize]) {
+        if !blocks.is_empty() {
+            self.groups[g].blocks.lock().unwrap().extend_from_slice(blocks);
         }
     }
 
-    /// Records the finished segment `done` (if any) and claims a fresh one (per-shard mode).
-    fn swap_seg(&self, s: usize, done: Option<Seg>, want_new: bool) -> usize {
-        let mut g = self.shards[s].lock().unwrap();
-        if let Some(d) = done {
-            if d.n > 0 {
-                g.segs.push(d);
-            }
+    /// Marks shard `s` completely consumed (after `Segs::free()`). Once every shard in
+    /// its group finishes, that group's 2 MB blocks return to `POOL` immediately.
+    pub fn mark_shard_done(&self, s: usize) {
+        if self.groups.len() <= 1 {
+            return;
         }
-        if !want_new {
-            return 0;
+        let g = self.group_of(s);
+        if self.groups[g].remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let blocks = std::mem::take(&mut *self.groups[g].blocks.lock().unwrap());
+            put_blocks(&blocks);
         }
-        if g.next_seg == SEGS_PER_BLOCK {
-            let b = get_block() as usize;
-            g.blocks.push(b);
-            g.next_seg = 0;
-        }
-        let p = *g.blocks.last().unwrap() + g.next_seg * SEG;
-        g.next_seg += 1;
-        p
     }
 
     /// Number of records currently stored in shard `s` (all writers finished).
@@ -259,10 +270,22 @@ impl<T: Copy> ShardSet<T> {
         Segs { segs: std::mem::take(&mut g.segs), blocks: std::mem::take(&mut g.blocks), _t: PhantomData }
     }
 
-    /// Returns all remaining blocks (including shared blocks) to the pool.
+    /// Returns all remaining blocks to the pool (via `&self`, for mid-pipeline barriers).
+    pub fn release_blocks(&self) {
+        for gp in &self.groups {
+            let blocks = std::mem::take(&mut *gp.blocks.lock().unwrap());
+            put_blocks(&blocks);
+        }
+        for sh in &self.shards {
+            let blocks = std::mem::take(&mut sh.lock().unwrap().blocks);
+            put_blocks(&blocks);
+        }
+    }
+
+    /// Returns all remaining blocks to the pool.
     pub fn free_all(self) {
-        if let Some(sb) = self.shared_blocks {
-            let blocks = sb.into_inner().unwrap();
+        for gp in self.groups {
+            let blocks = gp.blocks.into_inner().unwrap();
             put_blocks(&blocks);
         }
         for sh in self.shards {
@@ -296,15 +319,18 @@ struct Cur {
     fill: u32,  // records in staging
 }
 
+struct GroupCur {
+    block: usize,
+    next_seg: usize,
+    blocks: Vec<usize>,
+}
+
 pub struct Scatter<'a, T: Copy> {
     set: &'a ShardSet<T>,
     stage: Vec<Line>,
     cur: Vec<Cur>,
     nt: bool,
-    shared: bool,
-    local_block: usize,
-    local_next_seg: usize,
-    local_blocks: Vec<usize>,
+    gcur: Vec<GroupCur>,
 }
 
 impl<'a, T: Copy> Scatter<'a, T> {
@@ -315,28 +341,28 @@ impl<'a, T: Copy> Scatter<'a, T> {
 
     pub fn new(set: &'a ShardSet<T>) -> Scatter<'a, T> {
         let n = set.len();
+        let ng = set.groups.len();
         Scatter {
             set,
             stage: vec![Line([0; 64]); n * Self::LINES],
             cur: vec![Cur { ptr: 0, off: 0, fill: 0 }; n],
             nt: nt_enabled(),
-            shared: set.is_shared(),
-            local_block: 0,
-            local_next_seg: SEGS_PER_BLOCK,
-            local_blocks: Vec::new(),
+            gcur: (0..ng).map(|_| GroupCur { block: 0, next_seg: SEGS_PER_BLOCK, blocks: Vec::new() }).collect(),
         }
     }
 
     #[inline(always)]
-    fn alloc_local_seg(&mut self) -> usize {
-        if self.local_next_seg == SEGS_PER_BLOCK {
+    fn alloc_local_seg(&mut self, s: usize) -> usize {
+        let g = self.set.group_of(s);
+        let gc = unsafe { self.gcur.get_unchecked_mut(g) };
+        if gc.next_seg == SEGS_PER_BLOCK {
             let b = get_block() as usize;
-            self.local_blocks.push(b);
-            self.local_block = b;
-            self.local_next_seg = 0;
+            gc.blocks.push(b);
+            gc.block = b;
+            gc.next_seg = 0;
         }
-        let p = self.local_block + self.local_next_seg * SEG;
-        self.local_next_seg += 1;
+        let p = gc.block + gc.next_seg * SEG;
+        gc.next_seg += 1;
         p
     }
 
@@ -358,15 +384,10 @@ impl<'a, T: Copy> Scatter<'a, T> {
         let c = self.cur[s];
         let (mut ptr, mut off) = (c.ptr, c.off as usize);
         if ptr == 0 || off == SEG {
-            if self.shared {
-                if ptr != 0 {
-                    self.set.push_seg(s, Seg { ptr, n: (SEG / Self::SZ) as u32 });
-                }
-                ptr = self.alloc_local_seg();
-            } else {
-                let done = if ptr == 0 { None } else { Some(Seg { ptr, n: (SEG / Self::SZ) as u32 }) };
-                ptr = self.set.swap_seg(s, done, true);
+            if ptr != 0 {
+                self.set.push_seg(s, Seg { ptr, n: (SEG / Self::SZ) as u32 });
             }
+            ptr = self.alloc_local_seg(s);
             off = 0;
         }
         let src = unsafe { self.stage.as_ptr().add(s * Self::LINES) } as *const u8;
@@ -381,15 +402,10 @@ impl<'a, T: Copy> Scatter<'a, T> {
             let (mut ptr, mut off) = (c.ptr, c.off as usize);
             if c.fill > 0 {
                 if ptr == 0 || off == SEG {
-                    if self.shared {
-                        if ptr != 0 {
-                            self.set.push_seg(s, Seg { ptr, n: (SEG / Self::SZ) as u32 });
-                        }
-                        ptr = self.alloc_local_seg();
-                    } else {
-                        let done = if ptr == 0 { None } else { Some(Seg { ptr, n: (SEG / Self::SZ) as u32 }) };
-                        ptr = self.set.swap_seg(s, done, true);
+                    if ptr != 0 {
+                        self.set.push_seg(s, Seg { ptr, n: (SEG / Self::SZ) as u32 });
                     }
+                    ptr = self.alloc_local_seg(s);
                     off = 0;
                 }
                 let bytes = c.fill as usize * Self::SZ;
@@ -400,17 +416,13 @@ impl<'a, T: Copy> Scatter<'a, T> {
                 off += bytes;
             }
             if ptr != 0 {
-                if self.shared {
-                    self.set.push_seg(s, Seg { ptr, n: (off / Self::SZ) as u32 });
-                } else {
-                    self.set.swap_seg(s, Some(Seg { ptr, n: (off / Self::SZ) as u32 }), false);
-                }
+                self.set.push_seg(s, Seg { ptr, n: (off / Self::SZ) as u32 });
             }
             self.cur[s] = Cur { ptr: 0, off: 0, fill: 0 };
         }
         sfence();
-        if !self.local_blocks.is_empty() {
-            self.set.register_shared_blocks(&self.local_blocks);
+        for (g, gc) in self.gcur.iter().enumerate() {
+            self.set.register_group_blocks(g, &gc.blocks);
         }
         self.stage = Vec::new();
     }
@@ -488,7 +500,7 @@ mod tests {
     #[test]
     fn chained_blocks_whale_shard() {
         // One shard receives ~10 MB (5+ blocks) from 4 threads; nothing is lost.
-        let set: ShardSet<R48> = ShardSet::new(256);
+        let set: ShardSet<R48> = ShardSet::new_grouped(256, 8);
         let per_thread = 60_000u64;
         std::thread::scope(|s| {
             for t in 0..4u64 {
@@ -504,6 +516,11 @@ mod tests {
                 });
             }
         });
+        assert!(
+            set.groups[0].blocks.lock().unwrap().len() >= 5,
+            "whale group chained {} blocks",
+            set.groups[0].blocks.lock().unwrap().len()
+        );
         let mut seen = Vec::new();
         for sh in 0..256 {
             let segs = set.take(sh);
@@ -515,11 +532,13 @@ mod tests {
                     seen.push(r.a);
                 }
             }
-            if sh == 7 {
-                assert!(segs.blocks.len() >= 5, "whale shard chained {} blocks", segs.blocks.len());
-            }
             segs.free();
+            set.mark_shard_done(sh);
+            if sh == 31 {
+                assert!(set.groups[0].blocks.lock().unwrap().is_empty());
+            }
         }
+        set.free_all();
         seen.sort_unstable();
         let mut exp: Vec<u64> = (0..4u64).flat_map(|t| (0..per_thread).map(move |i| t * 1_000_000 + i)).collect();
         exp.sort_unstable();
@@ -544,6 +563,7 @@ mod tests {
             }
             segs.free();
         }
+        set2.free_all();
         assert_eq!(n, 100_000);
         assert_eq!(mapped_bytes(), before);
 

@@ -41,22 +41,56 @@ impl Column {
         self.n
     }
 
+    /// Advise the kernel to drop backing pages of this column after writing to disk
+    /// (moves teardown off the serial process-exit path).
+    pub fn release_pages(&self) {
+        #[cfg(all(target_os = "linux", not(test)))]
+        {
+            for (ptr, cap) in [
+                (self.values.as_ptr() as usize, self.values.capacity()),
+                (self.defs.as_ptr() as usize, self.defs.capacity()),
+            ] {
+                if cap >= 131_072 {
+                    let a = (ptr + 4095) & !4095;
+                    let e = (ptr + cap) & !4095;
+                    if e > a {
+                        unsafe { libc::madvise(a as *mut libc::c_void, e - a, libc::MADV_DONTNEED) };
+                    }
+                }
+            }
+        }
+    }
+
     #[inline(always)]
     fn push_def(&mut self, present: bool) {
-        if self.n & 7 == 0 {
-            self.defs.push(0);
-        }
-        if present {
+        let bit = self.n & 7;
+        if bit == 0 {
+            self.defs.push(present as u8);
+        } else if present {
             let last = self.defs.len() - 1;
-            unsafe { *self.defs.get_unchecked_mut(last) |= 1 << (self.n & 7) };
+            unsafe { *self.defs.get_unchecked_mut(last) |= 1 << bit };
+        }
+    }
+
+    #[inline(always)]
+    fn ensure_val(&mut self, extra: usize) {
+        if self.values.capacity() - self.values.len() < extra {
+            self.values.reserve(extra.max(4096));
         }
     }
 
     #[inline(always)]
     pub fn push_str(&mut self, s: &[u8]) {
         debug_assert!(self.kind == Kind::Str);
-        self.values.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        self.values.extend_from_slice(s);
+        let slen = s.len();
+        self.ensure_val(4 + slen);
+        unsafe {
+            let len = self.values.len();
+            let dst = self.values.as_mut_ptr().add(len);
+            (dst as *mut u32).write_unaligned((slen as u32).to_le());
+            std::ptr::copy_nonoverlapping(s.as_ptr(), dst.add(4), slen);
+            self.values.set_len(len + 4 + slen);
+        }
         self.n += 1;
     }
 
@@ -65,21 +99,38 @@ impl Column {
         debug_assert!(self.kind == Kind::OptStr);
         self.push_def(s.is_some());
         if let Some(s) = s {
-            self.values.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            self.values.extend_from_slice(s);
+            let slen = s.len();
+            self.ensure_val(4 + slen);
+            unsafe {
+                let len = self.values.len();
+                let dst = self.values.as_mut_ptr().add(len);
+                (dst as *mut u32).write_unaligned((slen as u32).to_le());
+                std::ptr::copy_nonoverlapping(s.as_ptr(), dst.add(4), slen);
+                self.values.set_len(len + 4 + slen);
+            }
         }
         self.n += 1;
     }
 
     #[inline(always)]
     pub fn push_date(&mut self, d: i32) {
-        self.values.extend_from_slice(&d.to_le_bytes());
+        self.ensure_val(4);
+        unsafe {
+            let len = self.values.len();
+            (self.values.as_mut_ptr().add(len) as *mut i32).write_unaligned(d.to_le());
+            self.values.set_len(len + 4);
+        }
         self.n += 1;
     }
 
     #[inline(always)]
     pub fn push_i64(&mut self, v: i64) {
-        self.values.extend_from_slice(&v.to_le_bytes());
+        self.ensure_val(8);
+        unsafe {
+            let len = self.values.len();
+            (self.values.as_mut_ptr().add(len) as *mut i64).write_unaligned(v.to_le());
+            self.values.set_len(len + 8);
+        }
         self.n += 1;
     }
 }

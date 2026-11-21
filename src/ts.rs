@@ -215,7 +215,7 @@ impl DateCache {
     }
 
     #[inline(always)]
-    fn calendar_cached(&self, b: &[u8]) -> Option<i64> {
+    fn cached_day(&self, b: &[u8]) -> Option<i64> {
         let p = b.as_ptr();
         unsafe {
             let d0 = (*p.add(8)).wrapping_sub(b'0');
@@ -224,27 +224,89 @@ impl DateCache {
             if ((non_digit_bits(d0) | non_digit_bits(d1)) & 0xF0) == 0 && d < 32 {
                 let slot = *self.slots.get_unchecked(d);
                 let pref = (p as *const u64).read_unaligned();
-                if slot.prefix != 0 && pref == slot.prefix && *p.add(10) == b'T' {
-                    let w = (p.add(11) as *const u64).read_unaligned();
-                    let x = w ^ u64::from_le_bytes(*b"00:00:00");
-                    let bad = (x & 0xF0F0_FFF0_F0FF_F0F0)
-                        | (x.wrapping_add(0x0606_0006_0600_0606) & 0xF0F0_00F0_F000_F0F0);
-                    if bad == 0 {
-                        let hi = x & 0x000F_0000_0F00_000F;
-                        let lo = (x >> 8) & 0x000F_0000_0F00_000F;
-                        let hms = hi * 10 + lo;
-                        let h = (hms & 0xFF) as u32;
-                        let mi = ((hms >> 24) & 0xFF) as u32;
-                        let s = ((hms >> 48) & 0xFF) as u32;
-                        if h <= 23 && mi <= 59 && s <= 59 {
-                            return Some(slot.day_ms + (h as i64 * 3600 + mi as i64 * 60 + s as i64) * 1000);
-                        }
-                    }
-                    return None;
+                if slot.prefix != 0 && pref == slot.prefix {
+                    return Some(slot.day_ms);
                 }
             }
         }
+        None
+    }
+
+    #[inline(always)]
+    fn clock_strict(p: *const u8) -> Option<i64> {
+        unsafe {
+            let w = (p as *const u64).read_unaligned();
+            let x = w ^ u64::from_le_bytes(*b"00:00:00");
+            let bad = (x & 0xF0F0_FFF0_F0FF_F0F0)
+                | (x.wrapping_add(0x0606_0006_0600_0606) & 0xF0F0_00F0_F000_F0F0);
+            if bad == 0 {
+                let hi = x & 0x000F_0000_0F00_000F;
+                let lo = (x >> 8) & 0x000F_0000_0F00_000F;
+                let hms = hi * 10 + lo;
+                let h = (hms & 0xFF) as u32;
+                let mi = ((hms >> 24) & 0xFF) as u32;
+                let s = ((hms >> 48) & 0xFF) as u32;
+                if h <= 23 && mi <= 59 && s <= 59 {
+                    return Some((h as i64 * 3600 + mi as i64 * 60 + s as i64) * 1000);
+                }
+            }
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn clock_fast(p: *const u8) -> i64 {
+        unsafe {
+            let x = (p as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00:00:00");
+            let hi = x & 0x000F_0000_0F00_000F;
+            let lo = (x >> 8) & 0x000F_0000_0F00_000F;
+            let hms = hi * 10 + lo;
+            let h = (hms & 0xFF) as i64;
+            let mi = ((hms >> 24) & 0xFF) as i64;
+            let s = ((hms >> 48) & 0xFF) as i64;
+            (h * 3600 + mi * 60 + s) * 1000
+        }
+    }
+
+    #[inline(always)]
+    fn calendar_cached(&self, b: &[u8]) -> Option<i64> {
+        if let Some(day_ms) = self.cached_day(b) {
+            let p = b.as_ptr();
+            if unsafe { *p.add(10) } != b'T' {
+                return None;
+            }
+            return Self::clock_strict(unsafe { p.add(11) }).map(|ms| day_ms + ms);
+        }
         calendar(b)
+    }
+
+    /// Share one validated DateCache lookup when F1 event and ingestion share the same
+    /// YYYY-MM-DD date (~98% of F1 rows). Event stays strictly validated and independent
+    /// of ingest for global dedup semantics.
+    #[inline(always)]
+    pub fn parse_event_ingest(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, Option<i64>) {
+        if event.len() == 20 && ingest.len() == 20 {
+            let ep = event.as_ptr();
+            let ip = ingest.as_ptr();
+            unsafe {
+                if *ep.add(19) == b'Z'
+                    && *ip.add(19) == b'Z'
+                    && (ep as *const u64).read_unaligned() == (ip as *const u64).read_unaligned()
+                    && (ep.add(8) as *const u16).read_unaligned() == (ip.add(8) as *const u16).read_unaligned()
+                {
+                    if let Some(day_ms) = self.cached_day(event) {
+                        let ev_ms = if *ep.add(10) == b'T' {
+                            Self::clock_strict(ep.add(11)).map(|ms| day_ms + ms)
+                        } else {
+                            None
+                        };
+                        let ing_ms = Some(day_ms + Self::clock_fast(ip.add(11)));
+                        return (ev_ms, ing_ms);
+                    }
+                }
+            }
+        }
+        (self.parse_ts(event), self.parse_f1_ingest(ingest))
     }
 
     /// Ultra-fast path for `ingest_ts` (guaranteed valid F1 per rules.md).
@@ -258,19 +320,45 @@ impl DateCache {
                 if d < 32 {
                     let slot = *self.slots.get_unchecked(d);
                     if slot.prefix != 0 && (p as *const u64).read_unaligned() == slot.prefix {
-                        let x = (p.add(11) as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00:00:00");
-                        let hi = x & 0x000F_0000_0F00_000F;
-                        let lo = (x >> 8) & 0x000F_0000_0F00_000F;
-                        let hms = hi * 10 + lo;
-                        let h = (hms & 0xFF) as i64;
-                        let mi = ((hms >> 24) & 0xFF) as i64;
-                        let s = ((hms >> 48) & 0xFF) as i64;
-                        return Some(slot.day_ms + (h * 3600 + mi * 60 + s) * 1000);
+                        return Some(slot.day_ms + Self::clock_fast(p.add(11)));
                     }
                 }
             }
         }
         parse_f1_fast(b)
+    }
+
+    /// Parse a known 13-byte F3 timestamp.
+    #[inline(always)]
+    pub fn parse_ts_13(b: &[u8]) -> Option<i64> {
+        parse_f3_13(b)
+    }
+
+    /// Parse a known 25-byte F2 timestamp.
+    #[inline(always)]
+    pub fn parse_ts_25(&self, b: &[u8]) -> Option<i64> {
+        let p = b.as_ptr();
+        unsafe {
+            let sign = *p.add(19);
+            if *p.add(22) == b':' && (sign == b'+' || sign == b'-') {
+                let base = self.calendar_cached(b)?;
+                let h0 = (*p.add(20)).wrapping_sub(b'0');
+                let h1 = (*p.add(21)).wrapping_sub(b'0');
+                let m0 = (*p.add(23)).wrapping_sub(b'0');
+                let m1 = (*p.add(24)).wrapping_sub(b'0');
+                if ((non_digit_bits(h0) | non_digit_bits(h1) | non_digit_bits(m0) | non_digit_bits(m1)) & 0xF0) != 0 {
+                    return None;
+                }
+                let oh = h0 as u32 * 10 + h1 as u32;
+                let om = m0 as u32 * 10 + m1 as u32;
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                let off = (oh as i64 * 60 + om as i64) * 60_000;
+                return Some(if sign == b'+' { base - off } else { base + off });
+            }
+        }
+        parse_f3_general(b)
     }
 
     #[inline(always)]
@@ -283,29 +371,7 @@ impl DateCache {
             return parse_f3_13(b);
         }
         if n == 25 {
-            let p = b.as_ptr();
-            unsafe {
-                let sign = *p.add(19);
-                if *p.add(22) == b':' && (sign == b'+' || sign == b'-') {
-                    let base = self.calendar_cached(b)?;
-                    let h0 = (*p.add(20)).wrapping_sub(b'0');
-                    let h1 = (*p.add(21)).wrapping_sub(b'0');
-                    let m0 = (*p.add(23)).wrapping_sub(b'0');
-                    let m1 = (*p.add(24)).wrapping_sub(b'0');
-                    if ((non_digit_bits(h0) | non_digit_bits(h1) | non_digit_bits(m0) | non_digit_bits(m1)) & 0xF0)
-                        != 0
-                    {
-                        return None;
-                    }
-                    let oh = h0 as u32 * 10 + h1 as u32;
-                    let om = m0 as u32 * 10 + m1 as u32;
-                    if oh > 23 || om > 59 {
-                        return None;
-                    }
-                    let off = (oh as i64 * 60 + om as i64) * 60_000;
-                    return Some(if sign == b'+' { base - off } else { base + off });
-                }
-            }
+            return self.parse_ts_25(b);
         }
         parse_f3_general(b)
     }

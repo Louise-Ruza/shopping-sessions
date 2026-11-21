@@ -13,24 +13,26 @@
 
 mod arena;
 mod csv;
+mod event_front;
 mod fixed;
 #[allow(dead_code)]
 mod hash;
 mod key;
 mod links;
 mod parquet;
+mod timebins;
 mod ts;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Barrier, Mutex};
 use std::time::Instant;
 
 use arena::{ShardSet, Scatter, Segs};
 use key::Key8;
-use links::{prefetch, Resolver, SEED_A};
+use links::{prefetch, LinkTable, SEED_A, SEED_L};
 use parquet::{Column, Kind};
-use ts::{parse_price, parse_ts, DateCache, DAY_MS};
+use ts::{parse_ts, DateCache, DAY_MS};
 
 const GAP_MS: i64 = 1_800_000;
 const SEVEN_DAYS_MS: i64 = 7 * DAY_MS;
@@ -444,7 +446,6 @@ struct Ctx {
 /// Dedup-table slot: a short tag of the event_id hash plus 1 + record index.
 trait Slot: Copy {
     fn make(h: u32, me: u32) -> Self;
-    fn is_empty(self) -> bool;
     fn tag_eq(self, h: u32) -> bool;
     fn idx(self) -> u32;
 }
@@ -453,10 +454,6 @@ impl Slot for u32 {
     #[inline(always)]
     fn make(h: u32, me: u32) -> u32 {
         (h & 0xFF00_0000) | (me + 1)
-    }
-    #[inline(always)]
-    fn is_empty(self) -> bool {
-        self == 0
     }
     #[inline(always)]
     fn tag_eq(self, h: u32) -> bool {
@@ -474,10 +471,6 @@ impl Slot for u64 {
         ((h as u64) << 32) | (me as u64 + 1)
     }
     #[inline(always)]
-    fn is_empty(self) -> bool {
-        self == 0
-    }
-    #[inline(always)]
     fn tag_eq(self, h: u32) -> bool {
         (self >> 32) as u32 == h
     }
@@ -487,19 +480,50 @@ impl Slot for u64 {
     }
 }
 
-/// Exact event_id dedup of one shard: marks losers in-place by setting `ts = TS_INVALID`
-/// (zero separate loser bitset!), keeping the copy with the smallest ingest_ts (first on tie).
+const CTRL_EMPTY: u8 = 0x80;
+
+#[inline(always)]
+unsafe fn ctrl_masks(ptr: *const u8, tag: u8) -> (u16, u16) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::*;
+        let bytes = _mm_loadu_si128(ptr.cast());
+        let matching = _mm_movemask_epi8(_mm_cmpeq_epi8(bytes, _mm_set1_epi8(tag as i8)));
+        // Occupied tags have bit 7 clear (0..=127); CTRL_EMPTY has bit 7 set.
+        (matching as u16, _mm_movemask_epi8(bytes) as u16)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let (mut matching, mut empty) = (0u16, 0u16);
+        for i in 0..16 {
+            let c = *ptr.add(i);
+            matching |= ((c == tag) as u16) << i;
+            empty |= ((c == CTRL_EMPTY) as u16) << i;
+        }
+        (matching, empty)
+    }
+}
+
+/// Exact event_id dedup of one shard using 16-byte SIMD SwissTable control groups
+/// (4x smaller memset per shard, 16-way parallel tag probe) and in-place loser
+/// marking (`ts = TS_INVALID`, zero loser bitset). Keeps smallest ingest_ts (first on tie).
 fn mark_losers<S: Slot + Default + Clone>(
     segs: &mut Segs<RawEv>,
     table: &mut Vec<S>,
+    controls: &mut Vec<u8>,
     cap: usize,
     base: i64,
     oob: &[i64],
 ) {
-    let mask = cap - 1;
-    table.clear();
-    table.resize(cap, S::default());
+    debug_assert!(cap >= 16 && cap.is_power_of_two());
+    if table.len() < cap {
+        table.resize(cap, S::default());
+    }
+    controls.clear();
+    controls.resize(cap, CTRL_EMPTY);
+    let group_mask = (cap - 1) & !15;
     let tptr = table.as_mut_ptr();
+    let cptr = controls.as_mut_ptr();
     let seg_meta = segs.segs.as_ptr();
     let nseg = segs.segs.len();
     const PF: usize = 16;
@@ -508,20 +532,25 @@ fn mark_losers<S: Slot + Default + Clone>(
         for ri in 0..slen {
             unsafe {
                 if ri + PF < slen {
-                    let fh = (*rptr.add(ri + PF)).ehash;
-                    prefetch(tptr.add(fh as usize & mask) as *const u8);
+                    let fg = (*rptr.add(ri + PF)).ehash as usize & group_mask;
+                    prefetch(cptr.add(fg));
+                    prefetch(tptr.add(fg) as *const u8);
                 }
                 let r = rptr.add(ri);
                 let h = (*r).ehash;
+                let tag = (h >> 25) as u8;
                 let me = ((si << 9) | ri) as u32;
-                let mut i = h as usize & mask;
-                loop {
-                    let slot = *tptr.add(i);
-                    if slot.is_empty() {
-                        *tptr.add(i) = S::make(h, me);
-                        break;
-                    }
-                    if slot.tag_eq(h) {
+                let mut group = h as usize & group_mask;
+                'probe: loop {
+                    let (mut matching, empty) = ctrl_masks(cptr.add(group), tag);
+                    while matching != 0 {
+                        let lane = matching.trailing_zeros() as usize;
+                        matching &= matching - 1;
+                        let i = group + lane;
+                        let slot = *tptr.add(i);
+                        if !slot.tag_eq(h) {
+                            continue;
+                        }
                         let oi = slot.idx();
                         let os = *seg_meta.add((oi >> 9) as usize);
                         let o = (os.ptr as *mut RawEv).add((oi & 511) as usize);
@@ -532,10 +561,16 @@ fn mark_losers<S: Slot + Default + Clone>(
                             } else {
                                 (*r).ts = TS_INVALID;
                             }
-                            break;
+                            break 'probe;
                         }
                     }
-                    i = (i + 1) & mask;
+                    if empty != 0 {
+                        let i = group + empty.trailing_zeros() as usize;
+                        *tptr.add(i) = S::make(h, me);
+                        *cptr.add(i) = tag;
+                        break;
+                    }
+                    group = (group + 16) & group_mask;
                 }
             }
         }
@@ -658,8 +693,36 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// One person: events sorted by ts, clicks sorted by (ts, click_id).
-    fn person(&mut self, person: Key8, evs: &[Ev8], clicks: &[Cl24]) {
+    /// One person: events in session-preserving order, clicks unsorted (sorted lazily when nsess >= 2).
+    fn person(&mut self, person: Key8, evs: &[Ev8], clicks: &mut [Cl24], ctmp: &mut Vec<Cl24>) {
+        if evs.len() == 1 && clicks.is_empty() {
+            let e = unsafe { *evs.get_unchecked(0) };
+            let day0ms = self.ctx.day0 * DAY_MS - self.ctx.base;
+            let day = ((e.ts() as i64 - day0ms) / DAY_MS) as u32;
+            let pc = e.pc();
+            let (rev, top_opt) = if pc != 0 {
+                let (p, c) = self.price_cat(pc);
+                (p, Some(self.ctx.cat_names[c]))
+            } else {
+                (0u64, None)
+            };
+            if self.cols[0].len() == MAX_ROWS_PER_FILE {
+                let prev = std::mem::replace(&mut self.cols, new_user_cols(32_768));
+                self.done_cols.push(prev);
+            }
+            let mut buf = [0u8; 16];
+            self.cols[0].push_str(person.as_slice(&mut buf));
+            self.cols[1].push_date((self.ctx.day0 + day as i64) as i32);
+            self.cols[2].push_i64(1);
+            self.cols[3].push_i64(1);
+            self.cols[4].push_i64(rev as i64);
+            self.cols[5].push_opt_str(top_opt);
+            let a = &mut self.acc[day as usize * self.k1];
+            a.sessions += 1;
+            a.purchasing += (pc != 0) as u32;
+            a.revenue += rev;
+            return;
+        }
         self.sess.clear();
         let day0ms = self.ctx.day0 * DAY_MS - self.ctx.base;
         let mut day_idx = 0u32;
@@ -716,8 +779,46 @@ impl<'a> Worker<'a> {
             }
             return;
         }
-        // day_first[d] = first session index with day >= d
         let nsess = self.sess.len();
+        if nsess == 1 {
+            // Single-session O(n) fast path: zero click sorting, zero day_first, zero close().
+            let s = self.sess[0];
+            let lo = s.start - SEVEN_DAYS_MS;
+            let hi = s.start;
+            let row_base = s.day as usize * k1;
+            let mut best_ts = i64::MIN;
+            let mut best_cid = Key8::EMPTY;
+            let mut credited = 0usize;
+            for c in clicks.iter() {
+                let cts = c.ts as i64;
+                if cts >= lo && cts <= hi {
+                    if cts > best_ts || (cts == best_ts && c.cid.cmp_bytes(&best_cid) == std::cmp::Ordering::Less) {
+                        best_ts = cts;
+                        best_cid = c.cid;
+                        credited = c.camp as usize;
+                    }
+                    let k = c.camp as usize;
+                    if self.cnt[k] == 0 {
+                        self.cnt[k] = 1;
+                        self.acc[row_base + k].assisted += 1;
+                        self.touched.push(k as u32);
+                    }
+                }
+            }
+            for &k in &self.touched {
+                self.cnt[k as usize] = 0;
+            }
+            self.touched.clear();
+            let a = &mut self.acc[row_base + credited];
+            a.sessions += 1;
+            a.purchasing += s.purch as u32;
+            a.revenue += s.rev;
+            return;
+        }
+        if clicks.len() > 1 {
+            sort_person_clicks(clicks, ctmp);
+        }
+        // day_first[d] = first session index with day >= d
         {
             let mut j = 0usize;
             for d in 0..=self.ctx.ndays {
@@ -860,7 +961,7 @@ fn sort_person_events(sl: &mut [Ev8], tmp: &mut Vec<Ev8>) {
         }
         return;
     }
-    if n <= 32 {
+    if n <= 24 {
         for i in 1..n {
             let x = unsafe { *sl.get_unchecked(i) };
             let mut j = i;
@@ -876,7 +977,7 @@ fn sort_person_events(sl: &mut [Ev8], tmp: &mut Vec<Ev8>) {
         }
         return;
     }
-    if n > 64 {
+    if n > 256 {
         radix_by_u32(sl, tmp, |e| e.ts());
     } else {
         sl.sort_unstable();
@@ -921,7 +1022,7 @@ fn sort_person_clicks(sl: &mut [Cl24], tmp: &mut Vec<Cl24>) {
         }
         return;
     }
-    if n > 64 {
+    if n > 256 {
         radix_by_u32(sl, tmp, |c| c.ts);
         let mut i = 0;
         while i < n {
@@ -956,11 +1057,14 @@ struct SolveScratch {
     ht: Vec<HtEnt>,
     ht_mask: usize,
     pkeys: Vec<Key8>,
+    canon: Vec<Key8>,
+    link_probe: Vec<(u32, u64)>,
     ev_off: Vec<u32>,
     ev_cur: Vec<u32>,
     ev_pids: Vec<u32>,
     evs: Vec<Ev8>,
     etmp: Vec<Ev8>,
+    bins: timebins::Scratch,
     cl_off: Vec<u32>,
     cl_cur: Vec<u32>,
     cl_pids: Vec<u32>,
@@ -974,11 +1078,14 @@ impl SolveScratch {
             ht: Vec::new(),
             ht_mask: 0,
             pkeys: Vec::new(),
+            canon: Vec::new(),
+            link_probe: Vec::new(),
             ev_off: Vec::new(),
             ev_cur: Vec::new(),
             ev_pids: Vec::new(),
             evs: Vec::new(),
             etmp: Vec::new(),
+            bins: timebins::Scratch::new(),
             cl_off: Vec::new(),
             cl_cur: Vec::new(),
             cl_pids: Vec::new(),
@@ -994,12 +1101,12 @@ impl SolveScratch {
     }
 
     #[inline(always)]
-    fn intern(&mut self, person: Key8) -> u32 {
+    fn intern(&mut self, person: Key8, h: u64) -> u32 {
         if self.pkeys.len() * 2 >= self.ht.len() {
             self.grow_ht();
         }
         let mask = self.ht_mask;
-        let mut i = person.hash(SEED_A) as usize & mask;
+        let mut i = h as usize & mask;
         loop {
             let e = unsafe { self.ht.get_unchecked_mut(i) };
             if e.key == person {
@@ -1063,17 +1170,26 @@ impl SolveScratch {
         self.ev_pids.clear();
         self.ev_pids.reserve(nev);
 
-        // Pass 1 over events: intern exact Key8 persons in inline 16B HtEnt with 8-ahead prefetch
+        // Pass 1 over events: intern exact Key8 persons in inline 16B HtEnt with 8-ahead single-hash prefetch
         const PF: usize = 8;
+        let mut hring = [0u64; PF];
         for seg in es.iter() {
             let slen = seg.len();
+            let pre = slen.min(PF);
+            for ri in 0..pre {
+                let h = unsafe { seg.get_unchecked(ri).person.hash(SEED_A) };
+                hring[ri] = h;
+                prefetch(unsafe { self.ht.as_ptr().add(h as usize & self.ht_mask) } as *const u8);
+            }
             for ri in 0..slen {
+                let h = hring[ri & (PF - 1)];
                 if ri + PF < slen {
                     let fh = unsafe { seg.get_unchecked(ri + PF).person.hash(SEED_A) };
+                    hring[(ri + PF) & (PF - 1)] = fh;
                     prefetch(unsafe { self.ht.as_ptr().add(fh as usize & self.ht_mask) } as *const u8);
                 }
                 let e = unsafe { seg.get_unchecked(ri) };
-                let pid = self.intern(e.person);
+                let pid = self.intern(e.person, h);
                 self.ev_pids.push(pid);
             }
         }
@@ -1182,18 +1298,269 @@ impl SolveScratch {
         for pid in 0..np {
             let es0 = unsafe { *self.ev_off.get_unchecked(pid) } as usize;
             let es1 = unsafe { *self.ev_off.get_unchecked(pid + 1) } as usize;
-            sort_person_events(unsafe { self.evs.get_unchecked_mut(es0..es1) }, &mut self.etmp);
-            let cls_slice: &[Cl24] = if ncl_kept > 0 {
+            let ordered = self.bins.order(unsafe { self.evs.get_unchecked_mut(es0..es1) }, &mut self.etmp);
+            let cls_slice: &mut [Cl24] = if ncl_kept > 0 {
                 let cs0 = unsafe { *self.cl_off.get_unchecked(pid) } as usize;
                 let cs1 = unsafe { *self.cl_off.get_unchecked(pid + 1) } as usize;
-                if cs1 > cs0 {
-                    sort_person_clicks(unsafe { self.cls.get_unchecked_mut(cs0..cs1) }, &mut self.ctmp);
-                }
-                unsafe { self.cls.get_unchecked(cs0..cs1) }
+                unsafe { self.cls.get_unchecked_mut(cs0..cs1) }
             } else {
-                &[]
+                &mut []
             };
-            w.person(unsafe { *self.pkeys.get_unchecked(pid) }, unsafe { self.evs.get_unchecked(es0..es1) }, cls_slice);
+            w.person(unsafe { *self.pkeys.get_unchecked(pid) }, ordered, cls_slice, &mut self.ctmp);
+        }
+    }
+
+    /// Two-tier solve Tier 1: raw-uid shard. Resolves each distinct uid ONCE in `links`,
+    /// solves truly unlinked users immediately in place, and forwards linked users'
+    /// events and clicks (including 0-event-in-shard linked clicks!) to Tier 2.
+    fn run_tier1_shard(
+        &mut self,
+        es: Segs<PEv>,
+        cs: Segs<Click>,
+        links: &LinkTable,
+        w: &mut Worker<'_>,
+        lev_w: &mut Scatter<'_, PEv>,
+        lcl_w: &mut Scatter<'_, Click>,
+        l_shift: u32,
+    ) {
+        if links.is_empty() {
+            self.run_shard(es, cs, w);
+            return;
+        }
+        let nev = es.len();
+        if nev == 0 {
+            if cs.len() > 0 {
+                for seg in cs.iter() {
+                    for c in seg {
+                        if links.maybe(c.phash) {
+                            if let Some(cp) = links.lookup(c.phash, c.person) {
+                                let ch = cp.hash(SEED_A);
+                                lcl_w.push(
+                                    (ch >> l_shift) as usize,
+                                    Click { person: cp, cid: c.cid, phash: ch, ts: c.ts, camp: c.camp },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            es.free();
+            cs.free();
+            return;
+        }
+
+        let init_cap = ((nev / 6).next_power_of_two()).max(256);
+        self.reset_ht(init_cap);
+        self.pkeys.clear();
+        self.ev_pids.clear();
+        self.ev_pids.reserve(nev);
+
+        // Pass 1 over events: intern exact raw Key8 uids in inline 16B HtEnt
+        const PF: usize = 8;
+        let mut hring = [0u64; PF];
+        for seg in es.iter() {
+            let slen = seg.len();
+            let pre = slen.min(PF);
+            for ri in 0..pre {
+                let h = unsafe { seg.get_unchecked(ri).person.hash(SEED_A) };
+                hring[ri] = h;
+                prefetch(unsafe { self.ht.as_ptr().add(h as usize & self.ht_mask) } as *const u8);
+            }
+            for ri in 0..slen {
+                let h = hring[ri & (PF - 1)];
+                if ri + PF < slen {
+                    let fh = unsafe { seg.get_unchecked(ri + PF).person.hash(SEED_A) };
+                    hring[(ri + PF) & (PF - 1)] = fh;
+                    prefetch(unsafe { self.ht.as_ptr().add(fh as usize & self.ht_mask) } as *const u8);
+                }
+                let e = unsafe { seg.get_unchecked(ri) };
+                let pid = self.intern(e.person, h);
+                self.ev_pids.push(pid);
+            }
+        }
+        let np = self.pkeys.len();
+
+        // Resolve each distinct raw uid ONCE in LinkTable (pipelined Bloom -> Table prefetch).
+        self.canon.clear();
+        self.canon.resize(np, Key8::EMPTY);
+        self.link_probe.clear();
+        let pre = np.min(PF);
+        for pid in 0..pre {
+            let h = unsafe { self.pkeys.get_unchecked(pid).hash(SEED_L) };
+            hring[pid] = h;
+            links.prefetch_bloom(h);
+        }
+        for pid in 0..np {
+            let h = hring[pid & (PF - 1)];
+            if pid + PF < np {
+                let fh = unsafe { self.pkeys.get_unchecked(pid + PF).hash(SEED_L) };
+                hring[(pid + PF) & (PF - 1)] = fh;
+                links.prefetch_bloom(fh);
+            }
+            if links.maybe(h) {
+                self.link_probe.push((pid as u32, h));
+            }
+        }
+        let npr = self.link_probe.len();
+        for j in 0..npr.min(PF) {
+            links.prefetch(unsafe { self.link_probe.get_unchecked(j).1 });
+        }
+        for j in 0..npr {
+            if j + PF < npr {
+                links.prefetch(unsafe { self.link_probe.get_unchecked(j + PF).1 });
+            }
+            let (pid, h) = unsafe { *self.link_probe.get_unchecked(j) };
+            let uid = unsafe { *self.pkeys.get_unchecked(pid as usize) };
+            if let Some(cp) = links.lookup(h, uid) {
+                unsafe { *self.canon.get_unchecked_mut(pid as usize) = cp };
+            }
+        }
+
+        // Prefix sum counts ONLY for unlinked users (canon[pid] == EMPTY).
+        // For linked users, reuse ev_off[pid] to store their Tier-2 shard index!
+        self.ev_off.clear();
+        self.ev_off.resize(np + 1, 0);
+        for e in &self.ht {
+            if !e.key.is_empty() {
+                let pid = e.pid as usize;
+                if unsafe { self.canon.get_unchecked(pid).is_empty() } {
+                    unsafe { *self.ev_off.get_unchecked_mut(pid) = e.cnt };
+                }
+            }
+        }
+        let mut sum = 0u32;
+        self.ev_cur.clear();
+        self.ev_cur.reserve(np);
+        for i in 0..np {
+            let cnt = unsafe { *self.ev_off.get_unchecked(i) };
+            unsafe { *self.ev_off.get_unchecked_mut(i) = sum };
+            self.ev_cur.push(sum);
+            sum += cnt;
+        }
+        unsafe { *self.ev_off.get_unchecked_mut(np) = sum };
+        let nev_unlinked = sum as usize;
+
+        // Pass 2 over events: unlinked -> local Ev8 buffer; linked -> Tier-2 Scatter
+        self.evs.clear();
+        self.evs.reserve(nev_unlinked);
+        let eo = self.evs.as_mut_ptr();
+        let mut k = 0usize;
+        for seg in es.iter() {
+            for e in seg {
+                unsafe {
+                    let pid = *self.ev_pids.get_unchecked(k) as usize;
+                    let cp = *self.canon.get_unchecked(pid);
+                    if cp.is_empty() {
+                        let dst = self.ev_cur.get_unchecked_mut(pid);
+                        eo.add(*dst as usize).write(Ev8::new(e.ts, e.pc));
+                        *dst += 1;
+                    } else {
+                        let ch = cp.hash(SEED_A);
+                        lev_w.push((ch >> l_shift) as usize, PEv { person: cp, ts: e.ts, pc: e.pc });
+                    }
+                }
+                k += 1;
+            }
+        }
+        unsafe { self.evs.set_len(nev_unlinked) };
+        es.free();
+
+        // Clicks: keep unlinked-with-events locally, forward linked (in-ht OR 0-event-in-shard) to Tier 2
+        let ncl_raw = cs.len();
+        self.cl_off.clear();
+        self.cl_off.resize(np + 1, 0);
+        self.cl_pids.clear();
+        self.cl_pids.reserve(ncl_raw);
+        let mut ncl_kept = 0usize;
+        if ncl_raw > 0 {
+            let ht_ptr = self.ht.as_ptr();
+            let ht_mask = self.ht_mask;
+            for seg in cs.iter() {
+                let slen = seg.len();
+                for ri in 0..slen {
+                    if ri + PF < slen {
+                        let fh = unsafe { seg.get_unchecked(ri + PF).phash };
+                        prefetch(unsafe { ht_ptr.add(fh as usize & ht_mask) } as *const u8);
+                    }
+                    let c = unsafe { seg.get_unchecked(ri) };
+                    if let Some(pid) = self.lookup(c.person, c.phash) {
+                        let cp = unsafe { *self.canon.get_unchecked(pid as usize) };
+                        if cp.is_empty() {
+                            self.cl_pids.push(pid);
+                            unsafe { *self.cl_off.get_unchecked_mut(pid as usize) += 1 };
+                            ncl_kept += 1;
+                        } else {
+                            self.cl_pids.push(u32::MAX);
+                            let ch = cp.hash(SEED_A);
+                            lcl_w.push(
+                                (ch >> l_shift) as usize,
+                                Click { person: cp, cid: c.cid, phash: ch, ts: c.ts, camp: c.camp },
+                            );
+                        }
+                    } else {
+                        self.cl_pids.push(u32::MAX);
+                        if links.maybe(c.phash) {
+                            if let Some(cp) = links.lookup(c.phash, c.person) {
+                                let ch = cp.hash(SEED_A);
+                                lcl_w.push(
+                                    (ch >> l_shift) as usize,
+                                    Click { person: cp, cid: c.cid, phash: ch, ts: c.ts, camp: c.camp },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.cls.clear();
+        if ncl_kept > 0 {
+            let mut csum = 0u32;
+            self.cl_cur.clear();
+            self.cl_cur.reserve(np);
+            for i in 0..np {
+                let cnt = unsafe { *self.cl_off.get_unchecked(i) };
+                unsafe { *self.cl_off.get_unchecked_mut(i) = csum };
+                self.cl_cur.push(csum);
+                csum += cnt;
+            }
+            self.cl_off[np] = csum;
+            self.cls.reserve(ncl_kept);
+            let co = self.cls.as_mut_ptr();
+            let mut ck = 0usize;
+            for seg in cs.iter() {
+                for c in seg {
+                    let pid = unsafe { *self.cl_pids.get_unchecked(ck) };
+                    ck += 1;
+                    if pid != u32::MAX {
+                        unsafe {
+                            let dst = self.cl_cur.get_unchecked_mut(pid as usize);
+                            co.add(*dst as usize).write(Cl24 { cid: c.cid, ts: c.ts, camp: c.camp });
+                            *dst += 1;
+                        }
+                    }
+                }
+            }
+            unsafe { self.cls.set_len(ncl_kept) };
+        }
+        cs.free();
+
+        // Solve all unlinked users immediately in Tier 1!
+        for pid in 0..np {
+            let es0 = unsafe { *self.ev_off.get_unchecked(pid) } as usize;
+            let es1 = unsafe { *self.ev_off.get_unchecked(pid + 1) } as usize;
+            if es0 == es1 {
+                continue;
+            }
+            let ordered = self.bins.order(unsafe { self.evs.get_unchecked_mut(es0..es1) }, &mut self.etmp);
+            let cls_slice: &mut [Cl24] = if ncl_kept > 0 {
+                let cs0 = unsafe { *self.cl_off.get_unchecked(pid) } as usize;
+                let cs1 = unsafe { *self.cl_off.get_unchecked(pid + 1) } as usize;
+                unsafe { self.cls.get_unchecked_mut(cs0..cs1) }
+            } else {
+                &mut []
+            };
+            w.person(unsafe { *self.pkeys.get_unchecked(pid) }, ordered, cls_slice, &mut self.ctmp);
         }
     }
 }
@@ -1223,7 +1590,7 @@ fn manifest_value(m: &str, key: &str) -> i64 {
 
 fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
     ctx: &Ctx,
-    links: &links::LinkTable,
+    link_files: &[&'static [u8]],
     event_files: &[&'static [u8]],
     click_files: &[&'static [u8]],
     threads: usize,
@@ -1235,195 +1602,247 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
     let p_shards: usize = 1 << P_BITS;
     let p_shift: u32 = 64 - P_BITS;
 
-    // ---- events: parse + validate, scatter one RawEv per line by event_id
+    // ---- events + dedup + clicks overlapped with background links build
+    // (links is not needed until Two-Tier solve!)
     let chunks = make_chunks(event_files, chunk_target(event_files, threads));
-    let id_set: ShardSet<RawEv> = ShardSet::new(id_shards);
+    let id_set: ShardSet<RawEv> = ShardSet::new_grouped(id_shards, 8);
     let oob_ingest: Mutex<Vec<i64>> = Mutex::new(Vec::new());
     let wide_store: Mutex<Vec<(u32, u16)>> = Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
-    par(threads, |_| {
-        let mut w = Scatter::new(&id_set);
-        let mut tok = fixed::Tok::default();
-        let oob_ref = &oob_ingest;
-        let wide_ref = &wide_store;
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= chunks.len() {
-                break;
-            }
-            let d = chunks[i].data;
-            populate(d);
-            fixed::scan::<7, _>(&mut tok, d, |f| {
-                let eid = f[0];
-                if eid.is_empty() {
-                    return;
+    let links_sync = if threads <= 1 {
+        let lt = links::build_links(link_files, 1);
+        mark("links");
+        Some(lt)
+    } else {
+        None
+    };
+    let (links, ev_set, click_set, wide_store) = std::thread::scope(|s| {
+        let links_job = if links_sync.is_none() {
+            let lt_threads = if ID_BITS >= 10 { (threads / 4).max(1) } else { 1 };
+            Some(s.spawn(move || links::build_links(link_files, lt_threads)))
+        } else {
+            None
+        };
+        par(threads, |_| {
+            let mut w = Scatter::new(&id_set);
+            let oob_ref = &oob_ingest;
+            let wide_ref = &wide_store;
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= chunks.len() {
+                    break;
                 }
-                let ingest = ctx.dates.parse_f1_ingest(f[3]);
-                let ek = Key8::new(eid);
-                let eh = ek.hash(SEED_ID);
-                let ing_u32 = enc_ingest_fast(ingest, ctx.base, oob_ref);
-                let mut r = RawEv {
-                    eid: ek,
-                    uid: Key8::EMPTY,
-                    ts: TS_INVALID,
-                    price: 0,
-                    ingest: ing_u32,
-                    ehash: eh as u32,
-                };
-                'v: {
-                    let Some(ing) = ingest else { break 'v };
-                    let uid = f[1];
-                    if uid.is_empty() || f[5].is_empty() {
-                        break 'v;
+                let d = chunks[i].data;
+                populate(d);
+                event_front::scan(d, &ctx.dates, |ev| {
+                    let eid = ev.eid;
+                    if eid.is_empty() {
+                        return;
                     }
-                    let ts = match ctx.dates.parse_ts(f[2]) {
-                        Some(t) if t >= ctx.ws && t < ctx.we => t,
-                        _ => break 'v,
+                    let ingest = ev.ingest;
+                    let ek = Key8::new(eid);
+                    let eh = ek.hash(SEED_ID);
+                    let ing_u32 = enc_ingest_fast(ingest, ctx.base, oob_ref);
+                    let mut r = RawEv {
+                        eid: ek,
+                        uid: Key8::EMPTY,
+                        ts: TS_INVALID,
+                        price: 0,
+                        ingest: ing_u32,
+                        ehash: eh as u32,
                     };
-                    let mut price_enc = 0u32;
-                    let et = f[4];
-                    let et_len = et.len();
-                    if et_len == 4 {
-                        let w = unsafe { (et.as_ptr() as *const u32).read_unaligned() };
-                        if w != u32::from_ne_bytes(*b"view") && w != u32::from_ne_bytes(*b"cart") {
+                    'v: {
+                        let Some(ing) = ingest else { break 'v };
+                        if ev.kind == 0 || ev.uid.is_empty() || ev.product.is_empty() {
                             break 'v;
                         }
-                    } else if et_len == 8
-                        && unsafe { (et.as_ptr() as *const u64).read_unaligned() } == u64::from_ne_bytes(*b"purchase")
-                    {
-                        let price = parse_price(f[6]);
-                        if price == 0 {
-                            break 'v;
-                        }
-                        let cat = ctx.products.get(f[5]).unwrap_or(ctx.unknown_cat);
-                        price_enc = if !ctx.wide {
-                            (price << 8) | cat
-                        } else {
-                            let mut g = wide_ref.lock().unwrap();
-                            g.push((price, cat as u16));
-                            g.len() as u32
+                        let ts = match ev.timestamp {
+                            Some(t) if t >= ctx.ws && t < ctx.we => t,
+                            _ => break 'v,
                         };
-                    } else {
-                        break 'v;
+                        let mut price_enc = 0u32;
+                        if ev.kind == 2 {
+                            let price = ev.price;
+                            if price == 0 {
+                                break 'v;
+                            }
+                            let cat = ctx.products.get(ev.product).unwrap_or(ctx.unknown_cat);
+                            price_enc = if !ctx.wide {
+                                (price << 8) | cat
+                            } else {
+                                let mut g = wide_ref.lock().unwrap();
+                                g.push((price, cat as u16));
+                                g.len() as u32
+                            };
+                        }
+                        if ing - ts > LATE_MS {
+                            break 'v;
+                        }
+                        r.uid = Key8::new(ev.uid);
+                        r.ts = (ts - ctx.base) as u32;
+                        r.price = price_enc;
                     }
-                    if ing - ts > LATE_MS {
-                        break 'v;
-                    }
-                    r.uid = Key8::new(uid);
-                    r.ts = (ts - ctx.base) as u32;
-                    r.price = price_enc;
-                }
-                w.push((eh >> id_shift) as usize, r);
-            });
-            release_chunk(d);
-        }
-        w.finish();
-    });
-    let oob_ingest = oob_ingest.into_inner().unwrap();
-    let wide_store = wide_store.into_inner().unwrap();
-    mark("events");
+                    w.push((eh >> id_shift) as usize, r);
+                });
+                release_chunk(d);
+            }
+            w.finish();
+        });
+        mark("events");
 
-    // ---- dedup (exact event_id) fused with person resolution and person scatter
-    let ev_set: ShardSet<PEv> = ShardSet::new_shared(p_shards);
-    let next = AtomicUsize::new(0);
-    let oob_slice = &oob_ingest[..];
-    par(threads, |_| {
-        let mut w = Scatter::new(&ev_set);
-        let mut res = Resolver::new(links, Ev8(0));
-        let mut emit = |e: Ev8, person: Key8, phash: u64| {
-            w.push((phash >> p_shift) as usize, PEv { person, ts: e.ts(), pc: e.pc() });
+        let oob_ingest = oob_ingest.into_inner().unwrap();
+        let wide_store = wide_store.into_inner().unwrap();
+
+        // ---- dedup (exact event_id) -> scatter directly by raw user_id (ZERO LinkTable lookups!)
+        let ev_set: ShardSet<PEv> = ShardSet::new_shared(p_shards);
+        let next = AtomicUsize::new(0);
+        let oob_slice = &oob_ingest[..];
+        par(threads, |_| {
+            let mut w = Scatter::new(&ev_set);
+            let (mut t32, mut t64): (Vec<u32>, Vec<u64>) = (Vec::new(), Vec::new());
+            let mut ctrls: Vec<u8> = Vec::new();
+            loop {
+                let s = next.fetch_add(1, Ordering::Relaxed);
+                if s >= id_shards {
+                    break;
+                }
+                let mut segs = id_set.take(s);
+                let nseg = segs.segs.len();
+                assert!(nseg < (1 << 22), "event_id shard too large");
+                let n = segs.len();
+                let cap = (n + n / 2).next_power_of_two().max(16);
+                if nseg < (1 << 15) - 1 {
+                    mark_losers(&mut segs, &mut t32, &mut ctrls, cap, ctx.base, oob_slice);
+                } else {
+                    mark_losers(&mut segs, &mut t64, &mut ctrls, cap, ctx.base, oob_slice);
+                }
+                for si in (0..nseg).rev() {
+                    for r in segs.seg(si) {
+                        if r.ts == TS_INVALID {
+                            continue;
+                        }
+                        let uh = r.uid.hash(SEED_A);
+                        w.push((uh >> p_shift) as usize, PEv { person: r.uid, ts: r.ts, pc: r.price });
+                    }
+                }
+                segs.free();
+                id_set.mark_shard_done(s);
+            }
+            w.finish();
+        });
+        id_set.free_all();
+        mark("dedup");
+
+        // ---- clicks: parse, validate, scatter directly by raw user_id (ZERO LinkTable lookups!)
+        let cws = ctx.ws - SEVEN_DAYS_MS;
+        let chunks = make_chunks(click_files, chunk_target(click_files, threads));
+        let click_set: ShardSet<Click> = ShardSet::new_shared(p_shards);
+        let next = AtomicUsize::new(0);
+        par(threads, |_| {
+            let mut w = Scatter::new(&click_set);
+            let mut tok = fixed::Tok::default();
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= chunks.len() {
+                    break;
+                }
+                let d = chunks[i].data;
+                populate(d);
+                fixed::scan::<4, _>(&mut tok, d, |f| {
+                    let (cid, uid) = (f[0], f[1]);
+                    if cid.is_empty() || uid.is_empty() {
+                        return;
+                    }
+                    let Some(camp) = ctx.camps.get(f[2]) else { return };
+                    let ts = match ctx.dates.parse_ts(f[3]) {
+                        Some(t) if t >= cws && t < ctx.we => t,
+                        _ => return,
+                    };
+                    let uid_k = Key8::new(uid);
+                    let uh = uid_k.hash(SEED_A);
+                    w.push(
+                        (uh >> p_shift) as usize,
+                        Click { person: uid_k, cid: Key8::new(cid), phash: uh, ts: (ts - ctx.base) as u32, camp },
+                    );
+                });
+                release_chunk(d);
+            }
+            w.finish();
+        });
+        mark("clicks");
+
+        let lt = match links_job {
+            Some(j) => {
+                let lt = j.join().expect("links build");
+                mark("links_wait");
+                lt
+            }
+            None => links_sync.unwrap(),
         };
-        let (mut t32, mut t64): (Vec<u32>, Vec<u64>) = (Vec::new(), Vec::new());
-        loop {
-            let s = next.fetch_add(1, Ordering::Relaxed);
-            if s >= id_shards {
-                break;
-            }
-            let mut segs = id_set.take(s);
-            let nseg = segs.segs.len();
-            assert!(nseg < (1 << 22), "event_id shard too large");
-            let n = segs.len();
-            let cap = (n + n / 2).next_power_of_two().max(16);
-            if nseg < (1 << 15) - 1 {
-                mark_losers(&mut segs, &mut t32, cap, ctx.base, oob_slice);
-            } else {
-                mark_losers(&mut segs, &mut t64, cap, ctx.base, oob_slice);
-            }
-            // Reverse MRU scan reuses the hottest L2-resident tail segments from mark_losers!
-            for si in (0..nseg).rev() {
-                for r in segs.seg(si) {
-                    if r.ts == TS_INVALID {
-                        continue;
-                    }
-                    res.push(Ev8::new(r.ts, r.price), r.uid, &mut emit);
-                }
-            }
-            segs.free();
-        }
-        res.drain(&mut emit);
-        w.finish();
+        (lt, ev_set, click_set, wide_store)
     });
-    id_set.free_all();
-    mark("dedup");
+    let links = &links;
 
-    // ---- clicks: parse, validate, resolve person, scatter by person
-    let cws = ctx.ws - SEVEN_DAYS_MS;
-    let chunks = make_chunks(click_files, chunk_target(click_files, threads));
-    let click_set: ShardSet<Click> = ShardSet::new_shared(p_shards);
-    let next = AtomicUsize::new(0);
-    par(threads, |_| {
-        let mut w = Scatter::new(&click_set);
-        let zero = Cl24 { cid: Key8::EMPTY, ts: 0, camp: 0 };
-        let mut res = Resolver::new(links, zero);
-        let mut tok = fixed::Tok::default();
-        let mut emit = |c: Cl24, person: Key8, phash: u64| {
-            w.push((phash >> p_shift) as usize, Click { person, cid: c.cid, phash, ts: c.ts, camp: c.camp });
-        };
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= chunks.len() {
-                break;
-            }
-            let d = chunks[i].data;
-            populate(d);
-            fixed::scan::<4, _>(&mut tok, d, |f| {
-                let (cid, uid) = (f[0], f[1]);
-                if cid.is_empty() || uid.is_empty() {
-                    return;
-                }
-                let Some(camp) = ctx.camps.get(f[2]) else { return };
-                let ts = match ctx.dates.parse_ts(f[3]) {
-                    Some(t) if t >= cws && t < ctx.we => t,
-                    _ => return,
-                };
-                let c = Cl24 { cid: Key8::new(cid), ts: (ts - ctx.base) as u32, camp };
-                res.push(c, Key8::new(uid), &mut emit);
-            });
-            release_chunk(d);
-        }
-        res.drain(&mut emit);
-        w.finish();
-    });
-    mark("clicks");
-
-    // ---- solve
+    // ---- Two-tier solve: Tier 1 resolves distinct uids once, solves unlinked in place,
+    // forwards linked to Tier 2; Tier 2 solves linked canonical persons in the same Workers!
     let mut order: Vec<(usize, usize)> =
         (0..p_shards).map(|p| (p, ev_set.count(p) * 2 + click_set.count(p))).collect();
     order.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let l_bits = P_BITS - 1;
+    let l_shards = 1usize << l_bits;
+    let l_shift = 64 - l_bits;
+    let linked_ev_set: ShardSet<PEv> = ShardSet::new_shared(l_shards);
+    let linked_cl_set: ShardSet<Click> = ShardSet::new_shared(l_shards);
+    let order2: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
     let wide_slice = &wide_store[..];
-    let next = AtomicUsize::new(0);
+    let next1 = AtomicUsize::new(0);
+    let next2 = AtomicUsize::new(0);
+    let bar = Barrier::new(threads);
     let results: Vec<(Vec<[Column; 6]>, Vec<CampAcc>)> = par(threads, |_| {
         let mut w = Worker::new(ctx, wide_slice, est_user_rows);
         let mut sc = SolveScratch::new();
-        loop {
-            let k = next.fetch_add(1, Ordering::Relaxed);
-            if k >= p_shards {
-                break;
+        {
+            let mut lev_w = Scatter::new(&linked_ev_set);
+            let mut lcl_w = Scatter::new(&linked_cl_set);
+            loop {
+                let k = next1.fetch_add(1, Ordering::Relaxed);
+                if k >= p_shards {
+                    break;
+                }
+                let p = order[k].0;
+                let es = ev_set.take(p);
+                let cs = click_set.take(p);
+                sc.run_tier1_shard(es, cs, links, &mut w, &mut lev_w, &mut lcl_w, l_shift);
             }
-            let p = order[k].0;
-            let es = ev_set.take(p);
-            let cs = click_set.take(p);
-            sc.run_shard(es, cs, &mut w);
+            lev_w.finish();
+            lcl_w.finish();
+        }
+        if bar.wait().is_leader() {
+            ev_set.release_blocks();
+            click_set.release_blocks();
+            links.release_pages();
+            if !links.is_empty() {
+                let mut o2: Vec<(usize, usize)> = (0..l_shards)
+                    .map(|p| (p, linked_ev_set.count(p) * 2 + linked_cl_set.count(p)))
+                    .filter(|x| x.1 > 0)
+                    .collect();
+                o2.sort_by_key(|x| std::cmp::Reverse(x.1));
+                *order2.lock().unwrap() = o2;
+            }
+        }
+        bar.wait();
+        if !links.is_empty() {
+            let o2 = order2.lock().unwrap().clone();
+            loop {
+                let k = next2.fetch_add(1, Ordering::Relaxed);
+                if k >= o2.len() {
+                    break;
+                }
+                let p = o2[k].0;
+                let es = linked_ev_set.take(p);
+                let cs = linked_cl_set.take(p);
+                sc.run_shard(es, cs, &mut w);
+            }
         }
         if w.cols[0].len() > 0 {
             let last = std::mem::replace(&mut w.cols, new_user_cols(0));
@@ -1433,6 +1852,8 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
     });
     ev_set.free_all();
     click_set.free_all();
+    linked_ev_set.free_all();
+    linked_cl_set.free_all();
     mark("solve");
     results
 }
@@ -1520,19 +1941,15 @@ fn main() {
     let ctx = &ctx;
     mark("init", &mut marks);
 
-    // ---- links (parallel 8-thread build)
-    let links = links::build_links(&link_files, threads);
-    let links = &links;
-    mark("links", &mut marks);
-
     let event_bytes: usize = event_files.iter().map(|d| d.len()).sum();
     let est_user_rows: usize = (event_bytes / (threads * 500)).clamp(1024, 512_000);
-    let results = if event_bytes > (2500 << 20) {
+    let force_10 = env("FORCE_SHARD_BITS").as_deref() == Some("10");
+    let results = if force_10 || event_bytes > (2500 << 20) {
         let mut m = |name: &'static str| mark(name, &mut marks);
-        run_pipeline::<10, 10>(ctx, links, &event_files, &click_files, threads, est_user_rows, &mut m)
+        run_pipeline::<10, 10>(ctx, &link_files, &event_files, &click_files, threads, est_user_rows, &mut m)
     } else {
         let mut m = |name: &'static str| mark(name, &mut marks);
-        run_pipeline::<9, 9>(ctx, links, &event_files, &click_files, threads, est_user_rows, &mut m)
+        run_pipeline::<9, 9>(ctx, &link_files, &event_files, &click_files, threads, est_user_rows, &mut m)
     };
 
     // ---- write (pooled blocks are released in parallel meanwhile)
@@ -1598,6 +2015,9 @@ fn main() {
                     }
                     parquet::write_file(&ud.join(format!("part-{i:05}.parquet")), &jobs[i])
                         .expect("write user_daily");
+                    for c in &jobs[i] {
+                        c.release_pages();
+                    }
                 })
             })
             .collect();
