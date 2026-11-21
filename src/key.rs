@@ -36,57 +36,6 @@ const OVF_SHARDS: usize = 1 << OVF_SHARD_BITS;
 #[repr(transparent)]
 pub struct Key8(pub u64);
 
-/// Exact 8-byte equality+hash key for `event_id` (`EKey`).
-/// Skips `bswap`, 7-bit ASCII validation, and `_pext_u64` on 99.7% of events
-/// (`n == 8 || n == 9` starting with `b'e'`). All tag spaces are strictly disjoint.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-#[repr(transparent)]
-pub struct EKey(pub u64);
-
-const EKEY_OVF_TAG: u64 = 0xC000_0000_0000_0000;
-
-impl EKey {
-    #[inline(always)]
-    pub fn new(s: &[u8]) -> EKey {
-        let n = s.len();
-        if n == 9 || n == 8 {
-            let p = s.as_ptr();
-            unsafe {
-                if *p == b'e' {
-                    let w0 = (p as *const u64).read_unaligned();
-                    let b8 = *p.add(n - 1);
-                    if b8 < 0x80 {
-                        let hi = if n == 9 { b8 as u64 } else { 0x88u64 };
-                        return EKey((w0 >> 8) | (hi << 56));
-                    }
-                }
-            }
-            return EKey::slow(s);
-        }
-        EKey::slow(s)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn slow(s: &[u8]) -> EKey {
-        let n = s.len();
-        if n <= 7 {
-            let mut v = (0x80u64 | n as u64) << 56;
-            for (i, &b) in s.iter().enumerate() {
-                v |= (b as u64) << (i * 8);
-            }
-            return EKey(v);
-        }
-        let idx = overflow_store().intern(s);
-        EKey(EKEY_OVF_TAG | idx)
-    }
-
-    #[inline(always)]
-    pub fn hash(&self, seed: u64) -> u64 {
-        mum(self.0 ^ seed, P0)
-    }
-}
-
 /// Packs 8 big-endian nonzero 7-bit ASCII bytes (`1..=127`) into 56 ordered bits.
 /// Returns `None` if any byte is `0` or `>= 128`.
 #[inline(always)]
@@ -153,7 +102,6 @@ impl Key8 {
     }
 
     #[cold]
-    #[inline(never)]
     fn overflow(s: &[u8]) -> Key8 {
         let idx = overflow_store().intern(s);
         Key8(OVF_BIT | idx)
@@ -162,7 +110,7 @@ impl Key8 {
     /// Single-multiply wyhash-grade 64-bit hash with full avalanche across all 64 bits.
     #[inline(always)]
     pub fn hash(&self, seed: u64) -> u64 {
-        mum(self.0 ^ seed, P0)
+        mum(self.0 ^ seed ^ P0, self.0.wrapping_add(P1) ^ seed)
     }
 
     /// The ID bytes; inline keys are decoded into `buf` (single BMI2 `pdep` on x86-64-v3).
@@ -371,47 +319,16 @@ mod tests {
     }
 
     #[test]
-    fn ekey_is_exact_and_collision_free() {
-        let ids: Vec<&[u8]> = vec![
-            b"", b"e", b"e1", b"e123456", b"e1234567", b"e12345678", b"e123456789",
-            b"u1234567", b"u12345678", b"e1234567\0", b"e123456\0", b"e1234567\x80",
-            b"e123456\x80", b"e1234567\xff", b"\x80\x81\x82\x83\x84\x85\x86",
-            b"e42huhoug", b"e42huhou", b"e42huhou\x88", b"long-event-id-1234567890",
-        ];
-        let keys: Vec<EKey> = ids.iter().map(|s| EKey::new(s)).collect();
-        for i in 0..ids.len() {
-            assert_eq!(keys[i], EKey::new(ids[i]));
-            for j in 0..ids.len() {
-                assert_eq!(keys[i] == keys[j], ids[i] == ids[j], "{:?} vs {:?}", ids[i], ids[j]);
-            }
-        }
-        let buf = vec![b'e'; 3 * 4096];
-        let base = (buf.as_ptr() as usize + 4095) & !4095;
-        let off = base - buf.as_ptr() as usize + 4096;
-        for n in 0..=15 {
-            let s = &buf[off - n..off];
-            assert_eq!(EKey::new(s), EKey::new(&s.to_vec()));
-        }
-    }
-
-    #[test]
     fn hash_distinct_keys_never_merge() {
         let mut seen = std::collections::HashSet::new();
         for i in 0..200_000u32 {
             let s = format!("u{i:x}");
             assert!(seen.insert(Key8::new(s.as_bytes())));
         }
-        let mut cnt_hi = [0u32; 256];
-        let mut cnt_lo = [0u32; 256];
-        let mut cnt_tag = [0u32; 128];
+        let mut cnt = [0u32; 256];
         for i in 0..256_000u32 {
-            let h = Key8::new(format!("u{i:08x}").as_bytes()).hash(0x9e37_79b9_7f4a_7c15);
-            cnt_hi[(h >> 56) as usize] += 1;
-            cnt_lo[(h & 255) as usize] += 1;
-            cnt_tag[((h >> 17) & 127) as usize] += 1;
+            cnt[(Key8::new(format!("e{i}").as_bytes()).hash(7) >> 56) as usize] += 1;
         }
-        assert!(cnt_hi.iter().all(|&c| c > 700 && c < 1300), "hi: {cnt_hi:?}");
-        assert!(cnt_lo.iter().all(|&c| c > 700 && c < 1300), "lo: {cnt_lo:?}");
-        assert!(cnt_tag.iter().all(|&c| c > 1500 && c < 2500), "tag: {cnt_tag:?}");
+        assert!(cnt.iter().all(|&c| c > 700 && c < 1300), "{cnt:?}");
     }
 }
