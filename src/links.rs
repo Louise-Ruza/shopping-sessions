@@ -257,6 +257,9 @@ struct LSide {
 }
 
 pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
+    if threads <= 1 {
+        return build_links_seq_sharded(files);
+    }
     let chunks = make_chunks(files, chunk_target(files, threads).min(1 << 20));
     let next = AtomicUsize::new(0);
     let sides: ShardSet<LSide> = ShardSet::new_shared(SIDE_SHARDS);
@@ -527,6 +530,189 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
         bloom_mask,
         empty: total_nr == 0,
     }
+}
+
+/// Fast zero-atomic single-threaded sharded link-table builder: 64 L2-resident
+/// intern shards + flat non-atomic union-find + non-atomic Bloom. Avoids both
+/// multi-thread CAS/spawn overhead AND unsharded DRAM hash-table thrashing.
+fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
+    let sides: ShardSet<LSide> = ShardSet::new_shared(SIDE_SHARDS);
+    let mut w = Scatter::new(&sides);
+    let mut tok = fixed::Tok::default();
+    let mut ne = 0u64;
+    for &d in files {
+        let start = match d.iter().position(|&c| c == b'\n') {
+            Some(i) => i + 1,
+            None => continue,
+        };
+        let body = &d[start..];
+        if body.is_empty() {
+            continue;
+        }
+        populate(body);
+        fixed::scan::<2, _>(&mut tok, body, |f| {
+            let (a, b) = (f[0], f[1]);
+            if a.is_empty() || b.is_empty() {
+                return;
+            }
+            let ka = Key8::new(a);
+            let kb = Key8::new(b);
+            let sa = (ka.hash(SEED_L) >> (64 - SIDE_BITS)) as usize;
+            let sb = (kb.hash(SEED_L) >> (64 - SIDE_BITS)) as usize;
+            w.push(sa, LSide { key: ka, ep: ne * 2 });
+            w.push(sb, LSide { key: kb, ep: ne * 2 + 1 });
+            ne += 1;
+        });
+        release_chunk(body);
+    }
+    w.finish();
+
+    let total_eps = (ne as usize) * 2;
+    if total_eps == 0 {
+        sides.free_all();
+        return LinkTable { tab: vec![LEMPTY; REGIONS << 2], rbits: 2, bloom: vec![0; 1 << 10], bloom_mask: (1 << 10) - 1, empty: true };
+    }
+
+    let mut eps: Vec<u32> = Vec::with_capacity(total_eps);
+    unsafe { eps.set_len(total_eps) };
+    let eptr = eps.as_mut_ptr();
+    let mut keys: Vec<Key8> = Vec::with_capacity(total_eps / 2 + 64);
+    let mut tab: Vec<u32> = Vec::new();
+    const PF: usize = 8;
+    for s in 0..SIDE_SHARDS {
+        let segs = sides.take(s);
+        let n = segs.len();
+        if n == 0 {
+            segs.free();
+            continue;
+        }
+        let cap = (n * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        tab.clear();
+        tab.resize(cap, 0);
+        let tptr = tab.as_mut_ptr();
+        for seg in segs.iter() {
+            let slen = seg.len();
+            for ri in 0..slen {
+                if ri + PF < slen {
+                    let fh = unsafe { seg.get_unchecked(ri + PF).key.hash(SEED_L) };
+                    prefetch(unsafe { tptr.add(fh as usize & mask) } as *const u8);
+                }
+                let side = unsafe { seg.get_unchecked(ri) };
+                let mut i = side.key.hash(SEED_L) as usize & mask;
+                let node;
+                loop {
+                    let e = unsafe { *tptr.add(i) };
+                    if e == 0 {
+                        node = keys.len() as u32;
+                        keys.push(side.key);
+                        unsafe { *tptr.add(i) = node + 1 };
+                        break;
+                    }
+                    let id = e - 1;
+                    if unsafe { *keys.get_unchecked(id as usize) } == side.key {
+                        node = id;
+                        break;
+                    }
+                    i = (i + 1) & mask;
+                }
+                unsafe { *eptr.add(side.ep as usize) = node };
+            }
+        }
+        segs.free();
+    }
+    sides.free_all();
+    drop(tab);
+
+    let n = keys.len();
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+
+    #[inline(always)]
+    fn find_seq(parent: &mut [u32], mut x: u32) -> u32 {
+        loop {
+            let p = unsafe { *parent.get_unchecked(x as usize) };
+            if p == x {
+                return x;
+            }
+            let g = unsafe { *parent.get_unchecked(p as usize) };
+            unsafe { *parent.get_unchecked_mut(x as usize) = g };
+            x = g;
+        }
+    }
+
+    for e in eps.chunks_exact(2) {
+        let a = find_seq(&mut parent, e[0]);
+        let b = find_seq(&mut parent, e[1]);
+        if a != b {
+            if unsafe { keys.get_unchecked(a as usize).cmp_bytes(keys.get_unchecked(b as usize)) }
+                == std::cmp::Ordering::Less
+            {
+                unsafe { *parent.get_unchecked_mut(b as usize) = a };
+            } else {
+                unsafe { *parent.get_unchecked_mut(a as usize) = b };
+            }
+        }
+    }
+    drop(eps);
+
+    let mut has_alias = vec![0u8; n];
+    for x in 0..n {
+        let r = find_seq(&mut parent, x as u32);
+        if r != x as u32 {
+            unsafe {
+                *has_alias.get_unchecked_mut(r as usize) = 1;
+                *parent.get_unchecked_mut(x) = r;
+            }
+        }
+    }
+    let mut counts = [0usize; REGIONS];
+    let mut linked: Vec<(u32, u32, u64)> = Vec::with_capacity(n);
+    for x in 0..n {
+        let r = unsafe { *parent.get_unchecked(x) };
+        if r != x as u32 || unsafe { *has_alias.get_unchecked(x) } != 0 {
+            let h = unsafe { keys.get_unchecked(x) }.hash(SEED_L);
+            counts[(h >> (64 - REGION_BITS)) as usize] += 1;
+            linked.push((x as u32, r, h));
+        }
+    }
+    drop(parent);
+    drop(has_alias);
+
+    let total_nr = linked.len();
+    let bloom_words = ((total_nr * 12 / 64).next_power_of_two()).clamp(1 << 10, 1 << 20);
+    let bloom_mask = bloom_words - 1;
+    let maxc = counts.iter().copied().max().unwrap_or(0);
+    let rbits = ((maxc + maxc / 2 + 1).next_power_of_two().max(4)).trailing_zeros();
+    let mut ltab = vec![LEMPTY; REGIONS << rbits];
+    #[cfg(target_os = "linux")]
+    if ltab.len() * std::mem::size_of::<LEnt>() >= (2 << 20) {
+        unsafe {
+            libc::madvise(
+                ltab.as_mut_ptr() as *mut libc::c_void,
+                ltab.len() * std::mem::size_of::<LEnt>(),
+                libc::MADV_HUGEPAGE,
+            );
+        }
+    }
+    let mut bloom = vec![0u64; bloom_words];
+    let rmask = (1usize << rbits) - 1;
+    let lptr = ltab.as_mut_ptr();
+    for &(x, root, h) in &linked {
+        unsafe {
+            *bloom.get_unchecked_mut(bloom_word(h, bloom_mask)) |= bloom_bits(h);
+            let r = (h >> (64 - REGION_BITS)) as usize;
+            let base = r << rbits;
+            let mut i = h as usize & rmask;
+            while !(*lptr.add(base + i)).key.is_empty() {
+                i = (i + 1) & rmask;
+            }
+            *lptr.add(base + i) = LEnt {
+                key: *keys.get_unchecked(x as usize),
+                person: *keys.get_unchecked(root as usize),
+            };
+        }
+    }
+    LinkTable { tab: ltab, rbits, bloom, bloom_mask, empty: total_nr == 0 }
 }
 
 /// Fast zero-sync single-threaded link-table builder (retained for reference/tests).

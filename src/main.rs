@@ -30,7 +30,7 @@ use std::time::Instant;
 
 use arena::{ShardSet, Scatter, Segs};
 use key::Key8;
-use links::{prefetch, LinkTable, SEED_A, SEED_L};
+use links::{prefetch, LinkTable, SEED_A};
 use parquet::{Column, Kind};
 use ts::{parse_ts, DateCache, DAY_MS};
 
@@ -588,6 +588,28 @@ struct CampAcc {
     revenue: u64,
 }
 
+/// L1-tiny 2-byte per-(campaign, day) counter pair, laid out as `[camp * ndays + day]`.
+/// All 14 days of a campaign sit in 28 contiguous bytes (half a cache line), so
+/// multi-day `close()` and multi-day attributed sessions stay in L1/L2 cache.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Cell8 {
+    sess: u8,
+    assisted: u8,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CellHi {
+    sess: u32,
+    assisted: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PurchRev {
+    purchasing: u32,
+    revenue: u64,
+}
+
 #[derive(Clone, Copy)]
 struct Sess {
     start: i64,
@@ -611,9 +633,15 @@ struct Worker<'a> {
     ctx: &'a Ctx,
     wide_store: &'a [(u32, u16)],
     k1: usize,
+    ndays: usize,
     cnt: Vec<u32>,
     since: Vec<u32>,
-    acc: Vec<CampAcc>,
+    /// Transposed `[camp * ndays + day]` L1-tiny u8 counters (~56 KB for 2001x14).
+    cells: Vec<Cell8>,
+    /// Overflow carries for `cells` (rarely touched, only on 256-wrap).
+    cells_hi: Vec<CellHi>,
+    /// Purchasing sessions & revenue `[camp * ndays + day]` (touched on ~3% of sessions).
+    purch_rev: Vec<PurchRev>,
     cat_rev: Vec<u64>,
     touched: Vec<u32>,
     sess: Vec<Sess>,
@@ -625,19 +653,76 @@ struct Worker<'a> {
 impl<'a> Worker<'a> {
     fn new(ctx: &'a Ctx, wide_store: &'a [(u32, u16)], est_rows: usize) -> Worker<'a> {
         let k1 = ctx.camp_ids.len();
+        let ndays = ctx.ndays;
+        let total = k1 * ndays;
         Worker {
             ctx,
             wide_store,
             k1,
+            ndays,
             cnt: vec![0; k1],
             since: vec![0; k1],
-            acc: vec![CampAcc::default(); k1 * ctx.ndays],
+            cells: vec![Cell8::default(); total],
+            cells_hi: vec![CellHi::default(); total],
+            purch_rev: vec![PurchRev::default(); total],
             cat_rev: vec![0; ctx.cat_names.len()],
             touched: Vec::new(),
             sess: Vec::new(),
-            day_first: vec![0; ctx.ndays + 1],
+            day_first: vec![0; ndays + 1],
             cols: new_user_cols(est_rows),
             done_cols: Vec::new(),
+        }
+    }
+
+    fn into_acc(self) -> Vec<CampAcc> {
+        let k1 = self.k1;
+        let ndays = self.ndays;
+        let mut out = vec![CampAcc::default(); k1 * ndays];
+        for k in 0..k1 {
+            let base = k * ndays;
+            for d in 0..ndays {
+                let src = base + d;
+                let c = self.cells[src];
+                let h = self.cells_hi[src];
+                let pr = self.purch_rev[src];
+                let sessions = h.sess + c.sess as u32;
+                let assisted = h.assisted + c.assisted as u32;
+                if sessions != 0 || assisted != 0 {
+                    out[d * k1 + k] = CampAcc {
+                        sessions,
+                        purchasing: pr.purchasing,
+                        assisted,
+                        revenue: pr.revenue,
+                    };
+                }
+            }
+        }
+        out
+    }
+
+    #[inline(always)]
+    fn add_session(&mut self, camp: usize, day: usize, purch: bool, rev: u64) {
+        let idx = camp * self.ndays + day;
+        let c = unsafe { self.cells.get_unchecked_mut(idx) };
+        let (nv, ov) = c.sess.overflowing_add(1);
+        c.sess = nv;
+        if ov {
+            unsafe { self.cells_hi.get_unchecked_mut(idx).sess += 256 };
+        }
+        if purch {
+            let pr = unsafe { self.purch_rev.get_unchecked_mut(idx) };
+            pr.purchasing += 1;
+            pr.revenue += rev;
+        }
+    }
+
+    #[inline(always)]
+    fn add_assisted(&mut self, idx: usize, add: u32) {
+        let c = unsafe { self.cells.get_unchecked_mut(idx) };
+        let sum = c.assisted as u32 + add;
+        c.assisted = sum as u8;
+        if sum >= 256 {
+            unsafe { self.cells_hi.get_unchecked_mut(idx).assisted += sum & !255 };
         }
     }
 
@@ -677,18 +762,23 @@ impl<'a> Worker<'a> {
         self.cols[5].push_opt_str(if top >= 0 { Some(self.ctx.cat_names[top as usize]) } else { None });
     }
 
-    #[inline]
+    #[inline(always)]
     fn close(&mut self, camp: usize, a: u32, b: u32) {
         if a >= b {
             return;
         }
-        let first = self.sess[a as usize].day as usize;
-        let last = self.sess[b as usize - 1].day as usize;
+        let first = unsafe { self.sess.get_unchecked(a as usize).day as usize };
+        let last = unsafe { self.sess.get_unchecked(b as usize - 1).day as usize };
+        let base = camp * self.ndays;
+        if first == last {
+            self.add_assisted(base + first, b - a);
+            return;
+        }
         for d in first..=last {
-            let lo = a.max(self.day_first[d]);
-            let hi = b.min(self.day_first[d + 1]);
+            let lo = a.max(unsafe { *self.day_first.get_unchecked(d) });
+            let hi = b.min(unsafe { *self.day_first.get_unchecked(d + 1) });
             if hi > lo {
-                self.acc[d * self.k1 + camp].assisted += hi - lo;
+                self.add_assisted(base + d, hi - lo);
             }
         }
     }
@@ -717,10 +807,7 @@ impl<'a> Worker<'a> {
             self.cols[3].push_i64(1);
             self.cols[4].push_i64(rev as i64);
             self.cols[5].push_opt_str(top_opt);
-            let a = &mut self.acc[day as usize * self.k1];
-            a.sessions += 1;
-            a.purchasing += (pc != 0) as u32;
-            a.revenue += rev;
+            self.add_session(0, day as usize, pc != 0, rev);
             return;
         }
         self.sess.clear();
@@ -769,13 +856,11 @@ impl<'a> Worker<'a> {
         }
         self.flush_row(person, cur_day, ns, ne, rev);
 
-        let k1 = self.k1;
         if clicks.is_empty() {
-            for s in &self.sess {
-                let a = &mut self.acc[s.day as usize * k1];
-                a.sessions += 1;
-                a.purchasing += s.purch as u32;
-                a.revenue += s.rev;
+            let n_s = self.sess.len();
+            for j in 0..n_s {
+                let s = unsafe { *self.sess.get_unchecked(j) };
+                self.add_session(0, s.day as usize, s.purch, s.rev);
             }
             return;
         }
@@ -785,7 +870,8 @@ impl<'a> Worker<'a> {
             let s = self.sess[0];
             let lo = s.start - SEVEN_DAYS_MS;
             let hi = s.start;
-            let row_base = s.day as usize * k1;
+            let sday = s.day as usize;
+            let ndays = self.ndays;
             let mut best_ts = i64::MIN;
             let mut best_cid = Key8::EMPTY;
             let mut credited = 0usize;
@@ -798,34 +884,33 @@ impl<'a> Worker<'a> {
                         credited = c.camp as usize;
                     }
                     let k = c.camp as usize;
-                    if self.cnt[k] == 0 {
-                        self.cnt[k] = 1;
-                        self.acc[row_base + k].assisted += 1;
+                    if unsafe { *self.cnt.get_unchecked(k) } == 0 {
+                        unsafe { *self.cnt.get_unchecked_mut(k) = 1 };
+                        self.add_assisted(k * ndays + sday, 1);
                         self.touched.push(k as u32);
                     }
                 }
             }
             for &k in &self.touched {
-                self.cnt[k as usize] = 0;
+                unsafe { *self.cnt.get_unchecked_mut(k as usize) = 0 };
             }
             self.touched.clear();
-            let a = &mut self.acc[row_base + credited];
-            a.sessions += 1;
-            a.purchasing += s.purch as u32;
-            a.revenue += s.rev;
+            self.add_session(credited, sday, s.purch, s.rev);
             return;
         }
         if clicks.len() > 1 {
             sort_person_clicks(clicks, ctmp);
         }
-        // day_first[d] = first session index with day >= d
-        {
+        // Only build day_first over the person's active day span (skip entirely if all sessions share one day).
+        let first_day = unsafe { self.sess.get_unchecked(0).day as usize };
+        let last_day = unsafe { self.sess.get_unchecked(nsess - 1).day as usize };
+        if first_day < last_day {
             let mut j = 0usize;
-            for d in 0..=self.ctx.ndays {
-                while j < nsess && (self.sess[j].day as usize) < d {
+            for d in first_day..=last_day + 1 {
+                while j < nsess && (unsafe { self.sess.get_unchecked(j).day as usize }) < d {
                     j += 1;
                 }
-                self.day_first[d] = j as u32;
+                unsafe { *self.day_first.get_unchecked_mut(d) = j as u32 };
             }
         }
         let n = clicks.len();
@@ -833,41 +918,41 @@ impl<'a> Worker<'a> {
         let mut latest_ts = i64::MIN;
         let mut latest_camp = 0usize;
         for j in 0..nsess {
-            let s = self.sess[j];
-            while cr < n && clicks[cr].ts as i64 <= s.start {
-                let c = &clicks[cr];
+            let s = unsafe { *self.sess.get_unchecked(j) };
+            while cr < n && unsafe { clicks.get_unchecked(cr).ts as i64 } <= s.start {
+                let c = unsafe { clicks.get_unchecked(cr) };
                 if c.ts as i64 != latest_ts {
                     latest_ts = c.ts as i64;
                     latest_camp = c.camp as usize;
                 }
                 let k = c.camp as usize;
-                self.cnt[k] += 1;
-                if self.cnt[k] == 1 {
-                    self.since[k] = j as u32;
+                let ck = unsafe { self.cnt.get_unchecked_mut(k) };
+                *ck += 1;
+                if *ck == 1 {
+                    unsafe { *self.since.get_unchecked_mut(k) = j as u32 };
                 }
                 cr += 1;
             }
             let lo = s.start - SEVEN_DAYS_MS;
-            while cl < cr && (clicks[cl].ts as i64) < lo {
-                let k = clicks[cl].camp as usize;
-                self.cnt[k] -= 1;
-                if self.cnt[k] == 0 {
-                    let a = self.since[k];
+            while cl < cr && (unsafe { clicks.get_unchecked(cl).ts as i64 }) < lo {
+                let k = unsafe { clicks.get_unchecked(cl).camp as usize };
+                let ck = unsafe { self.cnt.get_unchecked_mut(k) };
+                *ck -= 1;
+                if *ck == 0 {
+                    let a = unsafe { *self.since.get_unchecked(k) };
                     self.close(k, a, j as u32);
                 }
                 cl += 1;
             }
             let credited = if cl < cr { latest_camp } else { 0 };
-            let a = &mut self.acc[s.day as usize * k1 + credited];
-            a.sessions += 1;
-            a.purchasing += s.purch as u32;
-            a.revenue += s.rev;
+            self.add_session(credited, s.day as usize, s.purch, s.rev);
         }
         for i in cl..cr {
-            let k = clicks[i].camp as usize;
-            if self.cnt[k] > 0 {
-                self.cnt[k] = 0;
-                let a = self.since[k];
+            let k = unsafe { clicks.get_unchecked(i).camp as usize };
+            let ck = unsafe { self.cnt.get_unchecked_mut(k) };
+            if *ck > 0 {
+                *ck = 0;
+                let a = unsafe { *self.since.get_unchecked(k) };
                 self.close(k, a, nsess as u32);
             }
         }
@@ -1052,13 +1137,25 @@ struct HtEnt {
 const HT_EMPTY: HtEnt = HtEnt { key: Key8::EMPTY, pid: 0, cnt: 0 };
 const _: () = assert!(std::mem::size_of::<HtEnt>() == 16);
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct CanonInfo {
+    key: Key8,
+    hash: u64,
+}
+
+const CANON_EMPTY: CanonInfo = CanonInfo { key: Key8::EMPTY, hash: 0 };
+
 /// Scratch buffers reused across all shards handled by one solve worker.
 struct SolveScratch {
     ht: Vec<HtEnt>,
     ht_mask: usize,
     pkeys: Vec<Key8>,
-    canon: Vec<Key8>,
+    pkeys_h: Vec<u64>,
+    canon: Vec<CanonInfo>,
     link_probe: Vec<(u32, u64)>,
+    miss_clicks: Vec<Click>,
+    miss_probe: Vec<u32>,
     ev_off: Vec<u32>,
     ev_cur: Vec<u32>,
     ev_pids: Vec<u32>,
@@ -1078,8 +1175,11 @@ impl SolveScratch {
             ht: Vec::new(),
             ht_mask: 0,
             pkeys: Vec::new(),
+            pkeys_h: Vec::new(),
             canon: Vec::new(),
             link_probe: Vec::new(),
+            miss_clicks: Vec::new(),
+            miss_probe: Vec::new(),
             ev_off: Vec::new(),
             ev_cur: Vec::new(),
             ev_pids: Vec::new(),
@@ -1116,6 +1216,7 @@ impl SolveScratch {
             if e.key.is_empty() {
                 let pid = self.pkeys.len() as u32;
                 self.pkeys.push(person);
+                self.pkeys_h.push(h);
                 *e = HtEnt { key: person, pid, cnt: 1 };
                 return pid;
             }
@@ -1167,6 +1268,7 @@ impl SolveScratch {
         let init_cap = ((nev / 6).next_power_of_two()).max(256);
         self.reset_ht(init_cap);
         self.pkeys.clear();
+        self.pkeys_h.clear();
         self.ev_pids.clear();
         self.ev_pids.reserve(nev);
 
@@ -1310,6 +1412,47 @@ impl SolveScratch {
         }
     }
 
+    fn flush_miss_clicks(&mut self, links: &LinkTable, lcl_w: &mut Scatter<'_, Click>, l_shift: u32) {
+        let nm = self.miss_clicks.len();
+        if nm == 0 {
+            return;
+        }
+        const PF: usize = 8;
+        self.miss_probe.clear();
+        for i in 0..nm.min(PF) {
+            links.prefetch_bloom(unsafe { self.miss_clicks.get_unchecked(i).phash });
+        }
+        for i in 0..nm {
+            if i + PF < nm {
+                links.prefetch_bloom(unsafe { self.miss_clicks.get_unchecked(i + PF).phash });
+            }
+            if links.maybe(unsafe { self.miss_clicks.get_unchecked(i).phash }) {
+                self.miss_probe.push(i as u32);
+            }
+        }
+        let npr = self.miss_probe.len();
+        for j in 0..npr.min(PF) {
+            let idx = unsafe { *self.miss_probe.get_unchecked(j) as usize };
+            links.prefetch(unsafe { self.miss_clicks.get_unchecked(idx).phash });
+        }
+        for j in 0..npr {
+            if j + PF < npr {
+                let fidx = unsafe { *self.miss_probe.get_unchecked(j + PF) as usize };
+                links.prefetch(unsafe { self.miss_clicks.get_unchecked(fidx).phash });
+            }
+            let idx = unsafe { *self.miss_probe.get_unchecked(j) as usize };
+            let c = unsafe { *self.miss_clicks.get_unchecked(idx) };
+            if let Some(cp) = links.lookup(c.phash, c.person) {
+                let ch = cp.hash(SEED_A);
+                lcl_w.push(
+                    (ch >> l_shift) as usize,
+                    Click { person: cp, cid: c.cid, phash: ch, ts: c.ts, camp: c.camp },
+                );
+            }
+        }
+        self.miss_clicks.clear();
+    }
+
     /// Two-tier solve Tier 1: raw-uid shard. Resolves each distinct uid ONCE in `links`,
     /// solves truly unlinked users immediately in place, and forwards linked users'
     /// events and clicks (including 0-event-in-shard linked clicks!) to Tier 2.
@@ -1330,19 +1473,11 @@ impl SolveScratch {
         let nev = es.len();
         if nev == 0 {
             if cs.len() > 0 {
+                self.miss_clicks.clear();
                 for seg in cs.iter() {
-                    for c in seg {
-                        if links.maybe(c.phash) {
-                            if let Some(cp) = links.lookup(c.phash, c.person) {
-                                let ch = cp.hash(SEED_A);
-                                lcl_w.push(
-                                    (ch >> l_shift) as usize,
-                                    Click { person: cp, cid: c.cid, phash: ch, ts: c.ts, camp: c.camp },
-                                );
-                            }
-                        }
-                    }
+                    self.miss_clicks.extend_from_slice(seg);
                 }
+                self.flush_miss_clicks(links, lcl_w, l_shift);
             }
             es.free();
             cs.free();
@@ -1352,6 +1487,7 @@ impl SolveScratch {
         let init_cap = ((nev / 6).next_power_of_two()).max(256);
         self.reset_ht(init_cap);
         self.pkeys.clear();
+        self.pkeys_h.clear();
         self.ev_pids.clear();
         self.ev_pids.reserve(nev);
 
@@ -1380,23 +1516,20 @@ impl SolveScratch {
         }
         let np = self.pkeys.len();
 
-        // Resolve each distinct raw uid ONCE in LinkTable (pipelined Bloom -> Table prefetch).
+        // Resolve each distinct raw uid ONCE in LinkTable using saved SEED_A==SEED_L hashes.
+        // Precompute (canon_key, canon_hash) once per linked pid!
         self.canon.clear();
-        self.canon.resize(np, Key8::EMPTY);
+        self.canon.resize(np, CANON_EMPTY);
         self.link_probe.clear();
         let pre = np.min(PF);
         for pid in 0..pre {
-            let h = unsafe { self.pkeys.get_unchecked(pid).hash(SEED_L) };
-            hring[pid] = h;
-            links.prefetch_bloom(h);
+            links.prefetch_bloom(unsafe { *self.pkeys_h.get_unchecked(pid) });
         }
         for pid in 0..np {
-            let h = hring[pid & (PF - 1)];
             if pid + PF < np {
-                let fh = unsafe { self.pkeys.get_unchecked(pid + PF).hash(SEED_L) };
-                hring[(pid + PF) & (PF - 1)] = fh;
-                links.prefetch_bloom(fh);
+                links.prefetch_bloom(unsafe { *self.pkeys_h.get_unchecked(pid + PF) });
             }
+            let h = unsafe { *self.pkeys_h.get_unchecked(pid) };
             if links.maybe(h) {
                 self.link_probe.push((pid as u32, h));
             }
@@ -1412,18 +1545,20 @@ impl SolveScratch {
             let (pid, h) = unsafe { *self.link_probe.get_unchecked(j) };
             let uid = unsafe { *self.pkeys.get_unchecked(pid as usize) };
             if let Some(cp) = links.lookup(h, uid) {
-                unsafe { *self.canon.get_unchecked_mut(pid as usize) = cp };
+                unsafe {
+                    *self.canon.get_unchecked_mut(pid as usize) =
+                        CanonInfo { key: cp, hash: cp.hash(SEED_A) };
+                }
             }
         }
 
-        // Prefix sum counts ONLY for unlinked users (canon[pid] == EMPTY).
-        // For linked users, reuse ev_off[pid] to store their Tier-2 shard index!
+        // Prefix sum counts ONLY for unlinked users (canon[pid].key == EMPTY).
         self.ev_off.clear();
         self.ev_off.resize(np + 1, 0);
         for e in &self.ht {
             if !e.key.is_empty() {
                 let pid = e.pid as usize;
-                if unsafe { self.canon.get_unchecked(pid).is_empty() } {
+                if unsafe { self.canon.get_unchecked(pid).key.is_empty() } {
                     unsafe { *self.ev_off.get_unchecked_mut(pid) = e.cnt };
                 }
             }
@@ -1440,7 +1575,7 @@ impl SolveScratch {
         unsafe { *self.ev_off.get_unchecked_mut(np) = sum };
         let nev_unlinked = sum as usize;
 
-        // Pass 2 over events: unlinked -> local Ev8 buffer; linked -> Tier-2 Scatter
+        // Pass 2 over events: unlinked -> local Ev8 buffer; linked -> Tier-2 Scatter (zero re-hashing!)
         self.evs.clear();
         self.evs.reserve(nev_unlinked);
         let eo = self.evs.as_mut_ptr();
@@ -1449,14 +1584,13 @@ impl SolveScratch {
             for e in seg {
                 unsafe {
                     let pid = *self.ev_pids.get_unchecked(k) as usize;
-                    let cp = *self.canon.get_unchecked(pid);
-                    if cp.is_empty() {
+                    let ci = *self.canon.get_unchecked(pid);
+                    if ci.key.is_empty() {
                         let dst = self.ev_cur.get_unchecked_mut(pid);
                         eo.add(*dst as usize).write(Ev8::new(e.ts, e.pc));
                         *dst += 1;
                     } else {
-                        let ch = cp.hash(SEED_A);
-                        lev_w.push((ch >> l_shift) as usize, PEv { person: cp, ts: e.ts, pc: e.pc });
+                        lev_w.push((ci.hash >> l_shift) as usize, PEv { person: ci.key, ts: e.ts, pc: e.pc });
                     }
                 }
                 k += 1;
@@ -1465,12 +1599,14 @@ impl SolveScratch {
         unsafe { self.evs.set_len(nev_unlinked) };
         es.free();
 
-        // Clicks: keep unlinked-with-events locally, forward linked (in-ht OR 0-event-in-shard) to Tier 2
+        // Clicks: keep unlinked-with-events locally, forward linked directly (zero re-hashing),
+        // and pipeline 0-event-in-shard clicks through Bloom+Table prefetch!
         let ncl_raw = cs.len();
         self.cl_off.clear();
         self.cl_off.resize(np + 1, 0);
         self.cl_pids.clear();
         self.cl_pids.reserve(ncl_raw);
+        self.miss_clicks.clear();
         let mut ncl_kept = 0usize;
         if ncl_raw > 0 {
             let ht_ptr = self.ht.as_ptr();
@@ -1484,33 +1620,25 @@ impl SolveScratch {
                     }
                     let c = unsafe { seg.get_unchecked(ri) };
                     if let Some(pid) = self.lookup(c.person, c.phash) {
-                        let cp = unsafe { *self.canon.get_unchecked(pid as usize) };
-                        if cp.is_empty() {
+                        let ci = unsafe { *self.canon.get_unchecked(pid as usize) };
+                        if ci.key.is_empty() {
                             self.cl_pids.push(pid);
                             unsafe { *self.cl_off.get_unchecked_mut(pid as usize) += 1 };
                             ncl_kept += 1;
                         } else {
                             self.cl_pids.push(u32::MAX);
-                            let ch = cp.hash(SEED_A);
                             lcl_w.push(
-                                (ch >> l_shift) as usize,
-                                Click { person: cp, cid: c.cid, phash: ch, ts: c.ts, camp: c.camp },
+                                (ci.hash >> l_shift) as usize,
+                                Click { person: ci.key, cid: c.cid, phash: ci.hash, ts: c.ts, camp: c.camp },
                             );
                         }
                     } else {
                         self.cl_pids.push(u32::MAX);
-                        if links.maybe(c.phash) {
-                            if let Some(cp) = links.lookup(c.phash, c.person) {
-                                let ch = cp.hash(SEED_A);
-                                lcl_w.push(
-                                    (ch >> l_shift) as usize,
-                                    Click { person: cp, cid: c.cid, phash: ch, ts: c.ts, camp: c.camp },
-                                );
-                            }
-                        }
+                        self.miss_clicks.push(*c);
                     }
                 }
             }
+            self.flush_miss_clicks(links, lcl_w, l_shift);
         }
 
         self.cls.clear();
@@ -1848,7 +1976,8 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32>(
             let last = std::mem::replace(&mut w.cols, new_user_cols(0));
             w.done_cols.push(last);
         }
-        (std::mem::take(&mut w.done_cols), std::mem::take(&mut w.acc))
+        let done_cols = std::mem::take(&mut w.done_cols);
+        (done_cols, w.into_acc())
     });
     ev_set.free_all();
     click_set.free_all();

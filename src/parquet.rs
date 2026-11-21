@@ -27,10 +27,20 @@ impl Column {
             Kind::Date => 4,
             Kind::I64 => 8,
         };
+        let values = Vec::with_capacity(cap_rows * per);
+        #[cfg(all(target_os = "linux", not(test)))]
+        if values.capacity() >= (1 << 20) {
+            let ptr = values.as_ptr() as usize;
+            let a = (ptr + 4095) & !4095;
+            let e = (ptr + values.capacity()) & !4095;
+            if e > a {
+                unsafe { libc::madvise(a as *mut libc::c_void, e - a, libc::MADV_HUGEPAGE) };
+            }
+        }
         Column {
             name,
             kind,
-            values: Vec::with_capacity(cap_rows * per),
+            values,
             defs: if kind == Kind::OptStr { Vec::with_capacity(cap_rows / 8 + 1) } else { Vec::new() },
             n: 0,
         }
@@ -226,17 +236,18 @@ pub fn write_file(path: &Path, cols: &[Column]) -> std::io::Result<()> {
             if c.kind == Kind::OptStr {
                 // RLE/bit-packed hybrid, bit width 1, one bit-packed run.
                 let groups = c.n.div_ceil(8);
-                let mut lv = Vec::with_capacity(groups + 10);
+                page.reserve(groups + 14);
+                page.extend_from_slice(&[0u8; 4]);
                 let mut h = ((groups as u64) << 1) | 1;
                 while h >= 0x80 {
-                    lv.push((h as u8) | 0x80);
+                    page.push((h as u8) | 0x80);
                     h >>= 7;
                 }
-                lv.push(h as u8);
-                lv.extend_from_slice(&c.defs);
-                lv.resize(lv.len() + groups - c.defs.len(), 0);
-                page.extend_from_slice(&(lv.len() as u32).to_le_bytes());
-                page.extend_from_slice(&lv);
+                page.push(h as u8);
+                page.extend_from_slice(&c.defs);
+                page.resize(page.len() + groups - c.defs.len(), 0);
+                let lv_len = (page.len() - 4) as u32;
+                page[0..4].copy_from_slice(&lv_len.to_le_bytes());
                 page_len = page.len() + c.values.len();
             } else {
                 page_len = c.values.len();
