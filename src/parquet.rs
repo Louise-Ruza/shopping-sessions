@@ -12,6 +12,7 @@ pub enum Kind {
     I64,
 }
 
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct Column {
     name: &'static str,
     kind: Kind,

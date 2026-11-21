@@ -13,6 +13,7 @@
 
 mod arena;
 
+
 mod csv;
 
 mod fixed;
@@ -23,6 +24,8 @@ mod links;
 mod parquet;
 
 mod ts;
+
+mod bin_sessions;
 
 mod small_sort;
 
@@ -745,6 +748,11 @@ impl<'a> Worker<'a> {
         }
         self.flush_row(person, cur_day, ns, ne, rev);
 
+        self.attribute(clicks, ctmp, evs.len());
+    }
+
+    #[inline]
+    fn attribute(&mut self, clicks: &mut [Cl24], ctmp: &mut Vec<Cl24>, _event_count: usize) {
 
         sort_person_clicks(clicks, ctmp);
         self.attribute_sorted(clicks);
@@ -958,6 +966,8 @@ struct SolveScratch {
     cls: Vec<Cl24>,
     ctmp: Vec<Cl24>,
 
+
+    bin_sessions: bin_sessions::Scratch,
 }
 
 impl SolveScratch {
@@ -977,6 +987,8 @@ impl SolveScratch {
             cls: Vec::new(),
             ctmp: Vec::new(),
 
+
+            bin_sessions: bin_sessions::Scratch::default(),
         }
     }
 
@@ -1162,12 +1174,6 @@ impl SolveScratch {
             let es1 = unsafe { *self.ev_off.get_unchecked(pid + 1) } as usize;
 
             let source = unsafe { self.evs.get_unchecked_mut(es0..es1) };
-
-
-            let events = {
-                sort_person_events(source, &mut self.etmp);
-                &*source
-            };
             let cls_slice: &mut [Cl24] = if ncl_kept > 0 {
                 let cs0 = unsafe { *self.cl_off.get_unchecked(pid) } as usize;
                 let cs1 = unsafe { *self.cl_off.get_unchecked(pid + 1) } as usize;
@@ -1175,7 +1181,17 @@ impl SolveScratch {
             } else {
                 &mut []
             };
-            w.person(unsafe { *self.pkeys.get_unchecked(pid) }, events, cls_slice, &mut self.ctmp);
+            let person = self.pkeys[pid];
+
+            if self.bin_sessions.try_person(w, person, source, cls_slice, &mut self.ctmp) { continue; }
+
+
+            let events = {
+                sort_person_events(source, &mut self.etmp);
+                &*source
+            };
+
+            w.person(person, events, cls_slice, &mut self.ctmp);
         }
     }
 }
@@ -1299,12 +1315,24 @@ fn main() {
 
     let (links, ev_set, wide_store) = {
     let chunks = make_chunks(&event_files, chunk_target(&event_files, threads));
+
+
+
+
+
+
+
     let id_set: ShardSet<RawEv> = ShardSet::new(ID_SHARDS);
     let oob_ingest: Mutex<Vec<i64>> = Mutex::new(Vec::new());
     let wide_store: Mutex<Vec<(u32, u16)>> = Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
-    par(threads, |_| {
+    let _event_counts = par(threads, |_| {
         let mut w = Scatter::new(&id_set);
+
+
+
+         // direct valid, direct invalid, ordinary dedup
+
 
         let mut tok = fixed::Tok::default();
         let oob_ref = &oob_ingest;
@@ -1315,6 +1343,7 @@ fn main() {
                 break;
             }
             let d = chunks[i].data;
+
             populate(d);
 
 
@@ -1327,11 +1356,14 @@ fn main() {
 
                 let (event_ts, ingest) = ctx.dates.parse_event_ingest(f[2], f[3]);
 
-                let ek = Key8::event_id(eid);
-                let eh = ek.hash(SEED_ID);
 
 
-                let ing_u32 = enc_ingest_fast(ingest, ctx.base, oob_ref);
+                let singleton = false;
+                let ek = if singleton { Key8::EMPTY } else { Key8::event_id(eid) };
+                let eh = if singleton { 0 } else { ek.hash(SEED_ID) };
+
+
+                let ing_u32 = if singleton { 0 } else { enc_ingest_fast(ingest, ctx.base, oob_ref) };
                 let mut r = RawEv {
                     eid: ek,
                     uid: UserKey::EMPTY,
@@ -1385,12 +1417,15 @@ fn main() {
                     r.ts = (ts - ctx.base) as u32;
                     r.price = price_enc;
                 }
+
                 w.push((eh >> (64 - ID_BITS)) as usize, r);
             });
             release_chunk(d);
         }
         w.finish();
+
     });
+
     let oob_ingest = oob_ingest.into_inner().unwrap();
     let wide_store = wide_store.into_inner().unwrap();
     mark("events", &mut marks);
@@ -1400,6 +1435,7 @@ fn main() {
     mark("links_wait", &mut marks);
 
     // ---- dedup (exact event_id) fused with person resolution and person scatter
+
     let ev_set: ShardSet<PEv> = ShardSet::new_shared(P_SHARDS);
     let next = AtomicUsize::new(0);
     let oob_slice = &oob_ingest[..];
@@ -1618,3 +1654,7 @@ fn main() {
 
     std::process::exit(0);
 }
+
+
+
+

@@ -9,7 +9,7 @@ RUN cargo test --locked && cargo build --release --locked \
 
 FROM gcr.io/distroless/cc-debian12
 COPY --from=build /shopping-sessions /shopping-sessions
-COPY LICENSE /licenses/LICENSE
+COPY ["LICENSE", "/licenses/LICENSE"]
 COPY third_party /licenses/third_party
 ENV DATA_DIR=/data OUTPUT_DIR=/output
 USER 1000:1000
