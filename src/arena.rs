@@ -325,21 +325,21 @@ pub struct Scatter<'a, T: Copy, const STAGE: usize = 64> {
 
 impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
     const SZ: usize = std::mem::size_of::<T>();
-    const LINES: usize = STAGE / 64;
     const PER: u32 = (STAGE / std::mem::size_of::<T>()) as u32;
 
     pub fn new(set: &'a ShardSet<T>) -> Scatter<'a, T, STAGE> {
         const {
-            assert!(STAGE >= 64 && STAGE % 64 == 0 && STAGE % std::mem::size_of::<T>() == 0);
+            assert!(STAGE >= 32 && STAGE % std::mem::size_of::<T>() == 0);
             assert!(SEG % STAGE == 0);
         }
         let n = set.len();
         let ng = set.groups.len();
+        let nlines = (n * STAGE).div_ceil(64);
         Scatter {
             set,
-            stage: vec![Line([0; 64]); n * Self::LINES],
+            stage: vec![Line([0; 64]); nlines],
             cur: vec![Cur { dst: 0, rem: 0, fill: 0 }; n],
-            nt: nt_enabled(),
+            nt: nt_enabled() && (STAGE % 64 == 0),
             gcur: (0..ng).map(|_| GroupCur { block: 0, next_seg: SEGS_PER_BLOCK, blocks: Vec::new() }).collect(),
         }
     }
@@ -372,7 +372,7 @@ impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
     pub fn push(&mut self, s: usize, x: T) {
         unsafe {
             let c = self.cur.get_unchecked_mut(s);
-            let st = (self.stage.as_mut_ptr().add(s * Self::LINES)) as *mut T;
+            let st = (self.stage.as_mut_ptr() as *mut u8).add(s * STAGE) as *mut T;
             st.add(c.fill as usize).write(x);
             c.fill += 1;
             if c.fill == Self::PER {
@@ -390,8 +390,8 @@ impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
         }
         unsafe {
             let mut c = *self.cur.get_unchecked(s);
-            let st = (self.stage.as_mut_ptr().add(s * Self::LINES)) as *mut T;
-            let src = st as *const u8;
+            let src = (self.stage.as_mut_ptr() as *mut u8).add(s * STAGE);
+            let st = src as *mut T;
             let nt = self.nt;
             for &item in items {
                 st.add(c.fill as usize).write(map(item));
@@ -403,7 +403,7 @@ impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
                         dst = self.swap_seg(s, dst);
                         rem = SEG as u32;
                     }
-                    copy_stage(nt, dst as *mut u8, src, STAGE);
+                    copy_stage::<STAGE>(nt, dst as *mut u8, src);
                     c = Cur { dst: dst + STAGE, rem: rem - STAGE as u32, fill: 0 };
                 }
             }
@@ -411,7 +411,7 @@ impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
         }
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn flush(&mut self, s: usize) {
         let c = unsafe { *self.cur.get_unchecked(s) };
         let mut dst = c.dst;
@@ -420,8 +420,8 @@ impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
             dst = self.swap_seg(s, dst);
             rem = SEG as u32;
         }
-        let src = unsafe { self.stage.as_ptr().add(s * Self::LINES) } as *const u8;
-        unsafe { copy_stage(self.nt, dst as *mut u8, src, STAGE) };
+        let src = unsafe { (self.stage.as_ptr() as *const u8).add(s * STAGE) };
+        unsafe { copy_stage::<STAGE>(self.nt, dst as *mut u8, src) };
         unsafe {
             *self.cur.get_unchecked_mut(s) = Cur { dst: dst + STAGE, rem: rem - STAGE as u32, fill: 0 };
         }
@@ -439,7 +439,7 @@ impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
                 }
                 let bytes = c.fill as usize * Self::SZ;
                 unsafe {
-                    let src = self.stage.as_ptr().add(s * Self::LINES) as *const u8;
+                    let src = (self.stage.as_ptr() as *const u8).add(s * STAGE);
                     std::ptr::copy_nonoverlapping(src, dst as *mut u8, bytes);
                 }
                 dst += bytes;
@@ -478,22 +478,23 @@ fn sfence() {
     }
 }
 
-/// Copies `bytes` (a multiple of 64) from 64-byte-aligned `src` to 64-byte-aligned `dst`.
+/// Copies `BYTES` from `src` to `dst` (using AVX2 NT stores when `BYTES % 64 == 0` and `nt`).
 #[inline(always)]
-unsafe fn copy_stage(nt: bool, dst: *mut u8, src: *const u8, bytes: usize) {
+unsafe fn copy_stage<const BYTES: usize>(nt: bool, dst: *mut u8, src: *const u8) {
     #[cfg(target_arch = "x86_64")]
     {
-        if nt {
-            stream_avx2(dst, src, bytes);
+        if BYTES % 64 == 0 && nt {
+            stream_avx2(dst, src, BYTES);
             return;
         }
     }
     let _ = nt;
-    std::ptr::copy_nonoverlapping(src, dst, bytes);
+    std::ptr::copy_nonoverlapping(src, dst, BYTES);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2")]
+#[inline]
 unsafe fn stream_avx2(dst: *mut u8, src: *const u8, bytes: usize) {
     use core::arch::x86_64::*;
     if bytes == 64 {

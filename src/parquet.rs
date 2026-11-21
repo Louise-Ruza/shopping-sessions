@@ -24,11 +24,12 @@ pub struct Column {
 impl Column {
     pub fn new(name: &'static str, kind: Kind, cap_rows: usize) -> Column {
         let per = match kind {
-            Kind::Str | Kind::OptStr => 16,
+            Kind::Str => 14,
+            Kind::OptStr => 2,
             Kind::Date | Kind::I32 => 4,
             Kind::I64 => 8,
         };
-        let values = Vec::with_capacity(cap_rows * per);
+        let values = Vec::with_capacity(cap_rows * per + 16);
         #[cfg(all(target_os = "linux", not(test)))]
         if values.capacity() >= (1 << 20) {
             let ptr = values.as_ptr() as usize;
@@ -42,7 +43,7 @@ impl Column {
             name,
             kind,
             values,
-            defs: if kind == Kind::OptStr { Vec::with_capacity(cap_rows / 8 + 1) } else { Vec::new() },
+            defs: if kind == Kind::OptStr { Vec::with_capacity(cap_rows / 8 + 16) } else { Vec::new() },
             n: 0,
         }
     }
@@ -72,21 +73,39 @@ impl Column {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn grow_val(&mut self, extra: usize) {
+        self.values.reserve(extra.max(4096));
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_def(&mut self) {
+        self.defs.reserve(4096);
+    }
+
     #[inline(always)]
     fn push_def(&mut self, present: bool) {
+        let byte_idx = self.n >> 3;
         let bit = self.n & 7;
         if bit == 0 {
-            self.defs.push(present as u8);
+            if byte_idx == self.defs.capacity() {
+                self.grow_def();
+            }
+            unsafe {
+                *self.defs.as_mut_ptr().add(byte_idx) = present as u8;
+                self.defs.set_len(byte_idx + 1);
+            }
         } else if present {
-            let last = self.defs.len() - 1;
-            unsafe { *self.defs.get_unchecked_mut(last) |= 1 << bit };
+            unsafe { *self.defs.get_unchecked_mut(byte_idx) |= 1 << bit };
         }
     }
 
     #[inline(always)]
     fn ensure_val(&mut self, extra: usize) {
         if self.values.capacity() - self.values.len() < extra {
-            self.values.reserve(extra.max(4096));
+            self.grow_val(extra);
         }
     }
 

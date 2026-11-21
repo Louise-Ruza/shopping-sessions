@@ -6,7 +6,7 @@
 //! and every cross-bin gap `> GAP_MS`; interior order cannot create or merge a
 //! session and does not affect count, revenue, or category sums.
 
-use crate::{sort_person_events, Ev8, GAP_MS};
+use crate::{Ev8, GAP_MS};
 
 const WIDTH: u32 = GAP_MS as u32;
 const BINS: usize = (u32::MAX / WIDTH) as usize + 1;
@@ -25,7 +25,7 @@ impl Scratch {
     pub fn order<'a>(&mut self, rows: &'a mut [Ev8], tmp: &'a mut Vec<Ev8>) -> &'a [Ev8] {
         let n = rows.len();
         if n < MIN_EVENTS {
-            sort_person_events(rows, tmp);
+            rows.sort_unstable();
             return rows;
         }
         let cptr = self.cursors.as_mut_ptr();
