@@ -217,6 +217,9 @@ fn parse_row_hi<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     if c_lo.count_ones() + c_hi.count_ones() != 6 {
         return None;
     }
+    let q_hi = qt2 & below_hi;
+    let p_lo = parity64(q_lo);
+    let p_hi_raw = parity64(q_hi as u64) as u32;
     let c0 = c_lo.trailing_zeros() as usize;
     let low1 = c_lo & c_lo.wrapping_sub(1);
     let c1 = low1.trailing_zeros() as usize;
@@ -228,13 +231,11 @@ fn parse_row_hi<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     if c2 >= 63 {
         return None;
     }
-    let q_hi = qt2 & below_hi;
     let seps_lo = c_lo;
     let seps_hi = c_hi | end_bit_hi;
     let edges_lo = (seps_lo << 1) | 1 | (seps_lo >> 1) | ((seps_hi as u64) << 63);
     let edges_hi = (seps_hi << 1) | ((seps_lo >> 63) as u32) | (seps_hi >> 1);
-    let p_lo = parity64(q_lo);
-    let p_hi = (parity64(q_hi as u64) as u32) ^ 0u32.wrapping_sub((p_lo >> 63) as u32);
+    let p_hi = p_hi_raw ^ 0u32.wrapping_sub((p_lo >> 63) as u32);
     if ((q_lo & !edges_lo) | (p_lo & seps_lo)) != 0 || ((q_hi & !edges_hi) | (p_hi & seps_hi)) != 0 {
         return None;
     }
@@ -347,13 +348,19 @@ pub fn scan<'a, S: EventSink<'a>>(data: &'a [u8], dates: &DateCache, f: S) {
 unsafe fn handle_row_lo_avx2<'a, S: EventSink<'a>>(
     data: &'a [u8],
     bytes: &'a [u8; 96],
-    end: usize,
     c_lo: u64,
     q_lo: u64,
     dates: &DateCache,
     f: &mut S,
-) {
+) -> usize {
     use core::arch::x86_64::*;
+    let p = bytes.as_ptr();
+    let v_nl = _mm256_set1_epi8(b'\n' as i8);
+    let b0 = _mm256_loadu_si256(p.cast());
+    let b1 = _mm256_loadu_si256(p.add(32).cast());
+    let l_lo = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b0, v_nl)) as u32 as u64)
+        | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b1, v_nl)) as u32 as u64) << 32);
+    let end = l_lo.trailing_zeros() as usize;
     let v_ones = _mm_set1_epi64x(-1);
     let parity64 = |q: u64| -> u64 {
         _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(q as i64), v_ones)) as u64
@@ -363,6 +370,7 @@ unsafe fn handle_row_lo_avx2<'a, S: EventSink<'a>>(
     } else {
         fallback(data.get_unchecked(..end + 1), dates, f);
     }
+    end + 1
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -387,13 +395,15 @@ unsafe fn scan_avx2<'a, S: EventSink<'a>>(mut data: &'a [u8], dates: &DateCache,
         let c_lo = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b0, v_cm)) as u32 as u64)
             | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b1, v_cm)) as u32 as u64) << 32);
         let cm2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b2, v_cm)) as u32;
-        let l_lo = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b0, v_nl)) as u32 as u64)
-            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b1, v_nl)) as u32 as u64) << 32);
+        let l_lo_any = _mm256_movemask_epi8(_mm256_or_si256(
+            _mm256_cmpeq_epi8(b0, v_nl),
+            _mm256_cmpeq_epi8(b1, v_nl),
+        ));
         let nl2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b2, v_nl)) as u32;
         let q_lo = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b0, v_qt)) as u32 as u64)
             | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b1, v_qt)) as u32 as u64) << 32);
         let qt2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b2, v_qt)) as u32;
-        if l_lo == 0 {
+        if l_lo_any == 0 {
             if nl2 != 0 {
                 let end_hi = nl2.trailing_zeros() as usize;
                 let end = 64 + end_hi;
@@ -412,9 +422,8 @@ unsafe fn scan_avx2<'a, S: EventSink<'a>>(mut data: &'a [u8], dates: &DateCache,
                 data = &data[end..];
             }
         } else {
-            let end = l_lo.trailing_zeros() as usize;
-            handle_row_lo_avx2(data, bytes, end, c_lo, q_lo, dates, &mut f);
-            data = data.get_unchecked(end + 1..);
+            let adv = handle_row_lo_avx2(data, bytes, c_lo, q_lo, dates, &mut f);
+            data = data.get_unchecked(adv..);
         }
     }
     if !data.is_empty() {

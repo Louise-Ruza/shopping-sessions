@@ -178,6 +178,7 @@ impl Key8 {
         self.0 == 0
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn is_inline(&self) -> bool {
         (self.0 >> 56) < 0xC0

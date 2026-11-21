@@ -306,6 +306,13 @@ impl DateCache {
         calendar(b)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn parse_event_ingest_bcd_slow(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64, u32) {
+        let (ing_day_ms, ing_bcd) = self.parse_f1_ingest_bcd(ingest);
+        (self.parse_ts(event), ing_day_ms, ing_bcd)
+    }
+
     #[inline(always)]
     pub fn parse_event_ingest_bcd(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64, u32) {
         if event.len() == 20 && ingest.len() == 20 {
@@ -314,13 +321,12 @@ impl DateCache {
             unsafe {
                 let ep_pref = (ep as *const u64).read_unaligned();
                 let ep_dd = (ep.add(8) as *const u16).read_unaligned();
-                if *ep.add(19) == b'Z'
-                    && *ip.add(19) == b'Z'
+                if ((*ep.add(19) ^ b'Z') | (*ip.add(19) ^ b'Z')) == 0
                     && ep_pref == (ip as *const u64).read_unaligned()
                     && ep_dd == (ip.add(8) as *const u16).read_unaligned()
                 {
                     let slot = *self.slots.get_unchecked(dd_slot(ep_dd));
-                    if ep_pref == slot.prefix && ep_dd == slot.dd {
+                    if ((ep_pref ^ slot.prefix) | ((ep_dd ^ slot.dd) as u64)) == 0 {
                         let ev_ms = if *ep.add(10) == b'T' {
                             Self::clock_strict(ep.add(11)).map(|ms| slot.day_ms + ms)
                         } else {
@@ -332,8 +338,14 @@ impl DateCache {
                 }
             }
         }
+        self.parse_event_ingest_bcd_slow(event, ingest)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn parse_f2_ingest_bcd_slow(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64, u32) {
         let (ing_day_ms, ing_bcd) = self.parse_f1_ingest_bcd(ingest);
-        (self.parse_ts(event), ing_day_ms, ing_bcd)
+        (self.parse_ts_25(event), ing_day_ms, ing_bcd)
     }
 
     #[inline(always)]
@@ -350,7 +362,7 @@ impl DateCache {
                         && ep_dd == (ip.add(8) as *const u16).read_unaligned()
                     {
                         let slot = *self.slots.get_unchecked(dd_slot(ep_dd));
-                        if ep_pref == slot.prefix && ep_dd == slot.dd {
+                        if ((ep_pref ^ slot.prefix) | ((ep_dd ^ slot.dd) as u64)) == 0 {
                             let ing_bcd = slot.day_tag | bcd_hms(ip.add(11));
                             let ev_ms = if *ep.add(10) == b'T' {
                                 Self::clock_strict(ep.add(11)).and_then(|ms| {
@@ -385,8 +397,7 @@ impl DateCache {
                 }
             }
         }
-        let (ing_day_ms, ing_bcd) = self.parse_f1_ingest_bcd(ingest);
-        (self.parse_ts_25(event), ing_day_ms, ing_bcd)
+        self.parse_f2_ingest_bcd_slow(event, ingest)
     }
 
     #[inline(always)]
@@ -466,7 +477,7 @@ impl DateCache {
 }
 
 #[inline(always)]
-fn swar_dec8(x: u64) -> u64 {
+pub(crate) fn swar_dec8(x: u64) -> u64 {
     let a = (x & 0x00FF_00FF_00FF_00FF) * 10 + ((x >> 8) & 0x00FF_00FF_00FF_00FF);
     let b = (a & 0x0000_FFFF_0000_FFFF) * 100 + ((a >> 16) & 0x0000_FFFF_0000_FFFF);
     (b & 0xFFFF_FFFF) * 10_000 + (b >> 32)

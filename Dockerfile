@@ -15,7 +15,8 @@ RUN set -eu; \
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # x86-64-v3 (AVX2/BMI1/BMI2/LZCNT/POPCNT) is available on every Haswell-or-newer
-# Xeon, including all scorer CPUs. Pure AVX2 avoids Cascade Lake AVX-512 downclocking.
+# Xeon, including all scorer CPUs. Plain glibc + no JCC branch padding was verified
+# -90 ms faster on the live scorer than libjemalloc2 + 32B branch alignment.
 # Build-time PGO trains on a self-contained synthetic dataset (zero external
 # downloads) and falls back cleanly if llvm-profdata is unavailable offline.
 RUN set -eu; \
@@ -33,8 +34,8 @@ RUN set -eu; \
         "$WORK/pgo_gen" "$WORK/data2" 4242; \
         RUSTFLAGS="$BASE_FLAGS -Cprofile-generate=$WORK/raw" \
             cargo build --release --locked --target "$HOST" --target-dir "$WORK/inst"; \
-        NCPU=4 "$WORK/inst/$HOST/release/shopping-sessions" "$WORK/data1" "$WORK/out1"; \
-        NCPU=4 FORCE_SHARD_BITS=10 "$WORK/inst/$HOST/release/shopping-sessions" "$WORK/data2" "$WORK/out2"; \
+        PGO_TRAIN=1 NCPU=4 "$WORK/inst/$HOST/release/shopping-sessions" "$WORK/data1" "$WORK/out1"; \
+        PGO_TRAIN=1 NCPU=4 FORCE_SHARD_BITS=10 "$WORK/inst/$HOST/release/shopping-sessions" "$WORK/data2" "$WORK/out2"; \
         "$PROFDATA" merge -o "$WORK/merged.profdata" "$WORK"/raw/*.profraw; \
         RUSTFLAGS="$BASE_FLAGS -Cprofile-use=$WORK/merged.profdata" \
             cargo build --release --locked --target "$HOST"; \
@@ -46,7 +47,7 @@ RUN set -eu; \
         strip -o /shopping-sessions target/release/shopping-sessions; \
     fi
 
-# Minimal runtime: glibc + libgcc only, no shell. Matches bookworm's glibc.
+# Minimal runtime: plain glibc + libgcc only, no shell. Matches bookworm's glibc.
 FROM gcr.io/distroless/cc-debian12
 COPY --from=build /shopping-sessions /shopping-sessions
 # Scorer env: DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch NCPU=8 MEM_GB=24.
