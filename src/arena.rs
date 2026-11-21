@@ -21,15 +21,35 @@ pub const SEG: usize = 84 * 192; // 16128 = 63 * 256 = 126 * 128 = 252 * 64
 pub const SEGS_PER_BLOCK: usize = BLOCK / SEG; // 130
 const SLAB_BLOCKS: usize = 16;
 
+pub const MAX_BLOCKS: usize = 32_766;
+#[cfg(test)]
+pub const LOC_EMPTY: u32 = u32::MAX - 1;
+pub const LOC_INVALID: u32 = u32::MAX;
+
+static BLOCK_ADDRS: [AtomicUsize; MAX_BLOCKS] = [const { AtomicUsize::new(0) }; MAX_BLOCKS];
+
+/// Resolves a `loc` returned by `Scatter::push_with_loc` into a raw pointer to the 16-byte record.
+#[inline(always)]
+pub unsafe fn loc_ptr<T>(loc: u32) -> *mut T {
+    const {
+        assert!(std::mem::size_of::<T>() == 16);
+    }
+    let bid = (loc >> 17) as usize;
+    let off = (loc & 0x1_FFFF) as usize;
+    let base = BLOCK_ADDRS.get_unchecked(bid).load(Ordering::Relaxed);
+    (base as *mut T).add(off)
+}
+
 // ---------------------------------------------------------------------------
 // block pool
 
 struct PoolInner {
-    free: Vec<usize>,
+    free: Vec<(usize, u32)>,
     slabs: Vec<(usize, usize)>,
+    next_id: u32,
 }
 
-static POOL: Mutex<PoolInner> = Mutex::new(PoolInner { free: Vec::new(), slabs: Vec::new() });
+static POOL: Mutex<PoolInner> = Mutex::new(PoolInner { free: Vec::new(), slabs: Vec::new(), next_id: 0 });
 
 fn map_slab(inner: &mut PoolInner) {
     let want = SLAB_BLOCKS * BLOCK;
@@ -60,19 +80,24 @@ fn map_slab(inner: &mut PoolInner) {
     }
     inner.slabs.push((aligned, want));
     for i in (0..SLAB_BLOCKS).rev() {
-        inner.free.push(aligned + i * BLOCK);
+        let addr = aligned + i * BLOCK;
+        let id = inner.next_id;
+        assert!((id as usize) < MAX_BLOCKS, "arena block id overflow");
+        inner.next_id += 1;
+        BLOCK_ADDRS[id as usize].store(addr, Ordering::Relaxed);
+        inner.free.push((addr, id));
     }
 }
 
-pub fn get_block() -> *mut u8 {
+pub fn get_block() -> (usize, u32) {
     let mut g = POOL.lock().unwrap();
     if g.free.is_empty() {
         map_slab(&mut g);
     }
-    g.free.pop().unwrap() as *mut u8
+    g.free.pop().unwrap()
 }
 
-pub fn put_blocks(blocks: &[usize]) {
+pub fn put_blocks(blocks: &[(usize, u32)]) {
     if blocks.is_empty() {
         return;
     }
@@ -130,14 +155,15 @@ pub struct Seg {
 }
 
 struct ShardState {
-    blocks: Vec<usize>,
+    blocks: Vec<(usize, u32)>,
     next_seg: usize, // segments used in the last block
     segs: Vec<Seg>,
 }
 
 struct GroupPool {
+    #[allow(dead_code)]
     remaining: AtomicUsize,
-    blocks: Mutex<Vec<usize>>,
+    blocks: Mutex<Vec<(usize, u32)>>,
 }
 
 pub struct ShardSet<T> {
@@ -153,7 +179,7 @@ unsafe impl<T> Send for ShardSet<T> {}
 /// One shard's records, as returned by `ShardSet::take`.
 pub struct Segs<T> {
     pub segs: Vec<Seg>,
-    blocks: Vec<usize>,
+    blocks: Vec<(usize, u32)>,
     _t: PhantomData<T>,
 }
 
@@ -167,11 +193,6 @@ impl<T: Copy> Segs<T> {
     pub fn seg(&self, i: usize) -> &[T] {
         let s = self.segs[i];
         unsafe { std::slice::from_raw_parts(s.ptr as *const T, s.n as usize) }
-    }
-    #[inline(always)]
-    pub fn seg_ptr_mut(&mut self, i: usize) -> (*mut T, usize) {
-        let s = unsafe { *self.segs.get_unchecked(i) };
-        (s.ptr as *mut T, s.n as usize)
     }
     pub fn iter(&self) -> impl Iterator<Item = &[T]> + '_ {
         (0..self.segs.len()).map(move |i| self.seg(i))
@@ -239,7 +260,7 @@ impl<T: Copy> ShardSet<T> {
         }
     }
 
-    fn register_group_blocks(&self, g: usize, blocks: &[usize]) {
+    fn register_group_blocks(&self, g: usize, blocks: &[(usize, u32)]) {
         if !blocks.is_empty() {
             self.groups[g].blocks.lock().unwrap().extend_from_slice(blocks);
         }
@@ -247,6 +268,7 @@ impl<T: Copy> ShardSet<T> {
 
     /// Marks shard `s` completely consumed (after `Segs::free()`). Once every shard in
     /// its group finishes, that group's 2 MB blocks return to `POOL` immediately.
+    #[cfg(test)]
     pub fn mark_shard_done(&self, s: usize) {
         if self.groups.len() <= 1 {
             return;
@@ -303,60 +325,88 @@ impl<T: Copy> ShardSet<T> {
 struct Line([u8; 64]);
 
 #[derive(Clone, Copy)]
-struct Cur {
+struct Dest {
     dst: usize, // next write address in current segment (0 = none)
     rem: u32,   // bytes remaining in current segment (0 = full/unallocated)
-    fill: u32,  // records in staging
 }
 
 struct GroupCur {
     block: usize,
+    block_id: u32,
     next_seg: usize,
-    blocks: Vec<usize>,
+    blocks: Vec<(usize, u32)>,
 }
 
 pub struct Scatter<'a, T: Copy, const STAGE: usize = 64> {
     set: &'a ShardSet<T>,
     stage: Vec<Line>,
-    cur: Vec<Cur>,
+    /// Hot compact fill count per shard (512 B at 512 shards / 1 KB at 1024 shards -> always L1D).
+    fill: Vec<u8>,
+    /// Cold segment cursor, touched only on full-stage flush (every 4..12 pushes).
+    dest: Vec<Dest>,
+    /// Eventual `loc` of the next 16B record per shard (allocated only by `new_located`).
+    loc_next: Vec<u32>,
     nt: bool,
     gcur: Vec<GroupCur>,
 }
 
 impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
     const SZ: usize = std::mem::size_of::<T>();
-    const LINES: usize = STAGE / 64;
-    const PER: u32 = (STAGE / std::mem::size_of::<T>()) as u32;
+    const PER: u8 = (STAGE / std::mem::size_of::<T>()) as u8;
 
     pub fn new(set: &'a ShardSet<T>) -> Scatter<'a, T, STAGE> {
         const {
-            assert!(STAGE >= 64 && STAGE % 64 == 0 && STAGE % std::mem::size_of::<T>() == 0);
+            assert!(STAGE >= 32 && STAGE % std::mem::size_of::<T>() == 0);
+            assert!(STAGE / std::mem::size_of::<T>() <= 255);
             assert!(SEG % STAGE == 0);
         }
         let n = set.len();
         let ng = set.groups.len();
+        let nlines = (n * STAGE).div_ceil(64);
         Scatter {
             set,
-            stage: vec![Line([0; 64]); n * Self::LINES],
-            cur: vec![Cur { dst: 0, rem: 0, fill: 0 }; n],
-            nt: nt_enabled(),
-            gcur: (0..ng).map(|_| GroupCur { block: 0, next_seg: SEGS_PER_BLOCK, blocks: Vec::new() }).collect(),
+            stage: vec![Line([0; 64]); nlines],
+            fill: vec![0u8; n],
+            dest: vec![Dest { dst: 0, rem: 0 }; n],
+            loc_next: Vec::new(),
+            nt: nt_enabled() && (STAGE % 64 == 0),
+            gcur: (0..ng)
+                .map(|_| GroupCur { block: 0, block_id: 0, next_seg: SEGS_PER_BLOCK, blocks: Vec::new() })
+                .collect(),
         }
     }
 
+    /// Creates a `Scatter` for 16-byte records supporting `push_with_loc`, which returns the
+    /// exact stable `loc` where each staged record will land after flushing (NT or tail).
+    /// `Self::PER` must be a power of 2 so `loc & (PER - 1)` gives the exact staging slot
+    /// without touching `fill`.
+    pub fn new_located(set: &'a ShardSet<T>) -> Scatter<'a, T, STAGE> {
+        const {
+            assert!(std::mem::size_of::<T>() == 16);
+            assert!((STAGE / 16).is_power_of_two());
+            assert!((SEG / 16) % (STAGE / 16) == 0);
+        }
+        let mut sc = Self::new(set);
+        sc.loc_next = vec![LOC_INVALID; set.len()];
+        sc
+    }
+
     #[inline(always)]
-    fn alloc_local_seg(&mut self, s: usize) -> usize {
+    fn alloc_local_seg(&mut self, s: usize) -> (usize, u32) {
         let g = self.set.group_of(s);
         let gc = unsafe { self.gcur.get_unchecked_mut(g) };
         if gc.next_seg == SEGS_PER_BLOCK {
-            let b = get_block() as usize;
-            gc.blocks.push(b);
+            let (b, bid) = get_block();
+            gc.blocks.push((b, bid));
             gc.block = b;
+            gc.block_id = bid;
             gc.next_seg = 0;
         }
-        let p = gc.block + gc.next_seg * SEG;
+        let off = gc.next_seg * SEG;
+        let p = gc.block + off;
+        let loc = (gc.block_id << 17) | ((off >> 4) as u32);
         gc.next_seg += 1;
-        p
+        (p, loc)
     }
 
     #[cold]
@@ -365,19 +415,85 @@ impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
         if prev_end != 0 {
             self.set.push_seg(s, Seg { ptr: prev_end - SEG, n: (SEG / Self::SZ) as u32 });
         }
-        self.alloc_local_seg(s)
+        self.alloc_local_seg(s).0
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn ensure_seg_loc(&mut self, s: usize) -> u32 {
+        let (p, loc) = self.alloc_local_seg(s);
+        unsafe {
+            *self.dest.get_unchecked_mut(s) = Dest { dst: p, rem: SEG as u32 };
+        }
+        loc
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn finish_full_seg_loc(&mut self, s: usize, seg_end: usize) {
+        self.set.push_seg(s, Seg { ptr: seg_end - SEG, n: (SEG / Self::SZ) as u32 });
+        unsafe {
+            *self.dest.get_unchecked_mut(s) = Dest { dst: 0, rem: 0 };
+            *self.loc_next.get_unchecked_mut(s) = LOC_INVALID;
+        }
+    }
+
+    #[inline(always)]
+    pub fn prefetch_shard(&self, s: usize) {
+        unsafe {
+            let st = (self.stage.as_ptr() as *const u8).add(s * STAGE);
+            crate::links::prefetch(st);
+        }
+    }
+
+    #[inline(always)]
+    pub fn prefetch_located_shard(&self, s: usize) {
+        unsafe {
+            let st = (self.stage.as_ptr() as *const u8).add(s * STAGE);
+            crate::links::prefetch(st);
+            crate::links::prefetch(self.loc_next.as_ptr().add(s) as *const u8);
+        }
     }
 
     #[inline(always)]
     pub fn push(&mut self, s: usize, x: T) {
         unsafe {
-            let c = self.cur.get_unchecked_mut(s);
-            let st = (self.stage.as_mut_ptr().add(s * Self::LINES)) as *mut T;
-            st.add(c.fill as usize).write(x);
-            c.fill += 1;
-            if c.fill == Self::PER {
+            let fp = self.fill.get_unchecked_mut(s);
+            let f = *fp;
+            let st = (self.stage.as_mut_ptr() as *mut u8).add(s * STAGE) as *mut T;
+            st.add(f as usize).write(x);
+            let nf = f + 1;
+            if nf == Self::PER {
+                *fp = 0;
                 self.flush(s);
+            } else {
+                *fp = nf;
             }
+        }
+    }
+
+    #[inline(always)]
+    pub fn push_with_loc(&mut self, s: usize, x: T) -> u32 {
+        const {
+            assert!(std::mem::size_of::<T>() == 16);
+            assert!((STAGE / 16).is_power_of_two());
+        }
+        let per_mask = (Self::PER as u32) - 1;
+        unsafe {
+            let lp = self.loc_next.get_unchecked_mut(s);
+            let mut loc = *lp;
+            if loc == LOC_INVALID {
+                loc = self.ensure_seg_loc(s);
+            }
+            let f = (loc & per_mask) as usize;
+            let st = (self.stage.as_mut_ptr() as *mut u8).add(s * STAGE) as *mut T;
+            st.add(f).write(x);
+            let nloc = loc + 1;
+            *self.loc_next.get_unchecked_mut(s) = nloc;
+            if (nloc & per_mask) == 0 {
+                self.flush_located(s);
+            }
+            loc
         }
     }
 
@@ -389,57 +505,84 @@ impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
             return;
         }
         unsafe {
-            let mut c = *self.cur.get_unchecked(s);
-            let st = (self.stage.as_mut_ptr().add(s * Self::LINES)) as *mut T;
-            let src = st as *const u8;
+            let mut f = *self.fill.get_unchecked(s);
+            let mut d = *self.dest.get_unchecked(s);
+            let src = (self.stage.as_mut_ptr() as *mut u8).add(s * STAGE);
+            let st = src as *mut T;
             let nt = self.nt;
             for &item in items {
-                st.add(c.fill as usize).write(map(item));
-                c.fill += 1;
-                if c.fill == Self::PER {
-                    let mut dst = c.dst;
-                    let mut rem = c.rem;
+                st.add(f as usize).write(map(item));
+                f += 1;
+                if f == Self::PER {
+                    let mut dst = d.dst;
+                    let mut rem = d.rem;
                     if rem == 0 {
                         dst = self.swap_seg(s, dst);
                         rem = SEG as u32;
                     }
-                    copy_stage(nt, dst as *mut u8, src, STAGE);
-                    c = Cur { dst: dst + STAGE, rem: rem - STAGE as u32, fill: 0 };
+                    copy_stage::<STAGE>(nt, dst as *mut u8, src);
+                    d = Dest { dst: dst + STAGE, rem: rem - STAGE as u32 };
+                    f = 0;
                 }
             }
-            *self.cur.get_unchecked_mut(s) = c;
+            *self.fill.get_unchecked_mut(s) = f;
+            *self.dest.get_unchecked_mut(s) = d;
         }
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn flush(&mut self, s: usize) {
-        let c = unsafe { *self.cur.get_unchecked(s) };
-        let mut dst = c.dst;
-        let mut rem = c.rem;
+        let d = unsafe { *self.dest.get_unchecked(s) };
+        let mut dst = d.dst;
+        let mut rem = d.rem;
         if rem == 0 {
             dst = self.swap_seg(s, dst);
             rem = SEG as u32;
         }
-        let src = unsafe { self.stage.as_ptr().add(s * Self::LINES) } as *const u8;
-        unsafe { copy_stage(self.nt, dst as *mut u8, src, STAGE) };
+        let src = unsafe { (self.stage.as_ptr() as *const u8).add(s * STAGE) };
+        unsafe { copy_stage::<STAGE>(self.nt, dst as *mut u8, src) };
         unsafe {
-            *self.cur.get_unchecked_mut(s) = Cur { dst: dst + STAGE, rem: rem - STAGE as u32, fill: 0 };
+            *self.dest.get_unchecked_mut(s) = Dest { dst: dst + STAGE, rem: rem - STAGE as u32 };
+        }
+    }
+
+    #[inline(always)]
+    fn flush_located(&mut self, s: usize) {
+        let d = unsafe { *self.dest.get_unchecked(s) };
+        let src = unsafe { (self.stage.as_ptr() as *const u8).add(s * STAGE) };
+        unsafe { copy_stage::<STAGE>(self.nt, d.dst as *mut u8, src) };
+        let next_dst = d.dst + STAGE;
+        let next_rem = d.rem - STAGE as u32;
+        if next_rem == 0 {
+            self.finish_full_seg_loc(s, next_dst);
+        } else {
+            unsafe {
+                *self.dest.get_unchecked_mut(s) = Dest { dst: next_dst, rem: next_rem };
+            }
         }
     }
 
     /// Writes out every partial staging area and publishes all segments.
     pub fn finish(mut self) {
-        for s in 0..self.cur.len() {
-            let c = self.cur[s];
-            let (mut dst, mut rem) = (c.dst, c.rem as usize);
-            if c.fill > 0 {
+        let located = !self.loc_next.is_empty();
+        let per_mask = (Self::PER as usize) - 1;
+        for s in 0..self.dest.len() {
+            let f = if located {
+                let loc = self.loc_next[s];
+                if loc == LOC_INVALID { 0 } else { (loc as usize) & per_mask }
+            } else {
+                self.fill[s] as usize
+            };
+            let d = self.dest[s];
+            let (mut dst, mut rem) = (d.dst, d.rem as usize);
+            if f > 0 {
                 if rem == 0 {
                     dst = self.swap_seg(s, dst);
                     rem = SEG;
                 }
-                let bytes = c.fill as usize * Self::SZ;
+                let bytes = f * Self::SZ;
                 unsafe {
-                    let src = self.stage.as_ptr().add(s * Self::LINES) as *const u8;
+                    let src = (self.stage.as_ptr() as *const u8).add(s * STAGE);
                     std::ptr::copy_nonoverlapping(src, dst as *mut u8, bytes);
                 }
                 dst += bytes;
@@ -449,7 +592,8 @@ impl<'a, T: Copy, const STAGE: usize> Scatter<'a, T, STAGE> {
                 let used = SEG - rem;
                 self.set.push_seg(s, Seg { ptr: dst - used, n: (used / Self::SZ) as u32 });
             }
-            self.cur[s] = Cur { dst: 0, rem: 0, fill: 0 };
+            self.fill[s] = 0;
+            self.dest[s] = Dest { dst: 0, rem: 0 };
         }
         sfence();
         for (g, gc) in self.gcur.iter().enumerate() {
@@ -478,22 +622,23 @@ fn sfence() {
     }
 }
 
-/// Copies `bytes` (a multiple of 64) from 64-byte-aligned `src` to 64-byte-aligned `dst`.
+/// Copies `BYTES` from `src` to `dst` (using AVX2 NT stores when `BYTES % 64 == 0` and `nt`).
 #[inline(always)]
-unsafe fn copy_stage(nt: bool, dst: *mut u8, src: *const u8, bytes: usize) {
+unsafe fn copy_stage<const BYTES: usize>(nt: bool, dst: *mut u8, src: *const u8) {
     #[cfg(target_arch = "x86_64")]
     {
-        if nt {
-            stream_avx2(dst, src, bytes);
+        if BYTES % 64 == 0 && nt {
+            stream_avx2(dst, src, BYTES);
             return;
         }
     }
     let _ = nt;
-    std::ptr::copy_nonoverlapping(src, dst, bytes);
+    std::ptr::copy_nonoverlapping(src, dst, BYTES);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2")]
+#[inline]
 unsafe fn stream_avx2(dst: *mut u8, src: *const u8, bytes: usize) {
     use core::arch::x86_64::*;
     if bytes == 64 {
@@ -652,5 +797,74 @@ mod tests {
         set3.free_all();
         assert_eq!(n3, 50_000);
         assert_eq!(mapped_bytes(), before);
+    }
+
+    #[test]
+    fn located_scatter_and_loc_ptr() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        #[repr(C)]
+        struct R16 {
+            id: u64,
+            ts: u32,
+            tag: u32,
+        }
+        let set: ShardSet<R16> = ShardSet::new_shared(64);
+        let locs: Vec<Vec<(u32, u64)>> = std::thread::scope(|s| {
+            (0..4u64)
+                .map(|t| {
+                    let set = &set;
+                    s.spawn(move || {
+                        let mut w = Scatter::<R16, 64>::new_located(set);
+                        let mut out = Vec::with_capacity(40_000);
+                        for i in 0..40_000u64 {
+                            let sh = if i % 5 == 0 { 3 } else { (i % 64) as usize };
+                            let id = t * 100_000 + i;
+                            let loc = w.push_with_loc(sh, R16 { id, ts: i as u32, tag: sh as u32 });
+                            assert_ne!(loc, LOC_INVALID);
+                            assert_ne!(loc, LOC_EMPTY);
+                            out.push((loc, id));
+                        }
+                        w.finish();
+                        out
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        // Verify every single returned loc points to the exact record and supports in-place mutation.
+        for batch in &locs {
+            for &(loc, id) in batch {
+                unsafe {
+                    let p = loc_ptr::<R16>(loc);
+                    assert_eq!((*p).id, id);
+                    if id % 7 == 0 {
+                        std::ptr::addr_of_mut!((*p).ts).write(u32::MAX);
+                    }
+                }
+            }
+        }
+        let mut total = 0usize;
+        let mut killed = 0usize;
+        for sh in 0..64 {
+            let segs = set.take(sh);
+            for seg in segs.iter() {
+                for r in seg {
+                    assert_eq!(r.tag, sh as u32);
+                    if r.id % 7 == 0 {
+                        assert_eq!(r.ts, u32::MAX);
+                        killed += 1;
+                    } else {
+                        assert_ne!(r.ts, u32::MAX);
+                    }
+                    total += 1;
+                }
+            }
+            segs.free();
+        }
+        set.free_all();
+        assert_eq!(total, 160_000);
+        assert!(killed > 22_000);
     }
 }

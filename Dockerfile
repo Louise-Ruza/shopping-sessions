@@ -12,15 +12,19 @@ RUN set -eu; \
     if [ "$ENABLE_PGO" = "1" ]; then \
         rustup component add llvm-tools-preview || rustup component add llvm-tools-preview || echo "WARN: llvm-tools-preview unavailable, will fall back to non-PGO"; \
     fi
+RUN set -eu; \
+    apt-get update && apt-get install -y --no-install-recommends libjemalloc2 && rm -rf /var/lib/apt/lists/*; \
+    cp "$(dpkg -L libjemalloc2 | grep '/libjemalloc\.so\.2$')" /libjemalloc.so.2
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-# target-cpu=native tunes codegen for the build host's CPU.
+# x86-64-v3 (AVX2/BMI1/BMI2/LZCNT/POPCNT) is available on every Haswell-or-newer
+# Xeon, including all scorer CPUs. Pure AVX2 avoids Cascade Lake AVX-512 downclocking.
 # Build-time PGO trains on a self-contained synthetic dataset (zero external
 # downloads) and falls back cleanly if llvm-profdata is unavailable offline.
 RUN set -eu; \
     BASE_FLAGS=""; \
     if [ "$TARGETARCH" = "amd64" ] || [ "$(uname -m)" = "x86_64" ]; then \
-        BASE_FLAGS="-C target-cpu=native"; \
+        BASE_FLAGS="-C target-cpu=x86-64-v3 -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-align-all-functions=5"; \
     fi; \
     HOST="$(rustc -vV | sed -n 's/^host: //p')"; \
     PROFDATA="$(rustc --print sysroot)/lib/rustlib/$HOST/bin/llvm-profdata"; \
@@ -48,8 +52,9 @@ RUN set -eu; \
 # Minimal runtime: glibc + libgcc only, no shell. Matches bookworm's glibc.
 FROM gcr.io/distroless/cc-debian12
 COPY --from=build /shopping-sessions /shopping-sessions
+COPY --from=build /libjemalloc.so.2 /lib/libjemalloc.so.2
 # Scorer env: DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch NCPU=8 MEM_GB=24.
 # The binary writes only under OUTPUT_DIR and needs no writable root or /tmp.
-ENV DATA_DIR=/data OUTPUT_DIR=/output
+ENV DATA_DIR=/data OUTPUT_DIR=/output LD_PRELOAD=/lib/libjemalloc.so.2 MALLOC_CONF=thp:always,narenas:1,dirty_decay_ms:-1,muzzy_decay_ms:-1,oversize_threshold:0
 USER 1000:1000
 ENTRYPOINT ["/shopping-sessions"]

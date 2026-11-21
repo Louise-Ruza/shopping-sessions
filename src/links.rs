@@ -7,7 +7,7 @@
 //! lets unlinked/root IDs skip the DRAM table probe, and `Resolver` adds a 64-entry
 //! direct-mapped per-thread cache (whale IDs) plus a prefetch delay ring.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use crate::arena::{ShardSet, Scatter};
 use crate::key::Key8;
@@ -19,23 +19,26 @@ pub const SEED_A: u64 = SEED_L;
 const REGION_BITS: u32 = 8;
 const REGIONS: usize = 1 << REGION_BITS;
 /// Link-side shards for interning.
-const SIDE_BITS: u32 = 6;
+const SIDE_BITS: u32 = 7;
 const SIDE_SHARDS: usize = 1 << SIDE_BITS;
 
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
 struct LEnt {
     key: Key8,
-    person: Key8,
+    cid: u32,
+    _pad: u32,
 }
 
-const LEMPTY: LEnt = LEnt { key: Key8::EMPTY, person: Key8::EMPTY };
+const LEMPTY: LEnt = LEnt { key: Key8::EMPTY, cid: 0, _pad: 0 };
+const _: () = assert!(std::mem::size_of::<LEnt>() == 16);
 
 pub struct LinkTable {
     tab: Vec<LEnt>,
-    rbits: u32, // log2 slots per region
+    mask: usize,
     bloom: Vec<u64>,
     bloom_mask: usize,
+    canon_keys: Vec<Key8>,
     empty: bool,
 }
 
@@ -67,17 +70,28 @@ impl LinkTable {
     }
 
     #[inline(always)]
+    pub fn num_canon(&self) -> usize {
+        self.canon_keys.len()
+    }
+
+    #[inline(always)]
+    pub fn canon_key(&self, cid: u32) -> Key8 {
+        unsafe { *self.canon_keys.get_unchecked(cid as usize) }
+    }
+
+    #[inline(always)]
     pub fn prefetch_bloom(&self, h: u64) {
         prefetch(unsafe { self.bloom.as_ptr().add(bloom_word(h, self.bloom_mask)) } as *const u8);
     }
 
-    /// Release LinkTable backing pages back to the OS once Tier 1 finishes.
+    /// Release LinkTable backing pages back to the OS once solve finishes.
     pub fn release_pages(&self) {
         #[cfg(all(target_os = "linux", not(test)))]
         {
             for (ptr, bytes) in [
                 (self.tab.as_ptr() as usize, self.tab.len() * std::mem::size_of::<LEnt>()),
                 (self.bloom.as_ptr() as usize, self.bloom.len() * std::mem::size_of::<u64>()),
+                (self.canon_keys.as_ptr() as usize, self.canon_keys.len() * std::mem::size_of::<Key8>()),
             ] {
                 if bytes >= 131_072 {
                     let a = (ptr + 4095) & !4095;
@@ -92,7 +106,7 @@ impl LinkTable {
 
     #[inline(always)]
     fn slot(&self, h: u64) -> usize {
-        (((h >> (64 - REGION_BITS)) as usize) << self.rbits) | (h as usize & ((1 << self.rbits) - 1))
+        h as usize & self.mask
     }
 
     #[inline(always)]
@@ -106,21 +120,20 @@ impl LinkTable {
         prefetch(unsafe { self.tab.as_ptr().add(self.slot(h)) } as *const u8);
     }
 
-    /// Person of `uid` if it is a linked, non-root ID.
+    /// Dense canonical component id `cid` (`0..num_canon()`) if `uid` belongs to a linked component of size >= 2.
     #[inline(always)]
-    pub fn lookup(&self, h: u64, uid: Key8) -> Option<Key8> {
-        let rmask = (1usize << self.rbits) - 1;
-        let base = ((h >> (64 - REGION_BITS)) as usize) << self.rbits;
-        let mut i = h as usize & rmask;
+    pub fn lookup(&self, h: u64, uid: Key8) -> Option<u32> {
+        let mask = self.mask;
+        let mut i = h as usize & mask;
         loop {
-            let e = unsafe { self.tab.get_unchecked(base + i) };
+            let e = unsafe { self.tab.get_unchecked(i) };
             if e.key == uid {
-                return Some(e.person);
+                return Some(e.cid);
             }
             if e.key.is_empty() {
                 return None;
             }
-            i = (i + 1) & rmask;
+            i = (i + 1) & mask;
         }
     }
 
@@ -130,7 +143,7 @@ impl LinkTable {
         if !self.maybe(h) {
             return uid;
         }
-        self.lookup(h, uid).unwrap_or(uid)
+        self.lookup(h, uid).map(|cid| self.canon_key(cid)).unwrap_or(uid)
     }
 }
 
@@ -224,7 +237,10 @@ impl<'a, R: Copy> Resolver<'a, R> {
     fn finish_one(&mut self, y: Item<R>, emit: &mut impl FnMut(R, Key8, u64)) {
         let (item, uid, h) = y;
         let (person, phash) = match self.lt.lookup(h, uid) {
-            Some(p) => (p, p.hash(SEED_A)),
+            Some(cid) => {
+                let p = self.lt.canon_key(cid);
+                (p, p.hash(SEED_A))
+            }
             None => (uid, h),
         };
         unsafe { *self.cache.get_unchecked_mut((h as usize) & (CACHE - 1)) = CEnt { uid, person, phash } };
@@ -458,18 +474,29 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
             }
         }
     });
+    let mut root_cid = vec![u32::MAX; n];
+    let mut canon_keys: Vec<Key8> = Vec::new();
+    for x in 0..n {
+        if has_alias[x].load(Ordering::Relaxed) != 0 {
+            root_cid[x] = canon_keys.len() as u32;
+            canon_keys.push(keys[x]);
+        }
+    }
+    drop(has_alias);
+    let root_cid_ref = &root_cid;
     let groups: Vec<Vec<Vec<u64>>> = par(threads, |t| {
         let mut g: Vec<Vec<u64>> = (0..REGIONS).map(|_| Vec::new()).collect();
         for x in (t * step).min(n)..((t + 1) * step).min(n) {
             let r = parent[x].load(Ordering::Relaxed);
-            if r != x as u32 || has_alias[x].load(Ordering::Relaxed) != 0 {
+            let cid = root_cid_ref[r as usize];
+            if cid != u32::MAX {
                 let h = keys[x].hash(SEED_L);
-                g[(h >> (64 - REGION_BITS)) as usize].push(((r as u64) << 32) | x as u64);
+                g[(h >> (64 - REGION_BITS)) as usize].push(((cid as u64) << 32) | x as u64);
             }
         }
         g
     });
-    drop(has_alias);
+    drop(root_cid);
     let mut counts = vec![0usize; REGIONS];
     for g in &groups {
         for (r, v) in g.iter().enumerate() {
@@ -479,9 +506,9 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
     let total_nr: usize = counts.iter().sum();
     let bloom_words = ((total_nr * 12 / 64).next_power_of_two()).clamp(1 << 10, 1 << 20);
     let bloom_mask = bloom_words - 1;
-    let maxc = counts.iter().copied().max().unwrap_or(0);
-    let rbits = ((maxc + maxc / 2 + 1).next_power_of_two().max(4)).trailing_zeros();
-    let mut tab = vec![LEMPTY; REGIONS << rbits];
+    let cap = (total_nr + total_nr / 2 + 1).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let mut tab = vec![LEMPTY; cap];
     #[cfg(target_os = "linux")]
     if tab.len() * std::mem::size_of::<LEnt>() >= (2 << 20) {
         unsafe {
@@ -492,54 +519,67 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
             );
         }
     }
-    let bloom: Vec<AtomicU64> = (0..bloom_words).map(|_| AtomicU64::new(0)).collect();
-    {
-        let tp = SyncPtr(tab.as_mut_ptr() as *mut u64);
-        let tp = &tp;
-        let bloom = &bloom;
-        let groups = &groups;
-        let next = AtomicUsize::new(0);
-        par(threads, |_| loop {
-            let r = next.fetch_add(1, Ordering::Relaxed);
-            if r >= REGIONS {
-                break;
-            }
-            let tab = tp.0 as *mut LEnt;
-            let rmask = (1usize << rbits) - 1;
-            for g in groups {
-                for &v in &g[r] {
-                    let (root, x) = ((v >> 32) as usize, v as u32 as usize);
-                    let key = keys[x];
-                    let h = key.hash(SEED_L);
-                    bloom[bloom_word(h, bloom_mask)].fetch_or(bloom_bits(h), Ordering::Relaxed);
-                    let mut i = h as usize & rmask;
-                    unsafe {
-                        while !(*tab.add((r << rbits) + i)).key.is_empty() {
-                            i = (i + 1) & rmask;
-                        }
-                        *tab.add((r << rbits) + i) = LEnt { key, person: keys[root] };
-                    }
+    let mut bloom = vec![0u64; bloom_words];
+    for g in &groups {
+        for r in g {
+            for &v in r {
+                let (cid, x) = ((v >> 32) as u32, v as u32 as usize);
+                let key = keys[x];
+                let h = key.hash(SEED_L);
+                bloom[bloom_word(h, bloom_mask)] |= bloom_bits(h);
+                let mut i = h as usize & mask;
+                while !tab[i].key.is_empty() {
+                    i = (i + 1) & mask;
                 }
+                tab[i] = LEnt { key, cid, _pad: 0 };
             }
-        });
+        }
     }
     LinkTable {
         tab,
-        rbits,
-        bloom: bloom.into_iter().map(|a| a.into_inner()).collect(),
+        mask,
+        bloom,
         bloom_mask,
+        canon_keys,
         empty: total_nr == 0,
     }
 }
 
-/// Fast zero-atomic single-threaded sharded link-table builder: 64 L2-resident
-/// intern shards + flat non-atomic union-find + non-atomic Bloom. Avoids both
-/// multi-thread CAS/spawn overhead AND unsharded DRAM hash-table thrashing.
+/// Fast zero-atomic single-threaded sharded link-table builder: 128 L2-resident
+/// intern shards + multi-row AVX2 link scanner + cached hash + flat non-atomic union-find.
 fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
-    let sides: ShardSet<LSide> = ShardSet::new_shared(SIDE_SHARDS);
-    let mut w = Scatter::<LSide, 128>::new(&sides);
-    let mut tok = fixed::Tok::default();
-    let mut ne = 0u64;
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct LSideSeq {
+        key: Key8,
+        ep: u32,
+        h32: u32,
+    }
+    const _: () = assert!(std::mem::size_of::<LSideSeq>() == 16);
+
+    struct LinkHandler<'a> {
+        w: Scatter<'a, LSideSeq, 128>,
+        ne: u32,
+    }
+    impl crate::event_front::LinkSink<'_> for &mut LinkHandler<'_> {
+        #[inline(always)]
+        fn on_link(&mut self, a: &[u8], b: &[u8]) {
+            if a.is_empty() || b.is_empty() {
+                return;
+            }
+            let ka = Key8::new(a);
+            let kb = Key8::new(b);
+            let ha = ka.hash(SEED_L);
+            let hb = kb.hash(SEED_L);
+            let ep = self.ne * 2;
+            self.w.push((ha >> (64 - SIDE_BITS)) as usize, LSideSeq { key: ka, ep, h32: ha as u32 });
+            self.w.push((hb >> (64 - SIDE_BITS)) as usize, LSideSeq { key: kb, ep: ep + 1, h32: hb as u32 });
+            self.ne += 1;
+        }
+    }
+
+    let sides: ShardSet<LSideSeq> = ShardSet::new_shared(SIDE_SHARDS);
+    let mut handler = LinkHandler { w: Scatter::<LSideSeq, 128>::new(&sides), ne: 0 };
     for &d in files {
         let start = match d.iter().position(|&c| c == b'\n') {
             Some(i) => i + 1,
@@ -550,34 +590,30 @@ fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
             continue;
         }
         populate(body);
-        fixed::scan::<2, _>(&mut tok, body, |f| {
-            let (a, b) = (f[0], f[1]);
-            if a.is_empty() || b.is_empty() {
-                return;
-            }
-            let ka = Key8::new(a);
-            let kb = Key8::new(b);
-            let sa = (ka.hash(SEED_L) >> (64 - SIDE_BITS)) as usize;
-            let sb = (kb.hash(SEED_L) >> (64 - SIDE_BITS)) as usize;
-            w.push(sa, LSide { key: ka, ep: ne * 2 });
-            w.push(sb, LSide { key: kb, ep: ne * 2 + 1 });
-            ne += 1;
-        });
+        crate::event_front::scan_links(body, &mut handler);
         release_chunk(body);
     }
-    w.finish();
+    let ne = handler.ne;
+    handler.w.finish();
 
     let total_eps = (ne as usize) * 2;
     if total_eps == 0 {
         sides.free_all();
-        return LinkTable { tab: vec![LEMPTY; REGIONS << 2], rbits: 2, bloom: vec![0; 1 << 10], bloom_mask: (1 << 10) - 1, empty: true };
+        return LinkTable {
+            tab: vec![LEMPTY; 16],
+            mask: 15,
+            bloom: vec![0; 1 << 10],
+            bloom_mask: (1 << 10) - 1,
+            canon_keys: Vec::new(),
+            empty: true,
+        };
     }
 
     let mut eps: Vec<u32> = Vec::with_capacity(total_eps);
     unsafe { eps.set_len(total_eps) };
     let eptr = eps.as_mut_ptr();
     let mut keys: Vec<Key8> = Vec::with_capacity(total_eps / 2 + 64);
-    let mut tab: Vec<u32> = Vec::new();
+    let mut tab: Vec<(Key8, u32)> = Vec::new();
     const PF: usize = 8;
     for s in 0..SIDE_SHARDS {
         let segs = sides.take(s);
@@ -586,32 +622,32 @@ fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
             segs.free();
             continue;
         }
-        let cap = (n * 2).next_power_of_two().max(16);
+        let cap = (n + n / 2).next_power_of_two().max(16);
         let mask = cap - 1;
         tab.clear();
-        tab.resize(cap, 0);
+        tab.resize(cap, (Key8::EMPTY, 0));
         let tptr = tab.as_mut_ptr();
         for seg in segs.iter() {
             let slen = seg.len();
             for ri in 0..slen {
                 if ri + PF < slen {
-                    let fh = unsafe { seg.get_unchecked(ri + PF).key.hash(SEED_L) };
-                    prefetch(unsafe { tptr.add(fh as usize & mask) } as *const u8);
+                    let fs = unsafe { seg.get_unchecked(ri + PF) };
+                    prefetch(unsafe { tptr.add(fs.h32 as usize & mask) } as *const u8);
+                    prefetch(unsafe { eptr.add(fs.ep as usize) } as *const u8);
                 }
                 let side = unsafe { seg.get_unchecked(ri) };
-                let mut i = side.key.hash(SEED_L) as usize & mask;
+                let mut i = side.h32 as usize & mask;
                 let node;
                 loop {
-                    let e = unsafe { *tptr.add(i) };
-                    if e == 0 {
-                        node = keys.len() as u32;
-                        keys.push(side.key);
-                        unsafe { *tptr.add(i) = node + 1 };
+                    let e = unsafe { &mut *tptr.add(i) };
+                    if e.0 == side.key {
+                        node = e.1;
                         break;
                     }
-                    let id = e - 1;
-                    if unsafe { *keys.get_unchecked(id as usize) } == side.key {
-                        node = id;
+                    if e.0.is_empty() {
+                        node = keys.len() as u32;
+                        keys.push(side.key);
+                        *e = (side.key, node);
                         break;
                     }
                     i = (i + 1) & mask;
@@ -640,9 +676,26 @@ fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
         }
     }
 
-    for e in eps.chunks_exact(2) {
-        let a = find_seq(&mut parent, e[0]);
-        let b = find_seq(&mut parent, e[1]);
+    let ep_pairs = eps.len() >> 1;
+    let eptr_ro = eps.as_ptr();
+    let pptr = parent.as_ptr();
+    let kptr = keys.as_ptr();
+    const UPF: usize = 16;
+    for ei in 0..ep_pairs {
+        if ei + UPF < ep_pairs {
+            unsafe {
+                let fa = *eptr_ro.add((ei + UPF) * 2) as usize;
+                let fb = *eptr_ro.add((ei + UPF) * 2 + 1) as usize;
+                prefetch(pptr.add(fa) as *const u8);
+                prefetch(pptr.add(fb) as *const u8);
+                prefetch(kptr.add(fa) as *const u8);
+                prefetch(kptr.add(fb) as *const u8);
+            }
+        }
+        let ea = unsafe { *eptr_ro.add(ei * 2) };
+        let eb = unsafe { *eptr_ro.add(ei * 2 + 1) };
+        let a = find_seq(&mut parent, ea);
+        let b = find_seq(&mut parent, eb);
         if a != b {
             if unsafe { keys.get_unchecked(a as usize).cmp_bytes(keys.get_unchecked(b as usize)) }
                 == std::cmp::Ordering::Less
@@ -655,35 +708,64 @@ fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
     }
     drop(eps);
 
-    let mut has_alias = vec![0u8; n];
+    // Flatten union-find & tag each component root in place in `parent[r] = 0x8000_0000 | cid`
+    // (zero extra `root_cid` / `has_alias` allocation!).
+    #[inline(always)]
+    fn find_seq_tagged(parent: &mut [u32], mut x: u32) -> u32 {
+        loop {
+            let p = unsafe { *parent.get_unchecked(x as usize) };
+            if p == x || (p & 0x8000_0000) != 0 {
+                return x;
+            }
+            let g = unsafe { *parent.get_unchecked(p as usize) };
+            if (g & 0x8000_0000) != 0 {
+                return p;
+            }
+            unsafe { *parent.get_unchecked_mut(x as usize) = g };
+            x = g;
+        }
+    }
+
+    assert!(n < 0x8000_0000, "too many link nodes");
+    let mut canon_keys: Vec<Key8> = Vec::with_capacity(n / 2 + 16);
     for x in 0..n {
-        let r = find_seq(&mut parent, x as u32);
+        let p0 = unsafe { *parent.get_unchecked(x) };
+        if (p0 & 0x8000_0000) != 0 {
+            continue;
+        }
+        let r = find_seq_tagged(&mut parent, x as u32);
         if r != x as u32 {
             unsafe {
-                *has_alias.get_unchecked_mut(r as usize) = 1;
                 *parent.get_unchecked_mut(x) = r;
+                let pr = parent.get_unchecked_mut(r as usize);
+                if (*pr & 0x8000_0000) == 0 {
+                    *pr = 0x8000_0000 | (canon_keys.len() as u32);
+                    canon_keys.push(*keys.get_unchecked(r as usize));
+                }
             }
         }
     }
-    let mut counts = [0usize; REGIONS];
     let mut linked: Vec<(u32, u32, u64)> = Vec::with_capacity(n);
     for x in 0..n {
-        let r = unsafe { *parent.get_unchecked(x) };
-        if r != x as u32 || unsafe { *has_alias.get_unchecked(x) } != 0 {
+        let p = unsafe { *parent.get_unchecked(x) };
+        let cid_tag = if (p & 0x8000_0000) != 0 {
+            p
+        } else {
+            unsafe { *parent.get_unchecked(p as usize) }
+        };
+        if (cid_tag & 0x8000_0000) != 0 {
             let h = unsafe { keys.get_unchecked(x) }.hash(SEED_L);
-            counts[(h >> (64 - REGION_BITS)) as usize] += 1;
-            linked.push((x as u32, r, h));
+            linked.push((x as u32, cid_tag & 0x7FFF_FFFF, h));
         }
     }
     drop(parent);
-    drop(has_alias);
 
     let total_nr = linked.len();
     let bloom_words = ((total_nr * 12 / 64).next_power_of_two()).clamp(1 << 10, 1 << 20);
     let bloom_mask = bloom_words - 1;
-    let maxc = counts.iter().copied().max().unwrap_or(0);
-    let rbits = ((maxc + maxc / 2 + 1).next_power_of_two().max(4)).trailing_zeros();
-    let mut ltab = vec![LEMPTY; REGIONS << rbits];
+    let cap = (total_nr + total_nr / 2 + 1).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let mut ltab = vec![LEMPTY; cap];
     #[cfg(target_os = "linux")]
     if ltab.len() * std::mem::size_of::<LEnt>() >= (2 << 20) {
         unsafe {
@@ -695,24 +777,31 @@ fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
         }
     }
     let mut bloom = vec![0u64; bloom_words];
-    let rmask = (1usize << rbits) - 1;
     let lptr = ltab.as_mut_ptr();
-    for &(x, root, h) in &linked {
+    let bptr = bloom.as_mut_ptr();
+    let nlink = linked.len();
+    const LPF: usize = 16;
+    for idx in 0..nlink {
+        if idx + LPF < nlink {
+            let (_, _, fh) = unsafe { *linked.get_unchecked(idx + LPF) };
+            prefetch(unsafe { bptr.add(bloom_word(fh, bloom_mask)) } as *const u8);
+            prefetch(unsafe { lptr.add(fh as usize & mask) } as *const u8);
+        }
+        let (x, cid, h) = unsafe { *linked.get_unchecked(idx) };
         unsafe {
-            *bloom.get_unchecked_mut(bloom_word(h, bloom_mask)) |= bloom_bits(h);
-            let r = (h >> (64 - REGION_BITS)) as usize;
-            let base = r << rbits;
-            let mut i = h as usize & rmask;
-            while !(*lptr.add(base + i)).key.is_empty() {
-                i = (i + 1) & rmask;
+            *bptr.add(bloom_word(h, bloom_mask)) |= bloom_bits(h);
+            let mut i = h as usize & mask;
+            while !(*lptr.add(i)).key.is_empty() {
+                i = (i + 1) & mask;
             }
-            *lptr.add(base + i) = LEnt {
+            *lptr.add(i) = LEnt {
                 key: *keys.get_unchecked(x as usize),
-                person: *keys.get_unchecked(root as usize),
+                cid,
+                _pad: 0,
             };
         }
     }
-    LinkTable { tab: ltab, rbits, bloom, bloom_mask, empty: total_nr == 0 }
+    LinkTable { tab: ltab, mask, bloom, bloom_mask, canon_keys, empty: total_nr == 0 }
 }
 
 /// Fast zero-sync single-threaded link-table builder (retained for reference/tests).
@@ -808,31 +897,36 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
     drop(tab);
 
     let n = keys.len();
-    let mut has_alias = vec![false; n];
+    let mut root_cid = vec![u32::MAX; n];
+    let mut canon_keys: Vec<Key8> = Vec::with_capacity(n / 2 + 16);
     for x in 0..n {
         let r = find_seq(&mut parent, x as u32);
         if r != x as u32 {
-            has_alias[r as usize] = true;
+            parent[x] = r;
+            if root_cid[r as usize] == u32::MAX {
+                root_cid[r as usize] = canon_keys.len() as u32;
+                canon_keys.push(keys[r as usize]);
+            }
         }
     }
-    let mut counts = [0usize; REGIONS];
     let mut linked: Vec<(u32, u32, u64)> = Vec::with_capacity(n + 16);
     for x in 0..n {
-        let r = find_seq(&mut parent, x as u32);
-        if r != x as u32 || has_alias[x] {
+        let r = parent[x];
+        let cid = root_cid[r as usize];
+        if cid != u32::MAX {
             let h = unsafe { keys.get_unchecked(x) }.hash(SEED_L);
-            counts[(h >> (64 - REGION_BITS)) as usize] += 1;
-            linked.push((x as u32, r, h));
+            linked.push((x as u32, cid, h));
         }
     }
     drop(parent);
+    drop(root_cid);
 
     let total_nr = linked.len();
     let bloom_words = ((total_nr * 12 / 64).next_power_of_two()).clamp(1 << 10, 1 << 20);
     let bloom_mask = bloom_words - 1;
-    let maxc = counts.iter().copied().max().unwrap_or(0);
-    let rbits = ((maxc + maxc / 2 + 1).next_power_of_two().max(4)).trailing_zeros();
-    let mut ltab = vec![LEMPTY; REGIONS << rbits];
+    let cap = (total_nr + total_nr / 2 + 1).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let mut ltab = vec![LEMPTY; cap];
     #[cfg(target_os = "linux")]
     if ltab.len() * std::mem::size_of::<LEnt>() >= (2 << 20) {
         unsafe {
@@ -844,24 +938,31 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
         }
     }
     let mut bloom = vec![0u64; bloom_words];
-    let rmask = (1usize << rbits) - 1;
     let lptr = ltab.as_mut_ptr();
-    for &(x, root, h) in &linked {
+    let bptr = bloom.as_mut_ptr();
+    let nlink = linked.len();
+    const LPF: usize = 16;
+    for idx in 0..nlink {
+        if idx + LPF < nlink {
+            let (_, _, fh) = unsafe { *linked.get_unchecked(idx + LPF) };
+            prefetch(unsafe { bptr.add(bloom_word(fh, bloom_mask)) } as *const u8);
+            prefetch(unsafe { lptr.add(fh as usize & mask) } as *const u8);
+        }
+        let (x, cid, h) = unsafe { *linked.get_unchecked(idx) };
         unsafe {
-            *bloom.get_unchecked_mut(bloom_word(h, bloom_mask)) |= bloom_bits(h);
-            let r = (h >> (64 - REGION_BITS)) as usize;
-            let base = r << rbits;
-            let mut i = h as usize & rmask;
-            while !(*lptr.add(base + i)).key.is_empty() {
-                i = (i + 1) & rmask;
+            *bptr.add(bloom_word(h, bloom_mask)) |= bloom_bits(h);
+            let mut i = h as usize & mask;
+            while !(*lptr.add(i)).key.is_empty() {
+                i = (i + 1) & mask;
             }
-            *lptr.add(base + i) = LEnt {
+            *lptr.add(i) = LEnt {
                 key: *keys.get_unchecked(x as usize),
-                person: *keys.get_unchecked(root as usize),
+                cid,
+                _pad: 0,
             };
         }
     }
-    LinkTable { tab: ltab, rbits, bloom, bloom_mask, empty: total_nr == 0 }
+    LinkTable { tab: ltab, mask, bloom, bloom_mask, canon_keys, empty: total_nr == 0 }
 }
 
 #[cfg(test)]
@@ -903,7 +1004,9 @@ mod tests {
             // Two-tier invariant: component roots of size >= 2 MUST be present in LinkTable,
             // while self-links and unlinked IDs must NOT be present.
             let k_root = Key8::new(b"n0000");
-            assert_eq!(lt.lookup(k_root.hash(SEED_L), k_root), Some(k_root));
+            let root_cid = lt.lookup(k_root.hash(SEED_L), k_root).expect("root in LinkTable");
+            assert_eq!(lt.canon_key(root_cid), k_root);
+            assert_eq!(lt.num_canon(), 4);
             let k_self = Key8::new(b"q");
             assert_eq!(lt.lookup(k_self.hash(SEED_L), k_self), None);
             let k_un = Key8::new(b"unlinked");

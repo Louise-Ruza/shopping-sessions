@@ -1,7 +1,7 @@
 //! Minimal Parquet writer: one row group, one uncompressed PLAIN data page (V1)
 //! per column. Supports required strings, optional strings, DATE and INT64.
 
-use std::io::Write;
+use std::io::{IoSlice, Write};
 use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,11 +24,12 @@ pub struct Column {
 impl Column {
     pub fn new(name: &'static str, kind: Kind, cap_rows: usize) -> Column {
         let per = match kind {
-            Kind::Str | Kind::OptStr => 16,
+            Kind::Str => 14,
+            Kind::OptStr => 2,
             Kind::Date | Kind::I32 => 4,
             Kind::I64 => 8,
         };
-        let values = Vec::with_capacity(cap_rows * per);
+        let values = Vec::with_capacity(cap_rows * per + 16);
         #[cfg(all(target_os = "linux", not(test)))]
         if values.capacity() >= (1 << 20) {
             let ptr = values.as_ptr() as usize;
@@ -42,7 +43,7 @@ impl Column {
             name,
             kind,
             values,
-            defs: if kind == Kind::OptStr { Vec::with_capacity(cap_rows / 8 + 1) } else { Vec::new() },
+            defs: if kind == Kind::OptStr { Vec::with_capacity(cap_rows / 8 + 16) } else { Vec::new() },
             n: 0,
         }
     }
@@ -72,22 +73,61 @@ impl Column {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn grow_val(&mut self, extra: usize) {
+        self.values.reserve(extra.max(4096));
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_def(&mut self) {
+        self.defs.reserve(4096);
+    }
+
     #[inline(always)]
     fn push_def(&mut self, present: bool) {
+        let byte_idx = self.n >> 3;
         let bit = self.n & 7;
         if bit == 0 {
-            self.defs.push(present as u8);
+            if byte_idx == self.defs.capacity() {
+                self.grow_def();
+            }
+            unsafe {
+                *self.defs.as_mut_ptr().add(byte_idx) = present as u8;
+                self.defs.set_len(byte_idx + 1);
+            }
         } else if present {
-            let last = self.defs.len() - 1;
-            unsafe { *self.defs.get_unchecked_mut(last) |= 1 << bit };
+            unsafe { *self.defs.get_unchecked_mut(byte_idx) |= 1 << bit };
         }
     }
 
     #[inline(always)]
     fn ensure_val(&mut self, extra: usize) {
         if self.values.capacity() - self.values.len() < extra {
-            self.values.reserve(extra.max(4096));
+            self.grow_val(extra);
         }
+    }
+
+    /// Fast path for inline `Key8::as_slice` slices backed by a 16-byte stack buffer.
+    #[inline(always)]
+    pub unsafe fn push_str_inline16(&mut self, s: &[u8]) {
+        debug_assert!(self.kind == Kind::Str && s.len() <= 16);
+        let slen = s.len();
+        self.ensure_val(20);
+        let len = self.values.len();
+        let dst = self.values.as_mut_ptr().add(len);
+        (dst as *mut u32).write_unaligned((slen as u32).to_le());
+        (dst.add(4) as *mut u128).write_unaligned((s.as_ptr() as *const u128).read_unaligned());
+        self.values.set_len(len + 4 + slen);
+        self.n += 1;
+    }
+
+    #[inline(always)]
+    pub fn push_null(&mut self) {
+        debug_assert!(self.kind == Kind::OptStr);
+        self.push_def(false);
+        self.n += 1;
     }
 
     #[inline(always)]
@@ -231,36 +271,61 @@ fn physical(kind: Kind) -> i32 {
     }
 }
 
-/// Writes a Parquet file holding `cols` (all with the same row count) directly
-/// without copying column buffers into an intermediate file-sized `Vec<u8>`.
+fn write_all_vectored(f: &mut std::fs::File, slices: &mut [&[u8]]) -> std::io::Result<()> {
+    let mut cur = slices;
+    while !cur.is_empty() {
+        let mut iov = [IoSlice::new(&[]); 32];
+        let count = cur.len().min(32);
+        for i in 0..count {
+            iov[i] = IoSlice::new(cur[i]);
+        }
+        let mut n = match f.write_vectored(&iov[..count]) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_vectored returned 0")),
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        while !cur.is_empty() && n >= cur[0].len() {
+            n -= cur[0].len();
+            cur = &mut cur[1..];
+        }
+        if !cur.is_empty() && n > 0 {
+            cur[0] = &cur[0][n..];
+        }
+    }
+    Ok(())
+}
+
+/// Writes a Parquet file holding `cols` (all with the same row count) in a single
+/// vectored `writev` syscall without copying column or definition-level buffers.
 pub fn write_file(path: &Path, cols: &[Column]) -> std::io::Result<()> {
     let nrows = cols.first().map(|c| c.n).unwrap_or(0);
     let mut f = std::fs::File::create(path)?;
-    f.write_all(b"PAR1")?;
     let mut off = 4i64;
-    // (data_page_offset, total size)
     let mut chunks: Vec<(i64, i64)> = Vec::with_capacity(cols.len());
+    let mut hdrs: Vec<Vec<u8>> = Vec::with_capacity(cols.len());
     if nrows > 0 {
         for c in cols {
             assert_eq!(c.n, nrows);
-            let mut page: Vec<u8> = Vec::new();
+            let mut lv_hdr = [0u8; 16];
+            let mut lv_hdr_len = 0usize;
             let page_len;
             if c.kind == Kind::OptStr {
-                // RLE/bit-packed hybrid, bit width 1, one bit-packed run.
                 let groups = c.n.div_ceil(8);
-                page.reserve(groups + 14);
-                page.extend_from_slice(&[0u8; 4]);
+                debug_assert_eq!(c.defs.len(), groups);
                 let mut h = ((groups as u64) << 1) | 1;
+                let mut pos = 4usize;
                 while h >= 0x80 {
-                    page.push((h as u8) | 0x80);
+                    lv_hdr[pos] = (h as u8) | 0x80;
                     h >>= 7;
+                    pos += 1;
                 }
-                page.push(h as u8);
-                page.extend_from_slice(&c.defs);
-                page.resize(page.len() + groups - c.defs.len(), 0);
-                let lv_len = (page.len() - 4) as u32;
-                page[0..4].copy_from_slice(&lv_len.to_le_bytes());
-                page_len = page.len() + c.values.len();
+                lv_hdr[pos] = h as u8;
+                pos += 1;
+                let lv_len = (pos - 4 + c.defs.len()) as u32;
+                lv_hdr[0..4].copy_from_slice(&lv_len.to_le_bytes());
+                lv_hdr_len = pos;
+                page_len = pos + c.defs.len() + c.values.len();
             } else {
                 page_len = c.values.len();
             }
@@ -276,14 +341,12 @@ pub fn write_file(path: &Path, cols: &[Column]) -> std::io::Result<()> {
             t.i32(4, 3); // RLE
             t.end_struct();
             t.buf.push(0);
-            let chunk_size = (t.buf.len() + page.len() + c.values.len()) as i64;
-            f.write_all(&t.buf)?;
-            if !page.is_empty() {
-                f.write_all(&page)?;
+            let thdr_len = t.buf.len();
+            if lv_hdr_len > 0 {
+                t.buf.extend_from_slice(&lv_hdr[..lv_hdr_len]);
             }
-            if !c.values.is_empty() {
-                f.write_all(&c.values)?;
-            }
+            let chunk_size = (thdr_len + page_len) as i64;
+            hdrs.push(t.buf);
             chunks.push((off, chunk_size));
             off += chunk_size;
         }
@@ -358,6 +421,20 @@ pub fn write_file(path: &Path, cols: &[Column]) -> std::io::Result<()> {
     let flen = (t.buf.len() as u32).to_le_bytes();
     t.buf.extend_from_slice(&flen);
     t.buf.extend_from_slice(b"PAR1");
-    f.write_all(&t.buf)?;
-    Ok(())
+
+    let mut slices: Vec<&[u8]> = Vec::with_capacity(cols.len() * 3 + 2);
+    slices.push(b"PAR1");
+    if nrows > 0 {
+        for (c, hdr) in cols.iter().zip(&hdrs) {
+            slices.push(hdr.as_slice());
+            if c.kind == Kind::OptStr && !c.defs.is_empty() {
+                slices.push(c.defs.as_slice());
+            }
+            if !c.values.is_empty() {
+                slices.push(c.values.as_slice());
+            }
+        }
+    }
+    slices.push(t.buf.as_slice());
+    write_all_vectored(&mut f, &mut slices)
 }

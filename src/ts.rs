@@ -5,6 +5,36 @@
 //! bitwise ASCII digit validation, and an unrolled 13-digit F3 fast path.
 
 pub const DAY_MS: i64 = 86_400_000;
+pub const INGEST_OOB_BASE: u32 = 0xF000_0000;
+pub const INGEST_EXACT_I64: u32 = u32::MAX - 1;
+pub const INGEST_NONE: u32 = u32::MAX;
+
+#[inline(always)]
+unsafe fn bcd_hms(p: *const u8) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        let w = u64::from_be((p as *const u64).read_unaligned());
+        core::arch::x86_64::_pext_u64(w, 0x0F0F_000F_0F00_0F0F) as u32
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let h0 = (*p & 0x0F) as u32;
+        let h1 = (*p.add(1) & 0x0F) as u32;
+        let m0 = (*p.add(3) & 0x0F) as u32;
+        let m1 = (*p.add(4) & 0x0F) as u32;
+        let s0 = (*p.add(6) & 0x0F) as u32;
+        let s1 = (*p.add(7) & 0x0F) as u32;
+        (h0 << 20) | (h1 << 16) | (m0 << 12) | (m1 << 8) | (s0 << 4) | s1
+    }
+}
+
+#[inline(always)]
+pub fn bcd_hms_to_ms(bcd: u32) -> i64 {
+    let h = ((bcd >> 20) & 0xF) * 10 + ((bcd >> 16) & 0xF);
+    let m = ((bcd >> 12) & 0xF) * 10 + ((bcd >> 8) & 0xF);
+    let s = ((bcd >> 4) & 0xF) * 10 + (bcd & 0xF);
+    (h as i64 * 3600 + m as i64 * 60 + s as i64) * 1000
+}
 
 const MIN_LUT_YEAR: u32 = 1970;
 const MAX_LUT_YEAR: u32 = 2100;
@@ -168,19 +198,28 @@ pub fn parse_f1_fast(b: &[u8]) -> Option<i64> {
     parse_ts(b)
 }
 
-/// Direct-mapped 32-slot L1 date-prefix cache indexed by day-of-month (`1..=31`).
-/// For any <=27-day window (14d window + 7d click lookback + 6d late ingest), every
-/// calendar day-of-month is unique, so 100% of in-window F1/F2 dates hit with a
-/// single u64 prefix compare (`"YYYY-MM-"`) and skip all calendar/leap math.
+/// Direct-mapped 64-slot L1 date-prefix cache indexed directly by raw ASCII `DD` bits
+/// `((dd & 3) << 4) | ((dd >> 8) & 15)` (zero multiply/range checks). Empty slots store
+/// an impossible sentinel `dd` whose slot index never equals its own slot, so a single
+/// `(pref ^ slot.prefix) | (dd ^ slot.dd)` check validates both occupancy and exact date.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct DateSlot {
-    prefix: u64, // little-endian 8 bytes "YYYY-MM-"; 0 = empty
+    prefix: u64, // little-endian 8 bytes "YYYY-MM-"
     day_ms: i64,
+    day_tag: u32,
+    dd: u16, // little-endian 2 bytes "DD"
+    _pad: u16,
+}
+
+#[inline(always)]
+fn dd_slot(dd: u16) -> usize {
+    (((dd & 3) << 4) | ((dd >> 8) & 15)) as usize
 }
 
 pub struct DateCache {
-    slots: [DateSlot; 32],
+    slots: [DateSlot; 64],
+    pub base_day_ms: i64,
 }
 
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
@@ -198,7 +237,8 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 impl DateCache {
     pub fn new(ws: i64, we: i64) -> DateCache {
-        let mut slots = [DateSlot { prefix: 0, day_ms: 0 }; 32];
+        let mut slots = [DateSlot { prefix: 0, day_ms: 0, day_tag: 0, dd: 0xFFFF, _pad: 0 }; 64];
+        slots[63].dd = 0x0000;
         let d_start = (ws - 8 * DAY_MS).div_euclid(DAY_MS);
         let d_end = (we + 6 * DAY_MS).div_euclid(DAY_MS);
         let count = (d_end - d_start + 1).clamp(0, 28);
@@ -206,27 +246,26 @@ impl DateCache {
             let day = d_start + off;
             let (y, m, d) = civil_from_days(day);
             if y >= 1 && y <= 9999 && d >= 1 && d <= 31 {
-                let s = format!("{y:04}-{m:02}-");
-                let prefix = u64::from_le_bytes(s.as_bytes()[0..8].try_into().unwrap());
-                slots[d as usize] = DateSlot { prefix, day_ms: day * DAY_MS };
+                let s = format!("{y:04}-{m:02}-{d:02}");
+                let sb = s.as_bytes();
+                let prefix = u64::from_le_bytes(sb[0..8].try_into().unwrap());
+                let dd = u16::from_le_bytes([sb[8], sb[9]]);
+                slots[dd_slot(dd)] =
+                    DateSlot { prefix, day_ms: day * DAY_MS, day_tag: (off as u32) << 24, dd, _pad: 0 };
             }
         }
-        DateCache { slots }
+        DateCache { slots, base_day_ms: d_start * DAY_MS }
     }
 
     #[inline(always)]
     fn cached_day(&self, b: &[u8]) -> Option<i64> {
         let p = b.as_ptr();
         unsafe {
-            let d0 = (*p.add(8)).wrapping_sub(b'0');
-            let d1 = (*p.add(9)).wrapping_sub(b'0');
-            let d = (d0 as u32 * 10 + d1 as u32) as usize;
-            if ((non_digit_bits(d0) | non_digit_bits(d1)) & 0xF0) == 0 && d < 32 {
-                let slot = *self.slots.get_unchecked(d);
-                let pref = (p as *const u64).read_unaligned();
-                if slot.prefix != 0 && pref == slot.prefix {
-                    return Some(slot.day_ms);
-                }
+            let pref = (p as *const u64).read_unaligned();
+            let dd = (p.add(8) as *const u16).read_unaligned();
+            let slot = *self.slots.get_unchecked(dd_slot(dd));
+            if ((pref ^ slot.prefix) | ((dd ^ slot.dd) as u64)) == 0 {
+                return Some(slot.day_ms);
             }
         }
         None
@@ -243,29 +282,16 @@ impl DateCache {
                 let hi = x & 0x000F_0000_0F00_000F;
                 let lo = (x >> 8) & 0x000F_0000_0F00_000F;
                 let hms = hi * 10 + lo;
-                let h = (hms & 0xFF) as u32;
-                let mi = ((hms >> 24) & 0xFF) as u32;
-                let s = ((hms >> 48) & 0xFF) as u32;
-                if h <= 23 && mi <= 59 && s <= 59 {
-                    return Some((h as i64 * 3600 + mi as i64 * 60 + s as i64) * 1000);
+                // Branchless SWAR range check: h <= 23 (h+104 < 128), mi <= 59 (mi+68 < 128), s <= 59 (s+68 < 128).
+                if ((hms + 0x0044_0000_4400_0068) & 0x0080_0000_8000_0080) == 0 {
+                    let h = (hms & 0xFF) as i64;
+                    let mi = ((hms >> 24) & 0xFF) as i64;
+                    let s = ((hms >> 48) & 0xFF) as i64;
+                    return Some((h * 3600 + mi * 60 + s) * 1000);
                 }
             }
         }
         None
-    }
-
-    #[inline(always)]
-    fn clock_fast(p: *const u8) -> i64 {
-        unsafe {
-            let x = (p as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00:00:00");
-            let hi = x & 0x000F_0000_0F00_000F;
-            let lo = (x >> 8) & 0x000F_0000_0F00_000F;
-            let hms = hi * 10 + lo;
-            let h = (hms & 0xFF) as i64;
-            let mi = ((hms >> 24) & 0xFF) as i64;
-            let s = ((hms >> 48) & 0xFF) as i64;
-            (h * 3600 + mi * 60 + s) * 1000
-        }
     }
 
     #[inline(always)]
@@ -280,64 +306,114 @@ impl DateCache {
         calendar(b)
     }
 
-    /// Share one validated DateCache lookup when F1 event and ingestion share the same
-    /// YYYY-MM-DD date (~98% of F1 rows). Event stays strictly validated and independent
-    /// of ingest for global dedup semantics.
     #[inline(always)]
-    pub fn parse_event_ingest(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, Option<i64>) {
+    pub fn parse_event_ingest_bcd(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64, u32) {
         if event.len() == 20 && ingest.len() == 20 {
             let ep = event.as_ptr();
             let ip = ingest.as_ptr();
             unsafe {
-                if *ep.add(19) == b'Z' {
-                    let d0 = (*ep.add(8)).wrapping_sub(b'0');
-                    let d1 = (*ep.add(9)).wrapping_sub(b'0');
-                    let d = (d0 as u32 * 10 + d1 as u32) as usize;
-                    if ((non_digit_bits(d0) | non_digit_bits(d1)) & 0xF0) == 0 && d < 32 {
-                        let slot = *self.slots.get_unchecked(d);
-                        let ep_pref = (ep as *const u64).read_unaligned();
-                        if slot.prefix != 0 && ep_pref == slot.prefix {
-                            let day_ms = slot.day_ms;
+                let ep_pref = (ep as *const u64).read_unaligned();
+                let ep_dd = (ep.add(8) as *const u16).read_unaligned();
+                if *ep.add(19) == b'Z'
+                    && *ip.add(19) == b'Z'
+                    && ep_pref == (ip as *const u64).read_unaligned()
+                    && ep_dd == (ip.add(8) as *const u16).read_unaligned()
+                {
+                    let slot = *self.slots.get_unchecked(dd_slot(ep_dd));
+                    if ep_pref == slot.prefix && ep_dd == slot.dd {
+                        let ev_ms = if *ep.add(10) == b'T' {
+                            Self::clock_strict(ep.add(11)).map(|ms| slot.day_ms + ms)
+                        } else {
+                            None
+                        };
+                        let ing_bcd = slot.day_tag | bcd_hms(ip.add(11));
+                        return (ev_ms, slot.day_ms, ing_bcd);
+                    }
+                }
+            }
+        }
+        let (ing_day_ms, ing_bcd) = self.parse_f1_ingest_bcd(ingest);
+        (self.parse_ts(event), ing_day_ms, ing_bcd)
+    }
+
+    #[inline(always)]
+    pub fn parse_f2_ingest_bcd(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64, u32) {
+        if event.len() == 25 && ingest.len() == 20 {
+            let ep = event.as_ptr();
+            let ip = ingest.as_ptr();
+            unsafe {
+                let sign = *ep.add(19);
+                if *ep.add(22) == b':' && (sign == b'+' || sign == b'-') && *ip.add(19) == b'Z' {
+                    let ep_pref = (ep as *const u64).read_unaligned();
+                    let ep_dd = (ep.add(8) as *const u16).read_unaligned();
+                    if ep_pref == (ip as *const u64).read_unaligned()
+                        && ep_dd == (ip.add(8) as *const u16).read_unaligned()
+                    {
+                        let slot = *self.slots.get_unchecked(dd_slot(ep_dd));
+                        if ep_pref == slot.prefix && ep_dd == slot.dd {
+                            let ing_bcd = slot.day_tag | bcd_hms(ip.add(11));
                             let ev_ms = if *ep.add(10) == b'T' {
-                                Self::clock_strict(ep.add(11)).map(|ms| day_ms + ms)
+                                Self::clock_strict(ep.add(11)).and_then(|ms| {
+                                    let h0 = (*ep.add(20)).wrapping_sub(b'0');
+                                    let h1 = (*ep.add(21)).wrapping_sub(b'0');
+                                    let m0 = (*ep.add(23)).wrapping_sub(b'0');
+                                    let m1 = (*ep.add(24)).wrapping_sub(b'0');
+                                    if ((non_digit_bits(h0)
+                                        | non_digit_bits(h1)
+                                        | non_digit_bits(m0)
+                                        | non_digit_bits(m1))
+                                        & 0xF0)
+                                        != 0
+                                    {
+                                        return None;
+                                    }
+                                    let oh = h0 as u32 * 10 + h1 as u32;
+                                    let om = m0 as u32 * 10 + m1 as u32;
+                                    if oh > 23 || om > 59 {
+                                        return None;
+                                    }
+                                    let off = (oh as i64 * 60 + om as i64) * 60_000;
+                                    let base = slot.day_ms + ms;
+                                    Some(if sign == b'+' { base - off } else { base + off })
+                                })
                             } else {
                                 None
                             };
-                            let ing_ms = if *ip.add(19) == b'Z'
-                                && (ip as *const u64).read_unaligned() == ep_pref
-                                && (ip.add(8) as *const u16).read_unaligned()
-                                    == (ep.add(8) as *const u16).read_unaligned()
-                            {
-                                Some(day_ms + Self::clock_fast(ip.add(11)))
-                            } else {
-                                self.parse_f1_ingest(ingest)
-                            };
-                            return (ev_ms, ing_ms);
+                            return (ev_ms, slot.day_ms, ing_bcd);
                         }
                     }
                 }
             }
         }
-        (self.parse_ts(event), self.parse_f1_ingest(ingest))
+        let (ing_day_ms, ing_bcd) = self.parse_f1_ingest_bcd(ingest);
+        (self.parse_ts_25(event), ing_day_ms, ing_bcd)
     }
 
-    /// Ultra-fast path for `ingest_ts` (guaranteed valid F1 per rules.md).
     #[inline(always)]
-    pub fn parse_f1_ingest(&self, b: &[u8]) -> Option<i64> {
+    pub fn parse_f1_ingest_bcd(&self, b: &[u8]) -> (i64, u32) {
         if b.len() == 20 {
             let p = b.as_ptr();
             unsafe {
-                let d = ((*p.add(8)).wrapping_sub(b'0') as usize) * 10
-                    + (*p.add(9)).wrapping_sub(b'0') as usize;
-                if d < 32 {
-                    let slot = *self.slots.get_unchecked(d);
-                    if slot.prefix != 0 && (p as *const u64).read_unaligned() == slot.prefix {
-                        return Some(slot.day_ms + Self::clock_fast(p.add(11)));
+                if *p.add(19) == b'Z' {
+                    let pref = (p as *const u64).read_unaligned();
+                    let dd = (p.add(8) as *const u16).read_unaligned();
+                    let slot = *self.slots.get_unchecked(dd_slot(dd));
+                    if pref == slot.prefix && dd == slot.dd {
+                        return (slot.day_ms, slot.day_tag | bcd_hms(p.add(11)));
                     }
                 }
             }
         }
-        parse_f1_fast(b)
+        Self::parse_f1_ingest_slow(b)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn parse_f1_ingest_slow(b: &[u8]) -> (i64, u32) {
+        match parse_f1_fast(b) {
+            Some(ms) => (ms, INGEST_EXACT_I64),
+            None => (0, INGEST_NONE),
+        }
     }
 
     /// Parse a known 13-byte F3 timestamp.
