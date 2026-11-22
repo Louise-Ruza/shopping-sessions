@@ -23,7 +23,7 @@ pub struct Event<'a> {
     pub timestamp: Option<i64>,
     pub ing_day_ms: i64,
     pub ing_bcd: u32,
-    pub kind: u8, // 0 invalid; 1 view/cart; 2 purchase
+    pub kind: u8, // 0 invalid (then `product` is empty); 1 view/cart; 2 purchase
     pub price: u32,
 }
 
@@ -80,7 +80,9 @@ fn fallback<'a, S: EventSink<'a>>(data: &'a [u8], dates: &DateCache, f: &mut S) 
             uid_k,
             uh,
             uid_bytes: fields[1],
-            product: fields[5],
+            // An unknown kind empties `product`, so the sink's empty-product check rejects it
+            // and the per-row handler never tests `kind == 0`.
+            product: if kind == 0 { &[] } else { fields[5] },
             timestamp,
             ing_day_ms,
             ing_bcd,
@@ -195,7 +197,10 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
         };
         let kq = quoted(4, *p.add(c3 + 1) == b'"');
         let ka = c3 + 1 + kq;
-        let (kind, c4) = if ka + 4 + kq < c5 {
+        // No `ka + 4 + kq < c5` bound: a matching `view`/`cart` followed by a comma makes that
+        // comma the first one after `c3`, i.e. `c4 < c5`. Reads reach at most `end + 3`, which
+        // stays inside the input (`INPUT_TAIL` slack after every file).
+        let (kind, c4) = {
             let k4 = (p.add(ka) as *const u32).read_unaligned();
             let is_vc = ((k4 == u32::from_ne_bytes(*b"view")) | (k4 == u32::from_ne_bytes(*b"cart")))
                 & (*p.add(ka + 4 + kq) == b',');
@@ -209,8 +214,6 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
             } else {
                 return None;
             }
-        } else {
-            return None;
         };
         let pq = quoted(5, c4 + 1 < c5 && *p.add(c4 + 1) == b'"');
         let price = if kind == 2 {
@@ -364,9 +367,14 @@ fn parse_row_mid128<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
         let c0 = c_lo.trailing_zeros() as usize;
         let c1 = low1.trailing_zeros() as usize;
         let low2 = low1 & low1.wrapping_sub(1);
-        let c2_lo = low2.trailing_zeros() as usize;
-        let c2_hi = 64 + c_mid.trailing_zeros() as usize;
-        (c0, c1, if low2 != 0 { c2_lo } else { c2_hi })
+        // A (98%-predictable) branch rather than a cmov: the `c_mid` tzcnt competes for port 1
+        // with the row's other tzcnt/lzcnt/popcnt/pext/mulx ops.
+        let c2 = if low2 != 0 {
+            low2.trailing_zeros() as usize
+        } else {
+            64 + core::hint::black_box(c_mid).trailing_zeros() as usize
+        };
+        (c0, c1, c2)
     } else {
         let mut clo = c_lo;
         let mut cmid = c_mid;
@@ -392,7 +400,9 @@ fn parse_row_mid128<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
         let starts_hi = (c_mid << 1) | (c_lo >> 63);
         let a = _pext_u64(q_lo, starts_lo);
         let b = _pext_u64(q_mid, starts_hi);
-        Some((a | (b << starts_lo.count_ones())) as u8)
+        // popcnt(starts_lo) from the field-count popcnt(c_lo): one less port-1 op per row.
+        let n_lo = c_lo.count_ones() + 1 - (c_lo >> 63) as u32;
+        Some((a | (b << n_lo)) as u8)
     };
     #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
     let quotes = None;
@@ -1137,7 +1147,7 @@ mod tests {
                 uid_k,
                 uh,
                 uid_bytes: f[1],
-                product: f[5],
+                product: if kind == 0 { &[] } else { f[5] },
                 timestamp: dates.parse_ts(f[2]),
                 ing_day_ms,
                 ing_bcd,

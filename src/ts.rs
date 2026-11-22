@@ -470,7 +470,9 @@ impl DateCache {
     fn parse_f1_ingest_slow(b: &[u8]) -> (i64, u32) {
         match parse_f1_fast(b) {
             Some(ms) => (ms, INGEST_EXACT_I64),
-            None => (0, INGEST_NONE),
+            // `i64::MAX` makes every copy with an unparseable `ingest_ts` fail the sink's late
+            // check, so the per-row handler needs no separate `INGEST_NONE` test.
+            None => (i64::MAX, INGEST_NONE),
         }
     }
 

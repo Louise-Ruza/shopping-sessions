@@ -104,6 +104,11 @@ fn key_eq(a: u64, b: u64) -> bool {
 
 #[inline(never)]
 fn key_hash_slow(v: u64, seed: u64) -> u64 {
+    // +80 B placement pad (a jump over int3 filler, never executed) for the functions after this one.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("jmp 2f\n.skip 78, 0xcc\n2:", options(nomem, nostack, preserves_flags));
+    }
     crate::hash::hash(non_inline_bytes(v), seed)
 }
 
@@ -430,7 +435,8 @@ impl Key8 {
     fn pack_short_or_sentinel(s: &[u8], seed: u64) -> (Key8, u64) {
         let n = s.len();
         if n == 0 {
-            return (Key8::EMPTY, 0);
+            // Empty `user_id` -> sentinel: the event sink rejects it on its cold non-inline path.
+            return (Key8::NON_INLINE_SENTINEL, 0);
         }
         let mut v = (0x80u64 | n as u64) << 56;
         for (i, &b) in s.iter().enumerate() {

@@ -52,30 +52,16 @@ unsafe impl Send for SyncPtr {}
 // ---------------------------------------------------------------------------
 // mmap
 
-struct Mmap {
-    ptr: *const u8,
-    len: usize,
-}
+/// Readable bytes guaranteed after the end of every input file.
+const INPUT_TAIL: usize = 64;
 
-impl Mmap {
-    fn open(path: &Path) -> std::io::Result<Mmap> {
-        use std::os::unix::io::AsRawFd;
-        let f = std::fs::File::open(path)?;
-        let len = f.metadata()?.len() as usize;
-        if len == 0 {
-            return Ok(Mmap { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 });
-        }
-        let p = unsafe {
-            libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0)
-        };
-        if p == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Mmap { ptr: p as *const u8, len })
-    }
-    fn data(&self) -> &'static [u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
+/// Fallback for a file outside the input arena: a leaked heap copy with `INPUT_TAIL`
+/// readable bytes after its end.
+fn padded_copy(path: &Path) -> std::io::Result<&'static [u8]> {
+    let mut v = std::fs::read(path)?;
+    let len = v.len();
+    v.resize(len + INPUT_TAIL, 0);
+    Ok(&v.leak()[..len])
 }
 
 /// Reserves a single contiguous virtual address range sized to the input CSVs (`PROT_NONE`,
@@ -97,7 +83,7 @@ impl InputArena {
                 if let Ok(m) = std::fs::metadata(&p) {
                     let len = m.len() as usize;
                     if len > 0 {
-                        cap = cap.saturating_add((len + page - 1) & !(page - 1));
+                        cap = cap.saturating_add((len + INPUT_TAIL + page - 1) & !(page - 1));
                     }
                 }
             }
@@ -135,7 +121,8 @@ impl InputArena {
         if len == 0 {
             return Ok(&[]);
         }
-        let aligned = (len + self.page - 1) & !(self.page - 1);
+        let mapped = (len + self.page - 1) & !(self.page - 1);
+        let aligned = (len + INPUT_TAIL + self.page - 1) & !(self.page - 1);
         if self.base != 0 && self.cursor.saturating_add(aligned) <= self.cap {
             let addr = (self.base + self.cursor) as *mut libc::c_void;
             let p = unsafe {
@@ -149,11 +136,20 @@ impl InputArena {
                 )
             };
             if p != libc::MAP_FAILED {
+                if aligned > mapped {
+                    // Readable zero page after a file that ends within `INPUT_TAIL` bytes of a
+                    // page end, so parsers may read a few bytes past the last row.
+                    let tail = (self.base + self.cursor + mapped) as *mut libc::c_void;
+                    if unsafe { libc::mprotect(tail, aligned - mapped, libc::PROT_READ) } != 0 {
+                        unsafe { libc::munmap(addr, len) };
+                        return Ok(padded_copy(path)?);
+                    }
+                }
                 self.cursor += aligned;
                 return Ok(unsafe { std::slice::from_raw_parts(p as *const u8, len) });
             }
         }
-        Ok(Mmap::open(path)?.data())
+        padded_copy(path)
     }
 
     fn map_dir(&mut self, dir: &Path) -> Vec<&'static [u8]> {
@@ -529,9 +525,21 @@ fn encode_special_ingest(ing_bcd: u32, exact_ms: i64, oob: &Mutex<Vec<i64>>) -> 
     INGEST_OOB_BASE + idx
 }
 
+/// Inserts exactly `N` bytes (a 2-byte short jump over `N - 2` int3 bytes) to shift the
+/// placement of every function emitted after the enclosing one. Never executed past the jump.
+macro_rules! place_pad {
+    ($skip:literal) => {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!(concat!("jmp 2f\n.skip ", $skip, ", 0xcc\n2:"), options(nomem, nostack, preserves_flags));
+        }
+    };
+}
+
 #[cold]
 #[inline(never)]
 fn is_late_slow(ing_bcd: u32, ing_day_ms: i64, ts: i64) -> bool {
+    place_pad!(30); // +32 B: scan_avx2 / dedup_shard / scan_clicks placement
     let ing_ms = if ing_bcd < INGEST_OOB_BASE {
         ing_day_ms + bcd_hms_to_ms(ing_bcd)
     } else {
@@ -1189,6 +1197,7 @@ fn dedup_long_shard(
     base: i64,
     oob: &[i64],
 ) {
+    place_pad!(30); // +32 B: dedup_shard / scan_clicks placement
     let n = segs.len();
     if n < 2 {
         return;
@@ -4928,6 +4937,9 @@ fn push_other_event<'b>(
     ts_rel: u32,
     pc: u32,
 ) -> u32 {
+    if uid_bytes.is_empty() {
+        return arena::LOC_INVALID;
+    }
     let w = other_ev_w.get_or_insert_with(|| Scatter::<OtherPEv, 64, OTHER_SEG>::new_located(other_ev_set));
     arena::LOC_OTHER_BIT | w.push_with_loc(0, OtherPEv { person: Key8::new(uid_bytes), ts: ts_rel, pc })
 }
@@ -4960,6 +4972,9 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
     #[cold]
     #[inline(never)]
     fn push_long_purchase(&mut self, uid_bytes: &[u8], ts_rel: u32, product: &[u8], price: u32) -> u32 {
+        if uid_bytes.is_empty() {
+            return arena::LOC_INVALID;
+        }
         let pc = encode_purchase_pc(self.ctx, self.wide_ref, product, price);
         if pc == 0 {
             return arena::LOC_INVALID;
@@ -5011,11 +5026,11 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
         };
         let mut loc = arena::LOC_INVALID;
         'v: {
-            if ev.ing_bcd == INGEST_NONE
-                || ev.kind == 0
-                || ev.uid_k.is_empty()
-                || ev.product.is_empty()
-            {
+            // An unknown kind arrives with an empty `product`, and an unparseable ingest
+            // (`INGEST_NONE`) with `ing_day_ms == i64::MAX`, which the late check rejects.
+            // An empty `user_id` arrives as `NON_INLINE_SENTINEL` and is rejected in the cold
+            // `push_other_event` (or `push_long_purchase`), so the hot path tests only `product`.
+            if ev.product.is_empty() {
                 break 'v;
             }
             let ts = match ev.timestamp {
