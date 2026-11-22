@@ -1483,6 +1483,8 @@ struct Worker<'a> {
     ndays: usize,
     /// Co-located `(cnt, since)` per campaign (1 cacheline instead of 2 in `attribute_clicks`).
     camp_st: Vec<CampState>,
+    assisted_mask: Vec<u64>,
+    first_winner: [usize; 64],
     /// Pooled 2 MB THP block shared by `cells` + `cells_hi` + `purch_rev` (1 L1 dTLB entry!).
     acc_block: Option<(usize, u32)>,
     /// Transposed `[camp * ndays + day]` L1-tiny u8 counters (~56 KB for 2001x14), 2MB THP backed.
@@ -1541,6 +1543,8 @@ impl<'a> Worker<'a> {
             k1,
             ndays,
             camp_st: vec![CampState::default(); k1],
+            assisted_mask: vec![0; k1],
+            first_winner: [0; 64],
             acc_block,
             cells,
             cells_hi,
@@ -2255,6 +2259,10 @@ fn max_u32_cmov(mut a: u32, b: u32) -> u32 {
             }
             return;
         }
+        if nsess <= 64 {
+            self.attribute_session_mask(clicks);
+            return;
+        }
         if clicks.len() >= u16::MAX as usize || nsess >= u16::MAX as usize {
             self.attribute_clicks_wide(clicks, ctmp);
             return;
@@ -2316,6 +2324,60 @@ fn max_u32_cmov(mut a: u32, b: u32) -> u32 {
                 st.cnt = 0;
                 let a = st.since as u32;
                 self.close(k, a, nsess as u32);
+            }
+        }
+    }
+
+    // Session starts are sorted. All clicks that first become eligible at the
+    // same session compete for a single winner. The latest timestamp remains
+    // the best through later sessions until a new bucket wins or it expires.
+    #[inline(never)]
+    fn attribute_session_mask(&mut self, clicks: &[Cl24]) {
+        const WEEK: u32 = SEVEN_DAYS_MS as u32;
+        let mut starts = 0u64;
+        for (index, c) in clicks.iter().enumerate() {
+            let first = self.sess.partition_point(|s| s.start < c.ts);
+            let end = self.sess.partition_point(|s| s.start <= c.ts.saturating_add(WEEK));
+            if first == end {
+                continue;
+            }
+            let mask = (u64::MAX << first) & (u64::MAX >> (64 - end));
+            let seen = &mut self.assisted_mask[c.camp as usize];
+            if *seen == 0 {
+                self.touched.push(c.camp);
+            }
+            *seen |= mask;
+
+            let bit = 1u64 << first;
+            let slot = &mut self.first_winner[first];
+            if starts & bit == 0 {
+                starts |= bit;
+                *slot = index;
+            } else {
+                let prev = &clicks[*slot];
+                if c.ts > prev.ts || (c.ts == prev.ts && c.cid.cmp_bytes(&prev.cid).is_lt()) {
+                    *slot = index;
+                }
+            }
+        }
+        let mut credited = None;
+        for j in 0..self.sess.len() {
+            let session = self.sess[j];
+            self.day_end[session.day as usize] = j as u32 + 1;
+            if starts & (1u64 << j) != 0 {
+                credited = Some(&clicks[self.first_winner[j]]);
+            }
+            let camp = credited.filter(|c| session.start - c.ts <= WEEK).map_or(0, |c| c.camp);
+            self.add_session(camp as usize, session.day as usize, session.purch, session.rev);
+        }
+        while let Some(camp) = self.touched.pop() {
+            let mut remaining = std::mem::take(&mut self.assisted_mask[camp as usize]);
+            while remaining != 0 {
+                let first = remaining.trailing_zeros();
+                let len = (remaining >> first).trailing_ones();
+                self.close(camp as usize, first, first + len);
+                // Adding the lowest set bit carries across its whole run.
+                remaining &= remaining.wrapping_add(remaining & remaining.wrapping_neg());
             }
         }
     }
