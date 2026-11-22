@@ -533,6 +533,10 @@ pub fn scan<'a, S: EventSink<'a>>(data: &'a [u8], dates: &DateCache, f: S) {
         && is_x86_feature_detected!("pclmulqdq")
         && is_x86_feature_detected!("popcnt")
     {
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f") {
+            unsafe { scan_wide_masks(data, dates, f) };
+            return;
+        }
         unsafe { scan_avx2(data, dates, f) };
         return;
     }
@@ -569,6 +573,46 @@ unsafe fn handle_row_lo_avx2<'a, S: EventSink<'a>>(
         fallback(data.get_unchecked(..end + 1), dates, f);
     }
     end + 1
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx2,bmi1,bmi2,popcnt,pclmulqdq")]
+unsafe fn scan_wide_masks<'a, S: EventSink<'a>>(mut data: &'a [u8], dates: &DateCache, mut f: S) {
+    use core::arch::x86_64::*;
+    let parity = |q| _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(
+        _mm_cvtsi64_si128(q as i64), _mm_set1_epi64x(-1))) as u64;
+    while data.len() >= 128 {
+        let p = data.as_ptr();
+        _mm_prefetch(p.wrapping_add(512).cast(), _MM_HINT_T0);
+        _mm_prefetch(p.wrapping_add(576).cast(), _MM_HINT_T0);
+        let lo = _mm512_loadu_si512(p.cast());
+        let hi = _mm512_loadu_si512(p.add(64).cast());
+        let cm = _mm512_set1_epi8(b',' as i8);
+        let qt = _mm512_set1_epi8(b'"' as i8);
+        let nl = _mm512_set1_epi8(b'\n' as i8);
+        let (cl, ql, ll) = (_mm512_cmpeq_epi8_mask(lo, cm), _mm512_cmpeq_epi8_mask(lo, qt), _mm512_cmpeq_epi8_mask(lo, nl));
+        let (ch, qh, lh) = (_mm512_cmpeq_epi8_mask(hi, cm), _mm512_cmpeq_epi8_mask(hi, qt), _mm512_cmpeq_epi8_mask(hi, nl));
+        let bytes = &*p.cast::<[u8; 96]>();
+        let (end, event) = if ll != 0 {
+            let end = ll.trailing_zeros() as usize;
+            (end, parse_row_lo(bytes, end, cl, ql, dates, &parity, &f))
+        } else if lh != 0 {
+            let offset = lh.trailing_zeros() as usize;
+            let ev = if offset < 32 {
+                parse_row_hi(bytes, offset, cl, ch as u32, ql, qh as u32, dates, &parity, &f)
+            } else {
+                parse_row_mid128(data, offset, cl, ch, ql, qh, dates, &parity, &f)
+            };
+            (offset + 64, ev)
+        } else {
+            let used = handle_row_160_avx2(data, cl, ch, ql, qh, dates, &mut f);
+            data = &data[used..];
+            continue;
+        };
+        if let Some(ev) = event { f.on_event(ev); } else { fallback(&data[..=end], dates, &mut f); }
+        data = &data[end + 1..];
+    }
+    scan_avx2(data, dates, f);
 }
 
 /// Cold AVX2 handler for rare event rows >= 128 bytes (~1.5% of v5 rows: both IDs 33B).
