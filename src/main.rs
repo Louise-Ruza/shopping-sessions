@@ -189,6 +189,11 @@ pub(crate) struct Chunk {
 
 /// Splits every file's body (after its header line) into newline-aligned chunks.
 pub(crate) fn make_chunks(files: &[&'static [u8]], target: usize) -> Vec<Chunk> {
+    // +16 B after the row validator, restoring the click scanner offset.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("jmp 2f\n.skip 14, 0xcc\n2:", options(nomem, nostack, preserves_flags));
+    }
     let mut out = Vec::new();
     for &d in files {
         let start = match d.iter().position(|&c| c == b'\n') {
@@ -597,7 +602,7 @@ macro_rules! place_pad {
 #[cold]
 #[inline(never)]
 fn is_late_slow(ing_bcd: u32, ing_day_ms: i64, ts: i64) -> bool {
-    place_pad!(46); // +48 B: scan_avx2 placement
+    place_pad!(94); // +96 B: event scanner entry.
     let ing_ms = if ing_bcd < INGEST_OOB_BASE {
         ing_day_ms + bcd_hms_to_ms(ing_bcd)
     } else {
@@ -1351,7 +1356,7 @@ fn dedup_long_shard(
     base: i64,
     oob: &[i64],
 ) {
-    place_pad!(110); // +112 B: long-row scanner placement
+    place_pad!(126); // +128 B: following click scanner entries.
     let n = segs.len();
     if n < 2 {
         return;
@@ -2925,14 +2930,86 @@ struct HtEnt {
 
 const _: () = assert!(std::mem::size_of::<HtEnt>() == 16);
 
-/// 8-byte linked non-purchase event for hash-free Tier-2 solve.
+/// Up to three timestamps for one linked person. Canonical IDs are sharded
+/// before packing, so the top two bits of the local ID hold the length minus one.
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct LEv8 {
-    lpid: u32,
-    ts: u32,
+struct LinkedEvents {
+    packed: u32,
+    timestamps: [u32; 3],
 }
-const _: () = assert!(std::mem::size_of::<LEv8>() == 8);
+const _: () = assert!(std::mem::size_of::<LinkedEvents>() == 16);
+
+impl LinkedEvents {
+    const LEN_SHIFT: u32 = 30;
+
+    #[inline(always)]
+    fn lpid(self) -> usize {
+        (self.packed & ((1 << Self::LEN_SHIFT) - 1)) as usize
+    }
+
+    #[inline(always)]
+    fn len(self) -> u32 {
+        (self.packed >> Self::LEN_SHIFT) + 1
+    }
+
+    #[inline(always)]
+    unsafe fn write_timestamps(&self, dst: *mut u32, n: u32) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            use std::arch::x86_64::*;
+            let record = _mm_loadu_si128((self as *const Self).cast());
+            let values = _mm_srli_si128::<4>(record);
+            let mask = _mm_cmpgt_epi32(_mm_set1_epi32(n as i32), _mm_setr_epi32(0, 1, 2, 3));
+            _mm_maskstore_epi32(dst.cast(), mask, values);
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            dst.write(self.timestamps[0]);
+            if n > 1 {
+                dst.add(1).write(self.timestamps[1]);
+            }
+            if n > 2 {
+                dst.add(2).write(self.timestamps[2]);
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn forward_linked_events<const STAGE: usize>(
+    scatter: &mut Scatter<'_, LinkedEvents, STAGE>,
+    shard: usize,
+    lpid: u32,
+    timestamps: &[u32],
+) {
+    debug_assert!(lpid < (1 << LinkedEvents::LEN_SHIFT));
+    if timestamps.is_empty() {
+        return;
+    }
+    let n = (timestamps.len() - 1) / 3;
+    // Every call ends with one record containing 1–3 timestamps. Handle
+    // full and partial tails alike so a divisible length needs no branch.
+    let triples = unsafe { std::slice::from_raw_parts(timestamps.as_ptr().cast::<[u32; 3]>(), n) };
+    let tail = &timestamps[n * 3..];
+    let full = lpid | (2 << LinkedEvents::LEN_SHIFT);
+    scatter.push_mapped(shard, triples, |timestamps| LinkedEvents { packed: full, timestamps });
+    let packed = lpid | ((tail.len() as u32 - 1) << LinkedEvents::LEN_SHIFT);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let record = unsafe {
+        use std::arch::x86_64::*;
+        let mask = _mm_cmpgt_epi32(_mm_set1_epi32(tail.len() as i32), _mm_setr_epi32(0, 1, 2, 3));
+        let tail = _mm_maskload_epi32(tail.as_ptr().cast(), mask);
+        let lanes = _mm_or_si128(_mm_slli_si128::<4>(tail), _mm_cvtsi32_si128(packed as i32));
+        std::mem::transmute::<__m128i, LinkedEvents>(lanes)
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    let record = LinkedEvents {
+        packed,
+        timestamps: [tail[0], tail.get(1).copied().unwrap_or(0), tail.get(2).copied().unwrap_or(0)],
+    };
+    scatter.push(shard, record);
+}
 
 /// 16-byte linked purchase event for hash-free Tier-2 solve (~3% of linked events).
 #[derive(Clone, Copy)]
@@ -3548,6 +3625,7 @@ impl SolveScratch {
         wide_camps: bool,
         wide_cl: &Mutex<Vec<(u32, u32)>>,
     ) {
+        place_pad!(46); // +48 B: short Tier-1 entry.
         let nm = self.miss_clicks.len();
         if nm == 0 {
             return;
@@ -3596,7 +3674,7 @@ impl SolveScratch {
 
     /// Two-tier solve Tier 1: raw-uid shard. Resolves each distinct uid ONCE in `links`,
     /// solves truly unlinked users immediately in place, and forwards linked users'
-    /// non-purchases (`LEv8`), purchases (`LPurch`), and clicks (`LClick`) by dense `cid` to Tier 2.
+    /// non-purchases (`LinkedEvents`), purchases (`LPurch`), and clicks (`LClick`) by dense `cid` to Tier 2.
     #[allow(clippy::too_many_arguments)]
     fn run_tier1_shard<const EV_STAGE: usize, const P_STAGE: usize, const CL_STAGE: usize>(
         &mut self,
@@ -3605,7 +3683,7 @@ impl SolveScratch {
         cs: Segs<Click>,
         links: &LinkTable,
         w: &mut Worker<'_>,
-        lev_w: &mut Scatter<'_, LEv8, EV_STAGE>,
+        lev_w: &mut Scatter<'_, LinkedEvents, EV_STAGE>,
         lp_w: &mut Scatter<'_, LPurch, P_STAGE>,
         lcl_w: &mut Scatter<'_, LClick, CL_STAGE>,
         l_bits: u32,
@@ -3636,6 +3714,7 @@ impl SolveScratch {
         }
 
         if nev + npr >= u16::MAX as usize {
+            place_pad!(30); // +32 B: sessionizer entry.
             self.run_tier1_shard_wide(
                 es, ps, cs, links, w, lev_w, lp_w, lcl_w, l_bits, l_mask, wide_camps, wide_cl,
             );
@@ -3893,7 +3972,7 @@ impl SolveScratch {
         cs: Segs<Click>,
         links: &LinkTable,
         w: &mut Worker<'_>,
-        lev_w: &mut Scatter<'_, LEv8, EV_STAGE>,
+        lev_w: &mut Scatter<'_, LinkedEvents, EV_STAGE>,
         lp_w: &mut Scatter<'_, LPurch, P_STAGE>,
         lcl_w: &mut Scatter<'_, LClick, CL_STAGE>,
         l_bits: u32,
@@ -4057,7 +4136,7 @@ impl SolveScratch {
         ncl_kept: usize,
         links: &LinkTable,
         w: &mut Worker<'_>,
-        lev_w: &mut Scatter<'_, LEv8, EV_STAGE>,
+        lev_w: &mut Scatter<'_, LinkedEvents, EV_STAGE>,
         lp_w: &mut Scatter<'_, LPurch, P_STAGE>,
         lcl_w: &mut Scatter<'_, LClick, CL_STAGE>,
         l_bits: u32,
@@ -4133,7 +4212,7 @@ impl SolveScratch {
                 let (sh, lpid) = cid_to_shard_lpid(cid, l_bits, l_mask);
                 let ts_slice = unsafe { std::slice::from_raw_parts(eo_base.add(es0), es1 - es0) };
                 if !ts_slice.is_empty() {
-                    lev_w.push_mapped(sh, ts_slice, |ts| LEv8 { lpid, ts });
+                    forward_linked_events(lev_w, sh, lpid, ts_slice);
                 }
                 if !purch_slice.is_empty() {
                     lp_w.push_mapped(sh, purch_slice, |(ts, pc)| LPurch { lpid, ts, pc, _pad: 0 });
@@ -4232,7 +4311,7 @@ impl SolveScratch {
         lcs: Segs<LongClick>,
         links: &LinkTable,
         w: &mut Worker<'_>,
-        lev_w: &mut Scatter<'_, LEv8, EV_STAGE>,
+        lev_w: &mut Scatter<'_, LinkedEvents, EV_STAGE>,
         lp_w: &mut Scatter<'_, LPurch, P_STAGE>,
         lcl_w: &mut Scatter<'_, LClick, CL_STAGE>,
         l_bits: u32,
@@ -4603,7 +4682,7 @@ impl SolveScratch {
                 let (sh, lpid) = cid_to_shard_lpid(cid, l_bits, l_mask);
                 let ts_slice = unsafe { std::slice::from_raw_parts(eo_base.add(es0), es1 - es0) };
                 if !ts_slice.is_empty() {
-                    lev_w.push_mapped(sh, ts_slice, |ts| LEv8 { lpid, ts });
+                    forward_linked_events(lev_w, sh, lpid, ts_slice);
                 }
                 if !purch_slice.is_empty() {
                     lp_w.push_mapped(sh, purch_slice, |(ts, pc)| LPurch { lpid, ts, pc, _pad: 0 });
@@ -4643,7 +4722,7 @@ impl SolveScratch {
         ocs: Segs<Click>,
         links: &LinkTable,
         w: &mut Worker<'_>,
-        lev_w: &mut Scatter<'_, LEv8, EV_STAGE>,
+        lev_w: &mut Scatter<'_, LinkedEvents, EV_STAGE>,
         lp_w: &mut Scatter<'_, LPurch, P_STAGE>,
         lcl_w: &mut Scatter<'_, LClick, CL_STAGE>,
         l_bits: u32,
@@ -4710,7 +4789,7 @@ impl SolveScratch {
             if let Some(cid) = cid {
                 let (sh, lpid) = cid_to_shard_lpid(cid, l_bits, l_mask);
                 if !evs[idx].is_empty() {
-                    lev_w.push_mapped(sh, &evs[idx], |ts| LEv8 { lpid, ts });
+                    forward_linked_events(lev_w, sh, lpid, &evs[idx]);
                 }
                 if !purchs[idx].is_empty() {
                     lp_w.push_mapped(sh, &purchs[idx], |(ts, pc)| LPurch { lpid, ts, pc, _pad: 0 });
@@ -4735,15 +4814,15 @@ impl SolveScratch {
         sh: usize,
         l_bits: u32,
         links: &LinkTable,
-        es: Segs<LEv8>,
+        es: Segs<LinkedEvents>,
         ps: Segs<LPurch>,
         cs: Segs<LClick>,
         wide_cl: &[(u32, u32)],
         w: &mut Worker<'_>,
     ) {
-        let nev = es.len();
+        let nrecords = es.len();
         let npurch = ps.len();
-        if nev == 0 && npurch == 0 {
+        if nrecords == 0 && npurch == 0 {
             es.free();
             ps.free();
             cs.free();
@@ -4757,14 +4836,14 @@ impl SolveScratch {
             return;
         }
 
-        // Step 1: Count & scatter 8-byte non-purchase events directly by L1D-resident `lpid`.
+        // Step 1: Count and scatter timestamps directly by L1D-resident `lpid`.
         self.ev_off.clear();
         self.ev_off.resize(local_np + 1, 0);
-        if nev > 0 {
+        if nrecords > 0 {
             let off_ptr = self.ev_off.as_mut_ptr();
             for seg in es.iter() {
                 for e in seg {
-                    unsafe { *off_ptr.add(e.lpid as usize) += 1 };
+                    unsafe { *off_ptr.add(e.lpid()) += e.len() };
                 }
             }
             let mut sum = 0u32;
@@ -4784,7 +4863,7 @@ impl SolveScratch {
                 *off_ptr.add(local_np) = sum;
             }
             self.ev_ts.clear();
-            self.ev_ts.reserve_uninit(nev);
+            self.ev_ts.reserve_uninit(sum as usize + 3);
             let eo = self.ev_ts.as_mut_ptr();
             let cur_ptr = self.ev_cur.as_mut_ptr();
             const PF: usize = 8;
@@ -4793,21 +4872,23 @@ impl SolveScratch {
                 let main_end = slen.saturating_sub(PF);
                 for ri in 0..main_end {
                     unsafe {
-                        let flpid = seg.get_unchecked(ri + PF).lpid as usize;
+                        let flpid = seg.get_unchecked(ri + PF).lpid();
                         let fdst = *cur_ptr.add(flpid) as usize;
                         prefetch(eo.add(fdst) as *const u8);
                         let e = seg.get_unchecked(ri);
-                        let dst = cur_ptr.add(e.lpid as usize);
-                        eo.add(*dst as usize).write(e.ts);
-                        *dst += 1;
+                        let dst = cur_ptr.add(e.lpid());
+                        let n = e.len();
+                        e.write_timestamps(eo.add(*dst as usize), n);
+                        *dst += n;
                     }
                 }
                 for ri in main_end..slen {
                     unsafe {
                         let e = seg.get_unchecked(ri);
-                        let dst = cur_ptr.add(e.lpid as usize);
-                        eo.add(*dst as usize).write(e.ts);
-                        *dst += 1;
+                        let dst = cur_ptr.add(e.lpid());
+                        let n = e.len();
+                        e.write_timestamps(eo.add(*dst as usize), n);
+                        *dst += n;
                     }
                 }
             }
@@ -5393,7 +5474,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
         let base_day_ms = ctx.dates.base_day_ms;
         par(threads, |_| {
             if ID_BITS == 9 {
-                place_pad!(30); // +32 B: following short dedup entry.
+                place_pad!(46); // +48 B: following short dedup entry.
             }
             let mut buckets16: HugeBuf<DedupBucket16> = HugeBuf::empty();
             let mut buckets32: Vec<DedupBucket> = Vec::new();
@@ -5498,7 +5579,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
     let links = &links_owned;
 
     // ---- Two-tier solve: Tier 1 resolves distinct uids once, solves unlinked in place,
-    // forwards linked by dense cid (8B LEv8 + 16B LPurch + 16B LClick) to hash-free Tier 2!
+    // forwards linked records by dense cid to hash-free Tier 2.
     // Schedule short shards (`0..p_shards`) and long shards (`p_shards..p_shards+long_p_shards`)
     // together longest-job-first for optimal multi-core balance!
     let mut order: Vec<(usize, usize)> = Vec::with_capacity(p_shards + long_p_shards);
@@ -5521,7 +5602,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
     let l_shards = 1usize << l_bits;
     let l_mask = l_shards - 1;
     let wide_camps = ctx.camp_ids.len() >= 65_536;
-    let linked_ev_set: ShardSet<LEv8> = ShardSet::new_shared(l_shards);
+    let linked_ev_set: ShardSet<LinkedEvents> = ShardSet::new_shared(l_shards);
     let linked_p_set: ShardSet<LPurch> = ShardSet::new_shared(l_shards);
     let linked_cl_set: ShardSet<LClick> = ShardSet::new_shared(l_shards);
     let wide_cl_mu: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
@@ -5536,7 +5617,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
         let mut sc = SolveScratch::new();
         {
             let mut scatter_meta = arena::ScatterMetaPool::new();
-            let mut lev_w = Scatter::<LEv8, 128>::new_in(&linked_ev_set, &mut scatter_meta);
+            let mut lev_w = Scatter::<LinkedEvents, 128>::new_in(&linked_ev_set, &mut scatter_meta);
             let mut lp_w = Scatter::<LPurch, 64>::new_in(&linked_p_set, &mut scatter_meta);
             let mut lcl_w = Scatter::<LClick, 128>::new_in(&linked_cl_set, &mut scatter_meta);
             loop {
@@ -5618,7 +5699,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                     .map(|p| {
                         (
                             p,
-                            (linked_ev_set.count(p) + linked_p_set.count(p)) * 2 + linked_cl_set.count(p),
+                            linked_ev_set.count(p) * 6 + linked_p_set.count(p) * 2 + linked_cl_set.count(p),
                         )
                     })
                     .filter(|x| x.1 > 0)
@@ -5664,6 +5745,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
 }
 
 fn main() {
+    place_pad!(46); // +48 B: long Tier-1 entry.
     let t0 = Instant::now();
     let mut marks: Vec<(&str, f64)> = Vec::new();
     let mut last = t0;
