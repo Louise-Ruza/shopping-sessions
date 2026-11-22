@@ -582,23 +582,73 @@ struct PPurch {
     pc: u32,
 }
 
+/// Compact 24-byte event record for lossless 128-bit packed `'u'+32-lower-hex` `user_id`s
+/// (100% of v5 long IDs): 2.67x smaller than 64B inline-string records, buffered in 192B
+/// (8-record, 3-cacheline) NT staging slots, and compared as 2 `u64`s with ZERO CSV reads!
+/// `ts == u32::MAX` marks a deduplicated-away TOMBSTONE (impossible for valid `ts_rel`).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LongPEv {
+    lo: u64,
+    hi: u64,
+    ts: u32,
+    pc: u32, // 0 = non-purchase (view/cart); nonzero = purchase price/cat
+}
+
+/// Compact 32-byte click record for lossless 128-bit packed `'u'+32-lower-hex` `user_id`s
+/// (2x smaller than 64B, buffered in 128B 4-record NT staging slots).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LongClick {
+    lo: u64,
+    hi: u64,
+    cid: CKey,
+    ts: u32,
+    camp: u32,
+}
+
+/// 16-byte event record for arbitrary non-hex non-inline `user_id`s (0% of v5; lazy fallback).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct OtherPEv {
+    person: Key8,
+    ts: u32,
+    pc: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<LongPEv>() == 24);
+const _: () = assert!(std::mem::size_of::<LongClick>() == 32);
+const _: () = assert!(std::mem::size_of::<OtherPEv>() == 16);
+
 #[inline(always)]
 unsafe fn prefetch_ev_loc(loc: u32) {
-    if (loc & arena::LOC_PURCH_BIT) == 0 {
+    let tag = loc & arena::LOC_OTHER_BIT;
+    if tag == 0 {
         prefetch(arena::loc_ptr12::<PEv12>(loc) as *const u8);
+    } else if tag == arena::LOC_LONG_BIT {
+        prefetch(arena::loc_ptr24::<LongPEv>(loc) as *const u8);
+    } else if tag == arena::LOC_PURCH_BIT {
+        prefetch(arena::loc_ptr::<PPurch>(loc & 0x3FFF_FFFF) as *const u8);
     } else {
-        prefetch(arena::loc_ptr::<PPurch>(loc & !arena::LOC_PURCH_BIT) as *const u8);
+        prefetch(arena::loc_ptr::<OtherPEv>(loc & 0x3FFF_FFFF) as *const u8);
     }
 }
 
 #[inline(always)]
 unsafe fn tombstone_ev_loc(loc: u32) {
-    if (loc & arena::LOC_PURCH_BIT) == 0 {
+    let tag = loc & arena::LOC_OTHER_BIT;
+    if tag == 0 {
         let pev = arena::loc_ptr12::<PEv12>(loc);
         std::ptr::addr_of_mut!((*pev).person).write_unaligned(Key8::TOMBSTONE);
-    } else {
-        let pp = arena::loc_ptr::<PPurch>(loc & !arena::LOC_PURCH_BIT);
+    } else if tag == arena::LOC_LONG_BIT {
+        let le = arena::loc_ptr24::<LongPEv>(loc);
+        std::ptr::addr_of_mut!((*le).ts).write(u32::MAX);
+    } else if tag == arena::LOC_PURCH_BIT {
+        let pp = arena::loc_ptr::<PPurch>(loc & 0x3FFF_FFFF);
         std::ptr::addr_of_mut!((*pp).person).write(Key8::TOMBSTONE);
+    } else {
+        let oe = arena::loc_ptr::<OtherPEv>(loc & 0x3FFF_FFFF);
+        std::ptr::addr_of_mut!((*oe).person).write(Key8::TOMBSTONE);
     }
 }
 
@@ -880,7 +930,7 @@ fn dedup_shard(
         let slen = seg.len();
         let pre = slen.min(PF);
         for ri in 0..pre {
-            let h = unsafe { seg.get_unchecked(ri).eid.hash(SEED_ID) };
+            let h = key::mum(unsafe { seg.get_unchecked(ri).eid.0 } ^ SEED_ID, key::P0);
             let bi = fast_bucket(h, nbuckets);
             bring[ri] = (bi as u32, (h as u16) | 1);
             prefetch(unsafe { bptr.add(bi) } as *const u8);
@@ -888,7 +938,7 @@ fn dedup_shard(
         let main_end = slen.saturating_sub(PF);
         for ri in 0..main_end {
             let (bi0, tag) = bring[ri & (PF - 1)];
-            let fh = unsafe { seg.get_unchecked(ri + PF).eid.hash(SEED_ID) };
+            let fh = key::mum(unsafe { seg.get_unchecked(ri + PF).eid.0 } ^ SEED_ID, key::P0);
             let fbi = fast_bucket(fh, nbuckets);
             bring[(ri + PF) & (PF - 1)] = (fbi as u32, (fh as u16) | 1);
             prefetch(unsafe { bptr.add(fbi) } as *const u8);
@@ -912,7 +962,7 @@ fn dedup_shard(
                         let os = *seg_meta.add(osi);
                         let o = &*(os.ptr as *const DedupRec).add(ori);
                         let r = seg.get_unchecked(ri);
-                        if o.eid == r.eid {
+                        if o.eid.0 == r.eid.0 {
                             let loser_loc = if ingest_less(r.ingest, o.ingest, base, oob) {
                                 *(*bkt).pos.get_unchecked_mut(lane) = me;
                                 o.loc
@@ -961,7 +1011,7 @@ fn dedup_shard(
                         let os = *seg_meta.add(osi);
                         let o = &*(os.ptr as *const DedupRec).add(ori);
                         let r = seg.get_unchecked(ri);
-                        if o.eid == r.eid {
+                        if o.eid.0 == r.eid.0 {
                             let loser_loc = if ingest_less(r.ingest, o.ingest, base, oob) {
                                 *(*bkt).pos.get_unchecked_mut(lane) = me;
                                 o.loc
@@ -1500,6 +1550,14 @@ impl<'a> Worker<'a> {
             self.roll_user_file();
         }
         self.ud.begin_person(person, &mut self.carver);
+    }
+
+    #[inline(always)]
+    fn begin_person_bytes(&mut self, bytes: &[u8]) {
+        if self.ud.len() >= MAX_ROWS_PER_FILE {
+            self.roll_user_file();
+        }
+        self.ud.begin_person_bytes(bytes, &mut self.carver);
     }
 
     #[inline(always)]
@@ -2663,6 +2721,16 @@ impl Drop for Worker<'_> {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
+struct LongHtEnt {
+    lo: u64,
+    hi: u64,
+    pid: u32, // 0 = empty; 1..np = index into `long_pkeys`
+    cnt: u32,
+}
+const _: () = assert!(std::mem::size_of::<LongHtEnt>() == 32);
+
 struct SolveScratch {
     /// Pooled 2 MB THP block shared by `ht` (512 KB) + `ev_ts` (640 KB) + `ev_pids16` (256 KB) + `cls` (640 KB).
     /// Keeps all 4 hot per-shard tables in ONE L1 dTLB entry and cuts solve THP blocks 7->2 per worker!
@@ -2670,6 +2738,11 @@ struct SolveScratch {
     ht: HugeBuf<HtEnt>,
     ht_mask: usize,
     pkeys: Vec<(Key8, u64)>,
+    long_ht: Vec<LongHtEnt>,
+    long_ht_mask: usize,
+    long_pkeys: Vec<(u64, u64)>,
+    long_strs: Vec<[u8; 33]>,
+    long_miss: Vec<(CKey, u32, u32, u64, [u8; 33])>,
     canon: Vec<u32>,
     link_probe: Vec<(u32, u64)>,
     miss_clicks: Vec<(Click, u64)>,
@@ -2714,6 +2787,11 @@ impl SolveScratch {
             ht,
             ht_mask: 0,
             pkeys: Vec::new(),
+            long_ht: Vec::new(),
+            long_ht_mask: 0,
+            long_pkeys: Vec::new(),
+            long_strs: Vec::new(),
+            long_miss: Vec::new(),
             canon: Vec::new(),
             link_probe: Vec::new(),
             miss_clicks: Vec::new(),
@@ -2811,26 +2889,61 @@ impl SolveScratch {
         w.end_person();
     }
 
+    #[inline(always)]
+    fn solve_person_bytes(
+        bytes: &[u8],
+        ts_slice: &mut [u32],
+        purch_slice: &[(u32, u32)],
+        cls_slice: &mut [Cl24],
+        w: &mut Worker<'_>,
+        ctmp: &mut Vec<Cl24>,
+    ) {
+        let tot = ts_slice.len() + purch_slice.len();
+        w.begin_person_bytes(bytes);
+        if tot >= BIN_AGG_MIN_EVENTS {
+            w.person_binned(ts_slice, purch_slice, cls_slice, ctmp);
+        } else if purch_slice.is_empty() {
+            sort_person_ts(ts_slice);
+            w.person_no_purch(ts_slice, cls_slice, ctmp);
+        } else {
+            let mut tmp = [Ev8(0); BIN_AGG_MIN_EVENTS];
+            let mut k = 0usize;
+            for &ts in ts_slice.iter() {
+                unsafe { *tmp.get_unchecked_mut(k) = Ev8::new(ts, 0) };
+                k += 1;
+            }
+            for &(ts, pc) in purch_slice {
+                unsafe { *tmp.get_unchecked_mut(k) = Ev8::new(ts, pc) };
+                k += 1;
+            }
+            let sl = unsafe { tmp.get_unchecked_mut(..tot) };
+            sort_person_events(sl);
+            w.person(sl, cls_slice, ctmp);
+        }
+        w.end_person();
+    }
+
     fn reset_ht(&mut self, cap: usize) {
         self.ht.reset_zeroed(cap);
         self.ht_mask = cap - 1;
         // Pre-reserve pid=0 for `Key8::TOMBSTONE` so deduplicated-away `PEv`s route
         // branchlessly into slot 0 in both Pass 1 and Pass 2 (zero unpredictable branches!).
-        let th = Key8::TOMBSTONE.hash(SEED_A) as usize & self.ht_mask;
+        let th = key::mum(Key8::TOMBSTONE.0 ^ SEED_A, key::P0) as usize & self.ht_mask;
         self.ht[th] = HtEnt { key: Key8::TOMBSTONE, pid: 0, cnt: 0 };
     }
 
     #[inline(always)]
     fn intern(&mut self, person: Key8, h: u64) -> u32 {
+        // Short Tier-1 `ev_set`/`purch_set` contain 100% inline Key8s -> pure u64 compare!
         let mask = self.ht_mask;
         let mut i = h as usize & mask;
         loop {
             let e = unsafe { self.ht.get_unchecked_mut(i) };
-            if e.key == person {
+            if e.key.0 == person.0 {
                 e.cnt += 1;
                 return e.pid;
             }
-            if e.key.is_empty() {
+            if e.key.0 == 0 {
                 let pid = self.pkeys.len() as u32;
                 self.pkeys.push((person, h));
                 *e = HtEnt { key: person, pid, cnt: 1 };
@@ -2849,10 +2962,10 @@ impl SolveScratch {
         let mut i = h as usize & mask;
         loop {
             let e = unsafe { self.ht.get_unchecked_mut(i) };
-            if e.key == person {
+            if e.key.0 == person.0 {
                 return e.pid;
             }
-            if e.key.is_empty() {
+            if e.key.0 == 0 {
                 let pid = self.pkeys.len() as u32;
                 self.pkeys.push((person, h));
                 *e = HtEnt { key: person, pid, cnt: 0 };
@@ -2870,10 +2983,10 @@ impl SolveScratch {
         self.raw_purch.clear();
         for seg in ps.iter() {
             for p in seg {
-                if p.person == Key8::TOMBSTONE {
+                if p.person.0 == Key8::TOMBSTONE.0 {
                     continue;
                 }
-                let h = p.person.hash(SEED_A);
+                let h = key::mum(p.person.0 ^ SEED_A, key::P0);
                 let pid = self.intern_no_inc(p.person, h);
                 self.raw_purch.push(RawPurch { pid, ts: p.ts, pc: p.pc });
             }
@@ -2889,9 +3002,9 @@ impl SolveScratch {
         self.ht_mask = new_cap - 1;
         let mask = self.ht_mask;
         for &e in old.iter() {
-            if !e.key.is_empty() {
-                let mut i = e.key.hash(SEED_A) as usize & mask;
-                while !self.ht[i].key.is_empty() {
+            if e.key.0 != 0 {
+                let mut i = key::mum(e.key.0 ^ SEED_A, key::P0) as usize & mask;
+                while self.ht[i].key.0 != 0 {
                     i = (i + 1) & mask;
                 }
                 self.ht[i] = e;
@@ -2905,10 +3018,10 @@ impl SolveScratch {
         let mut i = phash as usize & mask;
         loop {
             let e = unsafe { self.ht.get_unchecked(i) };
-            if e.key == person {
+            if e.key.0 == person.0 {
                 return Some(e.pid);
             }
-            if e.key.is_empty() {
+            if e.key.0 == 0 {
                 return None;
             }
             i = (i + 1) & mask;
@@ -2941,7 +3054,7 @@ impl SolveScratch {
             let pre = slen.min(PF);
             for ri in 0..pre {
                 let person = unsafe { seg.get_unchecked(ri).person };
-                let h = person.hash(SEED_A);
+                let h = key::mum(person.0 ^ SEED_A, key::P0);
                 hring[ri] = h;
                 prefetch(unsafe { self.ht.as_ptr().add(h as usize & self.ht_mask) } as *const u8);
             }
@@ -2949,7 +3062,7 @@ impl SolveScratch {
                 let h = hring[ri & (PF - 1)];
                 if ri + PF < slen {
                     let fperson = unsafe { seg.get_unchecked(ri + PF).person };
-                    let fh = fperson.hash(SEED_A);
+                    let fh = key::mum(fperson.0 ^ SEED_A, key::P0);
                     hring[(ri + PF) & (PF - 1)] = fh;
                     prefetch(unsafe { self.ht.as_ptr().add(fh as usize & self.ht_mask) } as *const u8);
                 }
@@ -3034,14 +3147,14 @@ impl SolveScratch {
                 let slen = seg.len();
                 let pre = slen.min(PF);
                 for ri in 0..pre {
-                    let h = unsafe { seg.get_unchecked(ri).person.hash(SEED_A) };
+                    let h = key::mum(unsafe { seg.get_unchecked(ri).person.0 } ^ SEED_A, key::P0);
                     hring[ri] = h;
                     prefetch(unsafe { ht_ptr.add(h as usize & ht_mask) } as *const u8);
                 }
                 for ri in 0..slen {
                     let h = hring[ri & (PF - 1)];
                     if ri + PF < slen {
-                        let fh = unsafe { seg.get_unchecked(ri + PF).person.hash(SEED_A) };
+                        let fh = key::mum(unsafe { seg.get_unchecked(ri + PF).person.0 } ^ SEED_A, key::P0);
                         hring[(ri + PF) & (PF - 1)] = fh;
                         prefetch(unsafe { ht_ptr.add(fh as usize & ht_mask) } as *const u8);
                     }
@@ -3166,7 +3279,7 @@ impl SolveScratch {
             }
             let idx = unsafe { *self.miss_probe.get_unchecked(j) as usize };
             let (c, h) = unsafe { *self.miss_clicks.get_unchecked(idx) };
-            if let Some(cid) = links.lookup(h, c.person) {
+            if let Some(cid) = links.lookup_inline(h, c.person) {
                 let (sh, lpid) = cid_to_shard_lpid(cid, l_bits, l_mask);
                 let packed = if lpid < 32_768 && !wide_camps {
                     (lpid << 16) | c.camp
@@ -3234,33 +3347,25 @@ impl SolveScratch {
         self.ev_pids16.clear();
         self.ev_pids16.reserve_uninit(nev);
 
-        // Pass 1 over 12B non-purchase events: 2-stage prefetch (PF_REF=16 for long mmap uids, PF=8 for ht)
+        // Pass 1 over 12B non-purchase events: 100% inline Key8s -> pure mum + u64 compare!
         const PF: usize = 8;
-        const PF_REF: usize = 16;
         let mut hring = [0u64; PF];
         let pid_out = self.ev_pids16.as_mut_ptr();
         let mut pk = 0usize;
         for seg in es.iter() {
             let slen = seg.len();
-            let pre_ref = slen.min(PF_REF);
-            for ri in 0..pre_ref {
-                let p = unsafe { seg.get_unchecked(ri).person };
-                p.prefetch_ref();
-            }
             let pre = slen.min(PF);
             for ri in 0..pre {
                 let person = unsafe { seg.get_unchecked(ri).person };
-                let h = person.hash(SEED_A);
+                let h = key::mum(person.0 ^ SEED_A, key::P0);
                 hring[ri] = h;
                 prefetch(unsafe { self.ht.as_ptr().add(h as usize & self.ht_mask) } as *const u8);
             }
-            let main_end = slen.saturating_sub(PF_REF);
+            let main_end = slen.saturating_sub(PF);
             for ri in 0..main_end {
-                let rp = unsafe { seg.get_unchecked(ri + PF_REF).person };
-                rp.prefetch_ref();
                 let h = hring[ri & (PF - 1)];
                 let fperson = unsafe { seg.get_unchecked(ri + PF).person };
-                let fh = fperson.hash(SEED_A);
+                let fh = key::mum(fperson.0 ^ SEED_A, key::P0);
                 hring[(ri + PF) & (PF - 1)] = fh;
                 prefetch(unsafe { self.ht.as_ptr().add(fh as usize & self.ht_mask) } as *const u8);
                 let person = unsafe { seg.get_unchecked(ri).person };
@@ -3268,19 +3373,7 @@ impl SolveScratch {
                 unsafe { pid_out.add(pk).write(pid as u16) };
                 pk += 1;
             }
-            let tail_pf = slen.saturating_sub(PF);
-            for ri in main_end..tail_pf {
-                let h = hring[ri & (PF - 1)];
-                let fperson = unsafe { seg.get_unchecked(ri + PF).person };
-                let fh = fperson.hash(SEED_A);
-                hring[(ri + PF) & (PF - 1)] = fh;
-                prefetch(unsafe { self.ht.as_ptr().add(fh as usize & self.ht_mask) } as *const u8);
-                let person = unsafe { seg.get_unchecked(ri).person };
-                let pid = self.intern(person, h);
-                unsafe { pid_out.add(pk).write(pid as u16) };
-                pk += 1;
-            }
-            for ri in tail_pf..slen {
+            for ri in main_end..slen {
                 let h = hring[ri & (PF - 1)];
                 let person = unsafe { seg.get_unchecked(ri).person };
                 let pid = self.intern(person, h);
@@ -3382,23 +3475,16 @@ impl SolveScratch {
             let mut ck = 0usize;
             for seg in cs.iter() {
                 let slen = seg.len();
-                let pre_ref = slen.min(PF_REF);
-                for ri in 0..pre_ref {
-                    unsafe { seg.get_unchecked(ri).person.prefetch_ref() };
-                }
                 let pre = slen.min(PF);
                 for ri in 0..pre {
-                    let h = unsafe { seg.get_unchecked(ri).person.hash(SEED_A) };
+                    let h = key::mum(unsafe { seg.get_unchecked(ri).person.0 } ^ SEED_A, key::P0);
                     hring[ri] = h;
                     prefetch(unsafe { ht_ptr.add(h as usize & ht_mask) } as *const u8);
                 }
                 let main_end = slen.saturating_sub(PF);
                 for ri in 0..main_end {
-                    if ri + PF_REF < slen {
-                        unsafe { seg.get_unchecked(ri + PF_REF).person.prefetch_ref() };
-                    }
                     let h = hring[ri & (PF - 1)];
-                    let fh = unsafe { seg.get_unchecked(ri + PF).person.hash(SEED_A) };
+                    let fh = key::mum(unsafe { seg.get_unchecked(ri + PF).person.0 } ^ SEED_A, key::P0);
                     hring[(ri + PF) & (PF - 1)] = fh;
                     prefetch(unsafe { ht_ptr.add(fh as usize & ht_mask) } as *const u8);
                     let c = unsafe { seg.get_unchecked(ri) };
@@ -3527,7 +3613,7 @@ impl SolveScratch {
         for seg in es.iter() {
             for e in seg {
                 let person = e.person;
-                let h = person.hash(SEED_A);
+                let h = key::mum(person.0 ^ SEED_A, key::P0);
                 let pid = self.intern(person, h);
                 unsafe { pid_out.add(pk).write(pid) };
                 pk += 1;
@@ -3541,7 +3627,7 @@ impl SolveScratch {
                 self.miss_clicks.clear();
                 for seg in cs.iter() {
                     for &c in seg {
-                        self.miss_clicks.push((c, c.person.hash(SEED_A)));
+                        self.miss_clicks.push((c, key::mum(c.person.0 ^ SEED_A, key::P0)));
                     }
                 }
                 self.flush_miss_clicks(links, lcl_w, l_bits, l_mask, wide_camps, wide_cl);
@@ -3604,7 +3690,7 @@ impl SolveScratch {
             let mut ck = 0usize;
             for seg in cs.iter() {
                 for c in seg {
-                    let h = c.person.hash(SEED_A);
+                    let h = key::mum(c.person.0 ^ SEED_A, key::P0);
                     if let Some(pid) = self.lookup(c.person, h) {
                         unsafe {
                             clp_out.add(ck).write(pid);
@@ -3712,7 +3798,7 @@ impl SolveScratch {
             }
             let (pid, h) = unsafe { *self.link_probe.get_unchecked(j) };
             let uid = unsafe { self.pkeys.get_unchecked(pid as usize).0 };
-            if let Some(cid) = links.lookup(h, uid) {
+            if let Some(cid) = links.lookup_inline(h, uid) {
                 unsafe { *self.canon.get_unchecked_mut(pid as usize) = cid };
             }
         }
@@ -3771,6 +3857,571 @@ impl SolveScratch {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_long_ht(&mut self) {
+        let new_cap = (self.long_ht.len() * 2).max(128);
+        let old = std::mem::replace(&mut self.long_ht, vec![LongHtEnt::default(); new_cap]);
+        self.long_ht_mask = new_cap - 1;
+        let mask = self.long_ht_mask;
+        for e in old {
+            if e.pid != 0 {
+                let mut i = key::hash_hex128(e.lo, e.hi, SEED_A) as usize & mask;
+                while self.long_ht[i].pid != 0 {
+                    i = (i + 1) & mask;
+                }
+                self.long_ht[i] = e;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn intern_long(&mut self, lo: u64, hi: u64, h: u64, inc_non_purch: bool) -> u32 {
+        let mask = self.long_ht_mask;
+        let mut i = h as usize & mask;
+        loop {
+            let e = unsafe { self.long_ht.get_unchecked_mut(i) };
+            if e.pid != 0 {
+                if e.lo == lo && e.hi == hi {
+                    if inc_non_purch {
+                        e.cnt += 1;
+                    }
+                    return e.pid;
+                }
+            } else {
+                let pid = self.long_pkeys.len() as u32;
+                self.long_pkeys.push((lo, hi));
+                *e = LongHtEnt { lo, hi, pid, cnt: u32::from(inc_non_purch) };
+                if self.long_pkeys.len() * 2 >= self.long_ht.len() {
+                    self.grow_long_ht();
+                }
+                return pid;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[inline(always)]
+    fn lookup_long(&self, lo: u64, hi: u64, h: u64) -> Option<u32> {
+        let mask = self.long_ht_mask;
+        let mut i = h as usize & mask;
+        loop {
+            let e = unsafe { self.long_ht.get_unchecked(i) };
+            if e.pid == 0 {
+                return None;
+            }
+            if e.lo == lo && e.hi == hi {
+                return Some(e.pid);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// L1-resident Tier-1 solve for the disjoint 128-bit packed `'u'+32-hex` stream (`LongPEv` + `LongClick`).
+    /// Zero pointer chasing, zero `memcmp` on hits, 8-ahead prefetch, and 1x hex decode per distinct user!
+    #[allow(clippy::too_many_arguments)]
+    fn run_long_tier1_shard<const EV_STAGE: usize, const P_STAGE: usize, const CL_STAGE: usize>(
+        &mut self,
+        les: Segs<LongPEv>,
+        lcs: Segs<LongClick>,
+        links: &LinkTable,
+        w: &mut Worker<'_>,
+        lev_w: &mut Scatter<'_, LEv8, EV_STAGE>,
+        lp_w: &mut Scatter<'_, LPurch, P_STAGE>,
+        lcl_w: &mut Scatter<'_, LClick, CL_STAGE>,
+        l_bits: u32,
+        l_mask: usize,
+        wide_camps: bool,
+        wide_cl: &Mutex<Vec<(u32, u32)>>,
+    ) {
+        let nle = les.len();
+        let nlc = lcs.len();
+        if nle == 0 && nlc == 0 {
+            les.free();
+            lcs.free();
+            return;
+        }
+        if nle == 0 {
+            if !links.is_empty() && nlc > 0 {
+                let mut buf = [0u8; 33];
+                for seg in lcs.iter() {
+                    for c in seg {
+                        key::unpack_hex33(c.lo, c.hi, &mut buf);
+                        let h_link = hash::hash(&buf, links::SEED_L);
+                        if links.maybe(h_link) {
+                            if let Some(cid) = links.lookup_bytes(h_link, &buf) {
+                                let (sh, lpid) = cid_to_shard_lpid(cid, l_bits, l_mask);
+                                let packed = if lpid < 32_768 && !wide_camps {
+                                    (lpid << 16) | c.camp
+                                } else {
+                                    pack_lclick(lpid, c.camp, wide_cl)
+                                };
+                                lcl_w.push(sh, LClick { cid: c.cid, ts: c.ts, packed });
+                            }
+                        }
+                    }
+                }
+            }
+            les.free();
+            lcs.free();
+            return;
+        }
+
+        let init_cap = ((nle / 4).next_power_of_two()).clamp(128, 4_096);
+        self.long_ht.clear();
+        self.long_ht.resize(init_cap, LongHtEnt::default());
+        self.long_ht_mask = init_cap - 1;
+        self.long_pkeys.clear();
+        self.long_pkeys.push((0, 0)); // sentinel pid=0
+        self.ev_pids.clear();
+        self.ev_pids.reserve(nle);
+        self.raw_purch.clear();
+
+        const PF: usize = 8;
+        let mut hring = [0u64; PF];
+        let mut n_non_purch = 0usize;
+        for seg in les.iter() {
+            let slen = seg.len();
+            let pre = slen.min(PF);
+            for ri in 0..pre {
+                let e = unsafe { seg.get_unchecked(ri) };
+                let h = key::hash_hex128(e.lo, e.hi, SEED_A);
+                hring[ri] = h;
+                prefetch(unsafe { self.long_ht.as_ptr().add(h as usize & self.long_ht_mask) } as *const u8);
+            }
+            let main_end = slen.saturating_sub(PF);
+            for ri in 0..main_end {
+                let h = hring[ri & (PF - 1)];
+                let fe = unsafe { seg.get_unchecked(ri + PF) };
+                let fh = key::hash_hex128(fe.lo, fe.hi, SEED_A);
+                hring[(ri + PF) & (PF - 1)] = fh;
+                prefetch(unsafe { self.long_ht.as_ptr().add(fh as usize & self.long_ht_mask) } as *const u8);
+                let e = unsafe { seg.get_unchecked(ri) };
+                if e.ts == u32::MAX {
+                    self.ev_pids.push(0);
+                    continue;
+                }
+                let is_purch = e.pc != 0;
+                let pid = self.intern_long(e.lo, e.hi, h, !is_purch);
+                if is_purch {
+                    self.ev_pids.push(0);
+                    self.raw_purch.push(RawPurch { pid, ts: e.ts, pc: e.pc });
+                } else {
+                    self.ev_pids.push(pid);
+                    n_non_purch += 1;
+                }
+            }
+            for ri in main_end..slen {
+                let h = hring[ri & (PF - 1)];
+                let e = unsafe { seg.get_unchecked(ri) };
+                if e.ts == u32::MAX {
+                    self.ev_pids.push(0);
+                    continue;
+                }
+                let is_purch = e.pc != 0;
+                let pid = self.intern_long(e.lo, e.hi, h, !is_purch);
+                if is_purch {
+                    self.ev_pids.push(0);
+                    self.raw_purch.push(RawPurch { pid, ts: e.ts, pc: e.pc });
+                } else {
+                    self.ev_pids.push(pid);
+                    n_non_purch += 1;
+                }
+            }
+        }
+        let np = self.long_pkeys.len();
+        if np <= 1 {
+            les.free();
+            if !links.is_empty() && nlc > 0 {
+                let mut buf = [0u8; 33];
+                for seg in lcs.iter() {
+                    for c in seg {
+                        key::unpack_hex33(c.lo, c.hi, &mut buf);
+                        let h_link = hash::hash(&buf, links::SEED_L);
+                        if links.maybe(h_link) {
+                            if let Some(cid) = links.lookup_bytes(h_link, &buf) {
+                                let (sh, lpid) = cid_to_shard_lpid(cid, l_bits, l_mask);
+                                let packed = if lpid < 32_768 && !wide_camps {
+                                    (lpid << 16) | c.camp
+                                } else {
+                                    pack_lclick(lpid, c.camp, wide_cl)
+                                };
+                                lcl_w.push(sh, LClick { cid: c.cid, ts: c.ts, packed });
+                            }
+                        }
+                    }
+                }
+            }
+            lcs.free();
+            return;
+        }
+
+        self.ev_off.clear();
+        self.ev_off.resize(np + 1, 0);
+        for e in &self.long_ht {
+            if e.pid != 0 {
+                unsafe { *self.ev_off.get_unchecked_mut(e.pid as usize) = e.cnt };
+            }
+        }
+        let mut sum = 0u32;
+        self.ev_cur.clear();
+        self.ev_cur.reserve(np);
+        for i in 0..np {
+            let cnt = unsafe { *self.ev_off.get_unchecked(i) };
+            unsafe { *self.ev_off.get_unchecked_mut(i) = sum };
+            self.ev_cur.push(sum);
+            sum += cnt;
+        }
+        unsafe { *self.ev_off.get_unchecked_mut(np) = sum };
+
+        self.ev_ts.clear();
+        self.ev_ts.reserve_uninit(n_non_purch);
+        let eo = self.ev_ts.as_mut_ptr();
+        let pid_ptr = self.ev_pids.as_ptr();
+        let cur_ptr = self.ev_cur.as_mut_ptr();
+        let mut k = 0usize;
+        for seg in les.iter() {
+            for e in seg {
+                let pid = unsafe { *pid_ptr.add(k) } as usize;
+                k += 1;
+                if pid != 0 {
+                    unsafe {
+                        let dst = cur_ptr.add(pid);
+                        eo.add(*dst as usize).write(e.ts);
+                        *dst += 1;
+                    }
+                }
+            }
+        }
+        les.free();
+        let npurch = self.group_purchases(np);
+
+        // Long clicks: lookup directly in L1 `long_ht` with 8-ahead prefetch (zero CSV mmap reads!).
+        self.cl_off.clear();
+        self.cl_off.resize(np + 1, 0);
+        self.cl_pids.clear();
+        self.cl_pids.reserve(nlc);
+        self.long_miss.clear();
+        let mut ncl_kept = 0usize;
+        if nlc > 0 {
+            let check_links = !links.is_empty();
+            let ht_ptr = self.long_ht.as_ptr();
+            let ht_mask = self.long_ht_mask;
+            let mut buf = [0u8; 33];
+            for seg in lcs.iter() {
+                let slen = seg.len();
+                let pre = slen.min(PF);
+                for ri in 0..pre {
+                    let c = unsafe { seg.get_unchecked(ri) };
+                    let h = key::hash_hex128(c.lo, c.hi, SEED_A);
+                    hring[ri] = h;
+                    prefetch(unsafe { ht_ptr.add(h as usize & ht_mask) } as *const u8);
+                }
+                let main_end = slen.saturating_sub(PF);
+                for ri in 0..main_end {
+                    let h = hring[ri & (PF - 1)];
+                    let fc = unsafe { seg.get_unchecked(ri + PF) };
+                    let fh = key::hash_hex128(fc.lo, fc.hi, SEED_A);
+                    hring[(ri + PF) & (PF - 1)] = fh;
+                    prefetch(unsafe { ht_ptr.add(fh as usize & ht_mask) } as *const u8);
+                    let c = unsafe { seg.get_unchecked(ri) };
+                    if let Some(pid) = self.lookup_long(c.lo, c.hi, h) {
+                        self.cl_pids.push(pid);
+                        unsafe { *self.cl_off.get_unchecked_mut(pid as usize) += 1 };
+                        ncl_kept += 1;
+                    } else {
+                        self.cl_pids.push(u32::MAX);
+                        if check_links {
+                            key::unpack_hex33(c.lo, c.hi, &mut buf);
+                            let h_link = hash::hash(&buf, links::SEED_L);
+                            if links.maybe(h_link) {
+                                self.long_miss.push((c.cid, c.ts, c.camp, h_link, buf));
+                            }
+                        }
+                    }
+                }
+                for ri in main_end..slen {
+                    let h = hring[ri & (PF - 1)];
+                    let c = unsafe { seg.get_unchecked(ri) };
+                    if let Some(pid) = self.lookup_long(c.lo, c.hi, h) {
+                        self.cl_pids.push(pid);
+                        unsafe { *self.cl_off.get_unchecked_mut(pid as usize) += 1 };
+                        ncl_kept += 1;
+                    } else {
+                        self.cl_pids.push(u32::MAX);
+                        if check_links {
+                            key::unpack_hex33(c.lo, c.hi, &mut buf);
+                            let h_link = hash::hash(&buf, links::SEED_L);
+                            if links.maybe(h_link) {
+                                self.long_miss.push((c.cid, c.ts, c.camp, h_link, buf));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.cls.clear();
+        if ncl_kept > 0 {
+            let mut csum = 0u32;
+            self.cl_cur.clear();
+            self.cl_cur.reserve(np);
+            for i in 0..np {
+                let cnt = unsafe { *self.cl_off.get_unchecked(i) };
+                unsafe { *self.cl_off.get_unchecked_mut(i) = csum };
+                self.cl_cur.push(csum);
+                csum += cnt;
+            }
+            unsafe { *self.cl_off.get_unchecked_mut(np) = csum };
+            self.cls.reserve_uninit(ncl_kept);
+            let co = self.cls.as_mut_ptr();
+            let mut ck = 0usize;
+            for seg in lcs.iter() {
+                for c in seg {
+                    let pid = unsafe { *self.cl_pids.get_unchecked(ck) };
+                    ck += 1;
+                    if pid != u32::MAX {
+                        unsafe {
+                            let dst = self.cl_cur.get_unchecked_mut(pid as usize);
+                            co.add(*dst as usize).write(Cl24 { cid: c.cid, ts: c.ts, camp: c.camp });
+                            *dst += 1;
+                        }
+                    }
+                }
+            }
+            unsafe { self.cls.set_len(ncl_kept) };
+        }
+        lcs.free();
+
+        const LPF: usize = 16;
+        let nlm = self.long_miss.len();
+        for j in 0..nlm.min(LPF) {
+            links.prefetch(unsafe { self.long_miss.get_unchecked(j).3 });
+        }
+        for j in 0..nlm {
+            if j + LPF < nlm {
+                links.prefetch(unsafe { self.long_miss.get_unchecked(j + LPF).3 });
+            }
+            let (cid_k, ts, camp, h_link, ref buf) = unsafe { *self.long_miss.get_unchecked(j) };
+            if let Some(cid) = links.lookup_bytes(h_link, buf) {
+                let (sh, lpid) = cid_to_shard_lpid(cid, l_bits, l_mask);
+                let packed = if lpid < 32_768 && !wide_camps {
+                    (lpid << 16) | camp
+                } else {
+                    pack_lclick(lpid, camp, wide_cl)
+                };
+                lcl_w.push(sh, LClick { cid: cid_k, ts, packed });
+            }
+        }
+
+        // Format each distinct long user ONCE into L1-resident `long_strs` (no zero-fill),
+        // resolve against LinkTable with 16-ahead Bloom & bucket prefetch, then solve or forward.
+        self.long_strs.clear();
+        self.long_strs.reserve(np);
+        unsafe { self.long_strs.set_len(np) };
+        let has_links = !links.is_empty();
+        self.canon.clear();
+        self.canon.resize(np, u32::MAX);
+        if has_links {
+            let mut hring_l = [0u64; LPF];
+            self.link_probe.clear();
+            self.link_probe.reserve(np);
+            let pre = np.min(1 + LPF);
+            for pid in 1..pre {
+                let (lo, hi) = unsafe { *self.long_pkeys.get_unchecked(pid) };
+                let s = unsafe { self.long_strs.get_unchecked_mut(pid) };
+                key::unpack_hex33(lo, hi, s);
+                let h_link = hash::hash(s, links::SEED_L);
+                hring_l[pid & (LPF - 1)] = h_link;
+                links.prefetch_bloom(h_link);
+            }
+            for pid in 1..np {
+                let h_link = hring_l[pid & (LPF - 1)];
+                if pid + LPF < np {
+                    let fpid = pid + LPF;
+                    let (lo, hi) = unsafe { *self.long_pkeys.get_unchecked(fpid) };
+                    let s = unsafe { self.long_strs.get_unchecked_mut(fpid) };
+                    key::unpack_hex33(lo, hi, s);
+                    let fh = hash::hash(s, links::SEED_L);
+                    hring_l[fpid & (LPF - 1)] = fh;
+                    links.prefetch_bloom(fh);
+                }
+                if links.maybe(h_link) {
+                    self.link_probe.push((pid as u32, h_link));
+                }
+            }
+            let npr = self.link_probe.len();
+            for j in 0..npr.min(LPF) {
+                links.prefetch(unsafe { self.link_probe.get_unchecked(j).1 });
+            }
+            for j in 0..npr {
+                if j + LPF < npr {
+                    links.prefetch(unsafe { self.link_probe.get_unchecked(j + LPF).1 });
+                }
+                let (pid, h_link) = unsafe { *self.link_probe.get_unchecked(j) };
+                let bytes = unsafe { self.long_strs.get_unchecked(pid as usize) };
+                if let Some(cid) = links.lookup_bytes(h_link, bytes) {
+                    unsafe { *self.canon.get_unchecked_mut(pid as usize) = cid };
+                }
+            }
+        } else {
+            for pid in 1..np {
+                let (lo, hi) = unsafe { *self.long_pkeys.get_unchecked(pid) };
+                key::unpack_hex33(lo, hi, unsafe { self.long_strs.get_unchecked_mut(pid) });
+            }
+        }
+
+        let eo_base = self.ev_ts.as_mut_ptr();
+        for pid in 1..np {
+            let es0 = unsafe { *self.ev_off.get_unchecked(pid) } as usize;
+            let es1 = unsafe { *self.ev_cur.get_unchecked(pid) } as usize;
+            let purch_slice: &[(u32, u32)] = if npurch > 0 {
+                let ps0 = unsafe { *self.p_off.get_unchecked(pid) } as usize;
+                let ps1 = unsafe { *self.p_off.get_unchecked(pid + 1) } as usize;
+                unsafe { self.purch.get_unchecked(ps0..ps1) }
+            } else {
+                &[]
+            };
+            let cid = unsafe { *self.canon.get_unchecked(pid) };
+            if cid == u32::MAX {
+                let cls_slice: &mut [Cl24] = if ncl_kept > 0 {
+                    let cs0 = unsafe { *self.cl_off.get_unchecked(pid) } as usize;
+                    let cs1 = unsafe { *self.cl_off.get_unchecked(pid + 1) } as usize;
+                    unsafe { self.cls.get_unchecked_mut(cs0..cs1) }
+                } else {
+                    &mut []
+                };
+                let bytes = unsafe { self.long_strs.get_unchecked(pid) };
+                let ts_slice = unsafe { std::slice::from_raw_parts_mut(eo_base.add(es0), es1 - es0) };
+                Self::solve_person_bytes(bytes, ts_slice, purch_slice, cls_slice, w, &mut self.ctmp);
+            } else {
+                let (sh, lpid) = cid_to_shard_lpid(cid, l_bits, l_mask);
+                let ts_slice = unsafe { std::slice::from_raw_parts(eo_base.add(es0), es1 - es0) };
+                if !ts_slice.is_empty() {
+                    lev_w.push_mapped(sh, ts_slice, |ts| LEv8 { lpid, ts });
+                }
+                if !purch_slice.is_empty() {
+                    lp_w.push_mapped(sh, purch_slice, |(ts, pc)| LPurch { lpid, ts, pc, _pad: 0 });
+                }
+                if ncl_kept > 0 {
+                    let cs0 = unsafe { *self.cl_off.get_unchecked(pid) } as usize;
+                    let cs1 = unsafe { *self.cl_off.get_unchecked(pid + 1) } as usize;
+                    if cs0 < cs1 {
+                        let cls_s = unsafe { self.cls.get_unchecked(cs0..cs1) };
+                        if lpid < 32_768 && !wide_camps {
+                            let lpid_hi = lpid << 16;
+                            lcl_w.push_mapped(sh, cls_s, |c| LClick {
+                                cid: c.cid,
+                                ts: c.ts,
+                                packed: lpid_hi | c.camp,
+                            });
+                        } else {
+                            lcl_w.push_mapped(sh, cls_s, |c| LClick {
+                                cid: c.cid,
+                                ts: c.ts,
+                                packed: pack_lclick(lpid, c.camp, wide_cl),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cold fallback Tier-1 solve for arbitrary non-hex non-inline `user_id`s (0% of v5).
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn run_other_tier1_shard<const EV_STAGE: usize, const P_STAGE: usize, const CL_STAGE: usize>(
+        &mut self,
+        oes: Segs<OtherPEv>,
+        ocs: Segs<Click>,
+        links: &LinkTable,
+        w: &mut Worker<'_>,
+        lev_w: &mut Scatter<'_, LEv8, EV_STAGE>,
+        lp_w: &mut Scatter<'_, LPurch, P_STAGE>,
+        lcl_w: &mut Scatter<'_, LClick, CL_STAGE>,
+        l_bits: u32,
+        l_mask: usize,
+        wide_camps: bool,
+        wide_cl: &Mutex<Vec<(u32, u32)>>,
+    ) {
+        let mut map: std::collections::HashMap<Key8, usize> = std::collections::HashMap::new();
+        let mut keys: Vec<Key8> = Vec::new();
+        let mut evs: Vec<Vec<u32>> = Vec::new();
+        let mut purchs: Vec<Vec<(u32, u32)>> = Vec::new();
+        let mut clicks: Vec<Vec<Cl24>> = Vec::new();
+        for seg in oes.iter() {
+            for e in seg {
+                if e.person.0 == Key8::TOMBSTONE.0 {
+                    continue;
+                }
+                let idx = *map.entry(e.person).or_insert_with(|| {
+                    let id = keys.len();
+                    keys.push(e.person);
+                    evs.push(Vec::new());
+                    purchs.push(Vec::new());
+                    clicks.push(Vec::new());
+                    id
+                });
+                if e.pc == 0 {
+                    evs[idx].push(e.ts);
+                } else {
+                    purchs[idx].push((e.ts, e.pc));
+                }
+            }
+        }
+        oes.free();
+        let has_links = !links.is_empty();
+        for seg in ocs.iter() {
+            for c in seg {
+                if let Some(&idx) = map.get(&c.person) {
+                    clicks[idx].push(Cl24 { cid: c.cid, ts: c.ts, camp: c.camp });
+                } else if has_links {
+                    let h = c.person.hash(links::SEED_L);
+                    if links.maybe(h) {
+                        if let Some(cid) = links.lookup(h, c.person) {
+                            let (sh, lpid) = cid_to_shard_lpid(cid, l_bits, l_mask);
+                            let packed = if lpid < 32_768 && !wide_camps {
+                                (lpid << 16) | c.camp
+                            } else {
+                                pack_lclick(lpid, c.camp, wide_cl)
+                            };
+                            lcl_w.push(sh, LClick { cid: c.cid, ts: c.ts, packed });
+                        }
+                    }
+                }
+            }
+        }
+        ocs.free();
+        for idx in 0..keys.len() {
+            let pkey = keys[idx];
+            let cid = if has_links {
+                let h = pkey.hash(links::SEED_L);
+                if links.maybe(h) { links.lookup(h, pkey) } else { None }
+            } else {
+                None
+            };
+            if let Some(cid) = cid {
+                let (sh, lpid) = cid_to_shard_lpid(cid, l_bits, l_mask);
+                if !evs[idx].is_empty() {
+                    lev_w.push_mapped(sh, &evs[idx], |ts| LEv8 { lpid, ts });
+                }
+                if !purchs[idx].is_empty() {
+                    lp_w.push_mapped(sh, &purchs[idx], |(ts, pc)| LPurch { lpid, ts, pc, _pad: 0 });
+                }
+                if !clicks[idx].is_empty() {
+                    lcl_w.push_mapped(sh, &clicks[idx], |c| LClick {
+                        cid: c.cid,
+                        ts: c.ts,
+                        packed: pack_lclick(lpid, c.camp, wide_cl),
+                    });
+                }
+            } else {
+                Self::solve_person(pkey, &mut evs[idx], &purchs[idx], &mut clicks[idx], w, &mut self.ctmp);
             }
         }
     }
@@ -4056,6 +4707,9 @@ fn manifest_value(m: &str, key: &str) -> i64 {
 }
 
 const PURCH_SEG: usize = 2048;
+const LONG_EV_SEG: usize = 7680; // 40 * 192 = 320 * 24B (273 segs/2MB block, 99.94% packing, 2x fewer seg locks)
+const LONG_CL_SEG: usize = 2048; // 16 * 128 = 64 * 32B
+const OTHER_SEG: usize = 2048;
 
 struct EventHandler<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const P_STAGE: usize> {
     ctx: &'a Ctx,
@@ -4068,6 +4722,28 @@ struct EventHandler<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAG
     long_id_w: Scatter<'b, LongDedupRec, 192>,
     ev_w: Scatter<'b, PEv12, P_STAGE>,
     purch_w: Scatter<'b, PPurch, 64, PURCH_SEG>,
+    long_ev_w: Scatter<'b, LongPEv, 192, LONG_EV_SEG>,
+    other_ev_set: &'b ShardSet<OtherPEv, OTHER_SEG>,
+    other_ev_w: Option<Scatter<'b, OtherPEv, 64, OTHER_SEG>>,
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn encode_purchase_pc(
+    ctx: &Ctx,
+    wide_ref: &Mutex<Vec<(u32, u16)>>,
+    product: &[u8],
+    price: u32,
+) -> u32 {
+    if price == 0 {
+        return 0;
+    }
+    let cat = ctx.products.get_swar(product).unwrap_or(ctx.unknown_cat);
+    if !ctx.wide {
+        (price << 8) | cat
+    } else {
+        push_wide_price(wide_ref, price, cat)
+    }
 }
 
 #[inline(never)]
@@ -4082,25 +4758,71 @@ fn push_purchase(
     product: &[u8],
     price: u32,
 ) -> u32 {
-    if price == 0 {
+    let pc = encode_purchase_pc(ctx, wide_ref, product, price);
+    if pc == 0 {
         return arena::LOC_INVALID;
     }
-    let cat = ctx.products.get_swar(product).unwrap_or(ctx.unknown_cat);
-    let pc = if !ctx.wide {
-        (price << 8) | cat
-    } else {
-        push_wide_price(wide_ref, price, cat)
-    };
     arena::LOC_PURCH_BIT | purch_w.push_with_loc(p_sh, PPurch { person: uid_k, ts: ts_rel, pc })
+}
+
+#[cold]
+#[inline(never)]
+fn push_other_event<'b>(
+    other_ev_set: &'b ShardSet<OtherPEv, OTHER_SEG>,
+    other_ev_w: &mut Option<Scatter<'b, OtherPEv, 64, OTHER_SEG>>,
+    uid_bytes: &[u8],
+    ts_rel: u32,
+    pc: u32,
+) -> u32 {
+    let w = other_ev_w.get_or_insert_with(|| Scatter::<OtherPEv, 64, OTHER_SEG>::new_located(other_ev_set));
+    arena::LOC_OTHER_BIT | w.push_with_loc(0, OtherPEv { person: Key8::new(uid_bytes), ts: ts_rel, pc })
+}
+
+impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const P_STAGE: usize>
+    EventHandler<'a, 'b, ID_BITS, P_BITS, EV_STAGE, P_STAGE>
+{
+    #[inline(never)]
+    fn push_long_non_purch(&mut self, uid_bytes: &[u8], ts_rel: u32) -> u32 {
+        if let Some((lo, hi)) = key::try_pack_hex33(uid_bytes) {
+            let uh = key::hash_hex128(lo, hi, SEED_A);
+            let p_sh = (uh >> (64 - P_BITS)) as usize;
+            self.long_ev_w.push_with_loc24(p_sh, LongPEv { lo, hi, ts: ts_rel, pc: 0 })
+        } else {
+            push_other_event(self.other_ev_set, &mut self.other_ev_w, uid_bytes, ts_rel, 0)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_long_purchase(&mut self, uid_bytes: &[u8], ts_rel: u32, product: &[u8], price: u32) -> u32 {
+        let pc = encode_purchase_pc(self.ctx, self.wide_ref, product, price);
+        if pc == 0 {
+            return arena::LOC_INVALID;
+        }
+        if let Some((lo, hi)) = key::try_pack_hex33(uid_bytes) {
+            let uh = key::hash_hex128(lo, hi, SEED_A);
+            let p_sh = (uh >> (64 - P_BITS)) as usize;
+            self.long_ev_w.push_with_loc24(p_sh, LongPEv { lo, hi, ts: ts_rel, pc })
+        } else {
+            push_other_event(self.other_ev_set, &mut self.other_ev_w, uid_bytes, ts_rel, pc)
+        }
+    }
 }
 
 impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const P_STAGE: usize>
     event_front::EventSink<'_> for &mut EventHandler<'a, 'b, ID_BITS, P_BITS, EV_STAGE, P_STAGE>
 {
     #[inline(always)]
-    fn prefetch_keys(&self, eh: u64, uh: u64) {
-        self.id_w.prefetch_shard((eh >> (64 - ID_BITS)) as usize);
-        self.ev_w.prefetch_located_shard((uh >> (64 - P_BITS)) as usize);
+    fn prefetch_keys(&self, ek_long: bool, eh: u64, uid_long: bool, uh: u64) {
+        let id_sh = (eh >> (64 - ID_BITS)) as usize;
+        if !ek_long {
+            self.id_w.prefetch_shard(id_sh);
+        } else {
+            self.long_id_w.prefetch_shard(id_sh);
+        }
+        if !uid_long {
+            self.ev_w.prefetch_located_shard((uh >> (64 - P_BITS)) as usize);
+        }
     }
 
     #[inline(always)]
@@ -4133,21 +4855,27 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
             {
                 break 'v;
             }
-            let p_sh = (ev.uh >> (64 - P_BITS)) as usize;
             let ts_rel = (ts - self.base) as u32;
-            if ev.kind == 1 {
-                loc = self.ev_w.push_with_loc12(p_sh, PEv12 { person: ev.uid_k, ts: ts_rel });
+            if ev.uid_k.0 != Key8::NON_INLINE_SENTINEL.0 {
+                let p_sh = (ev.uh >> (64 - P_BITS)) as usize;
+                if ev.kind == 1 {
+                    loc = self.ev_w.push_with_loc12(p_sh, PEv12 { person: ev.uid_k, ts: ts_rel });
+                } else {
+                    loc = push_purchase(
+                        self.ctx,
+                        self.wide_ref,
+                        &mut self.purch_w,
+                        p_sh,
+                        ev.uid_k,
+                        ts_rel,
+                        ev.product,
+                        ev.price,
+                    );
+                }
+            } else if ev.kind == 1 {
+                loc = self.push_long_non_purch(ev.uid_bytes, ts_rel);
             } else {
-                loc = push_purchase(
-                    self.ctx,
-                    self.wide_ref,
-                    &mut self.purch_w,
-                    p_sh,
-                    ev.uid_k,
-                    ts_rel,
-                    ev.product,
-                    ev.price,
-                );
+                loc = self.push_long_purchase(ev.uid_bytes, ts_rel, ev.product, ev.price);
             }
         }
         if !ek.is_non_inline() {
@@ -4164,6 +4892,23 @@ struct ClickHandler<'a, 'b, const P_BITS: u32, const CL_STAGE: usize> {
     cwlen: u64,
     base: i64,
     w: Scatter<'b, Click, CL_STAGE>,
+    long_w: Scatter<'b, LongClick, 128, LONG_CL_SEG>,
+    other_set: &'b ShardSet<Click, LONG_EV_SEG>,
+    other_w: Option<Scatter<'b, Click, 192, LONG_EV_SEG>>,
+}
+
+#[cold]
+#[inline(never)]
+fn push_other_click<'b>(
+    other_set: &'b ShardSet<Click, LONG_EV_SEG>,
+    other_w: &mut Option<Scatter<'b, Click, 192, LONG_EV_SEG>>,
+    uid: &[u8],
+    cid: CKey,
+    ts: u32,
+    camp: u32,
+) {
+    let w = other_w.get_or_insert_with(|| Scatter::<Click, 192, LONG_EV_SEG>::new(other_set));
+    w.push(0, Click { person: Key8::new(uid), cid, ts, camp });
 }
 
 impl<'a, 'b, const P_BITS: u32, const CL_STAGE: usize> event_front::ClickSink<'_>
@@ -4175,18 +4920,29 @@ impl<'a, 'b, const P_BITS: u32, const CL_STAGE: usize> event_front::ClickSink<'_
         if cid.is_empty() || uid.is_empty() {
             return;
         }
-        let (uid_k, uh) = Key8::new_and_hash(uid, SEED_A);
-        let sh = (uh >> (64 - P_BITS)) as usize;
-        self.w.prefetch_shard(sh);
+        let (uid_k, uh) = Key8::pack_inline_or_sentinel(uid, SEED_A);
+        let is_inline = uid_k.0 != Key8::NON_INLINE_SENTINEL.0;
+        let sh = if is_inline {
+            let s = (uh >> (64 - P_BITS)) as usize;
+            self.w.prefetch_shard(s);
+            s
+        } else {
+            0
+        };
         let Some(camp) = self.ctx.camps.get_swar(f[2]) else { return };
         let ts = match self.ctx.dates.parse_ts(f[3]) {
             Some(t) if (t.wrapping_sub(self.cws) as u64) < self.cwlen => t,
             _ => return,
         };
-        self.w.push(
-            sh,
-            Click { person: uid_k, cid: CKey::new(cid), ts: (ts - self.base) as u32, camp },
-        );
+        let ts_rel = (ts - self.base) as u32;
+        if is_inline {
+            self.w.push(sh, Click { person: uid_k, cid: CKey::new(cid), ts: ts_rel, camp });
+        } else if let Some((lo, hi)) = key::try_pack_hex33(uid) {
+            let lsh = (key::hash_hex128(lo, hi, SEED_A) >> (64 - P_BITS)) as usize;
+            self.long_w.push(lsh, LongClick { lo, hi, cid: CKey::new(cid), ts: ts_rel, camp });
+        } else {
+            push_other_click(self.other_set, &mut self.other_w, uid, CKey::new(cid), ts_rel, camp);
+        }
     }
 }
 
@@ -4214,6 +4970,8 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
     let long_id_set: ShardSet<LongDedupRec> = ShardSet::new_shared(id_shards);
     let ev_set: ShardSet<PEv12> = ShardSet::new_shared(p_shards);
     let purch_set: ShardSet<PPurch, PURCH_SEG> = ShardSet::new_shared(p_shards);
+    let long_ev_set: ShardSet<LongPEv, LONG_EV_SEG> = ShardSet::new_shared(p_shards);
+    let other_ev_set: ShardSet<OtherPEv, OTHER_SEG> = ShardSet::new_shared(1);
     let oob_ingest: Mutex<Vec<i64>> = Mutex::new(Vec::new());
     let wide_store: Mutex<Vec<(u32, u16)>> = Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
@@ -4225,7 +4983,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
         None
     };
     let links_slot: Mutex<Option<LinkTable>> = Mutex::new(None);
-    let (links_owned, click_set, wide_store) = std::thread::scope(|s| {
+    let (links_owned, click_set, long_click_set, other_click_set, wide_store) = std::thread::scope(|s| {
         let links_job = if links_sync.is_none() && !inline_links {
             Some(s.spawn(move || links::build_links(link_files, 1)))
         } else {
@@ -4250,6 +5008,9 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                 long_id_w: Scatter::<LongDedupRec, 192>::new(&long_id_set),
                 ev_w: Scatter::<PEv12, P_STAGE>::new_located12(&ev_set),
                 purch_w: Scatter::<PPurch, 64, PURCH_SEG>::new_located(&purch_set),
+                long_ev_w: Scatter::<LongPEv, 192, LONG_EV_SEG>::new_located24(&long_ev_set),
+                other_ev_set: &other_ev_set,
+                other_ev_w: None,
             };
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
@@ -4264,6 +5025,10 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
             handler.long_id_w.finish();
             handler.ev_w.finish();
             handler.purch_w.finish();
+            handler.long_ev_w.finish();
+            if let Some(ow) = handler.other_ev_w {
+                ow.finish();
+            }
         });
         mark("events");
 
@@ -4317,6 +5082,8 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
         let cwlen: u64 = (ctx.we - cws).max(0) as u64;
         let chunks = make_chunks(click_files, chunk_target(click_files, threads));
         let click_set: ShardSet<Click> = ShardSet::new_shared(p_shards);
+        let long_click_set: ShardSet<LongClick, LONG_CL_SEG> = ShardSet::new_shared(p_shards);
+        let other_click_set: ShardSet<Click, LONG_EV_SEG> = ShardSet::new_shared(1);
         let next = AtomicUsize::new(0);
         par(threads, |_| {
             let mut handler = ClickHandler::<P_BITS, CL_STAGE> {
@@ -4325,6 +5092,9 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                 cwlen,
                 base: ctx.base,
                 w: Scatter::<Click, CL_STAGE>::new(&click_set),
+                long_w: Scatter::<LongClick, 128, LONG_CL_SEG>::new(&long_click_set),
+                other_set: &other_click_set,
+                other_w: None,
             };
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
@@ -4336,6 +5106,10 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                 event_front::scan_clicks(d, &mut handler);
             }
             handler.w.finish();
+            handler.long_w.finish();
+            if let Some(ow) = handler.other_w {
+                ow.finish();
+            }
         });
         mark("clicks");
 
@@ -4352,16 +5126,25 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                 None => links_sync.unwrap(),
             }
         };
-        (lt, click_set, wide_store)
+        (lt, click_set, long_click_set, other_click_set, wide_store)
     });
     let links = &links_owned;
 
     // ---- Two-tier solve: Tier 1 resolves distinct uids once, solves unlinked in place,
     // forwards linked by dense cid (8B LEv8 + 16B LPurch + 16B LClick) to hash-free Tier 2!
     let mut order: Vec<(usize, usize)> = (0..p_shards)
-        .map(|p| (p, (ev_set.count(p) + purch_set.count(p)) * 2 + click_set.count(p)))
+        .map(|p| {
+            (
+                p,
+                (ev_set.count(p) + purch_set.count(p) + long_ev_set.count(p)) * 2
+                    + click_set.count(p)
+                    + long_click_set.count(p),
+            )
+        })
         .collect();
     order.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let has_other = other_ev_set.count(0) > 0 || other_click_set.count(0) > 0;
+    let total_t1 = p_shards + usize::from(has_other);
     let l_bits = P_BITS - 1;
     let l_shards = 1usize << l_bits;
     let l_mask = l_shards - 1;
@@ -4385,8 +5168,26 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
             let mut lcl_w = Scatter::<LClick, 128>::new(&linked_cl_set);
             loop {
                 let k = next1.fetch_add(1, Ordering::Relaxed);
-                if k >= p_shards {
+                if k >= total_t1 {
                     break;
+                }
+                if k == p_shards {
+                    let oes = other_ev_set.take(0);
+                    let ocs = other_click_set.take(0);
+                    sc.run_other_tier1_shard(
+                        oes,
+                        ocs,
+                        links,
+                        &mut w,
+                        &mut lev_w,
+                        &mut lp_w,
+                        &mut lcl_w,
+                        l_bits,
+                        l_mask,
+                        wide_camps,
+                        &wide_cl_mu,
+                    );
+                    continue;
                 }
                 let p = order[k].0;
                 let es = ev_set.take(p);
@@ -4406,6 +5207,21 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                     wide_camps,
                     &wide_cl_mu,
                 );
+                let les = long_ev_set.take(p);
+                let lcs = long_click_set.take(p);
+                sc.run_long_tier1_shard(
+                    les,
+                    lcs,
+                    links,
+                    &mut w,
+                    &mut lev_w,
+                    &mut lp_w,
+                    &mut lcl_w,
+                    l_bits,
+                    l_mask,
+                    wide_camps,
+                    &wide_cl_mu,
+                );
             }
             lev_w.finish();
             lp_w.finish();
@@ -4414,7 +5230,11 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
         if bar.wait().is_leader() {
             ev_set.release_blocks();
             purch_set.release_blocks();
+            long_ev_set.release_blocks();
+            other_ev_set.release_blocks();
             click_set.release_blocks();
+            long_click_set.release_blocks();
+            other_click_set.release_blocks();
             if !links.is_empty() {
                 *wide_cl_ro.lock().unwrap() = std::mem::take(&mut *wide_cl_mu.lock().unwrap());
                 let mut o2: Vec<(usize, usize)> = (0..l_shards)
@@ -4454,7 +5274,11 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
     });
     ev_set.free_all();
     purch_set.free_all();
+    long_ev_set.free_all();
+    other_ev_set.free_all();
     click_set.free_all();
+    long_click_set.free_all();
+    other_click_set.free_all();
     linked_ev_set.free_all();
     linked_p_set.free_all();
     linked_cl_set.free_all();

@@ -18,6 +18,7 @@ pub struct Event<'a> {
     pub eh: u64,
     pub uid_k: Key8,
     pub uh: u64,
+    pub uid_bytes: &'a [u8],
     pub product: &'a [u8],
     pub timestamp: Option<i64>,
     pub ing_day_ms: i64,
@@ -28,7 +29,7 @@ pub struct Event<'a> {
 
 pub trait EventSink<'a> {
     #[inline(always)]
-    fn prefetch_keys(&self, _eh: u64, _uh: u64) {}
+    fn prefetch_keys(&self, _ek_long: bool, _eh: u64, _uid_long: bool, _uh: u64) {}
     fn on_event(&mut self, ev: Event<'a>);
 }
 
@@ -72,12 +73,13 @@ fn fallback<'a, S: EventSink<'a>>(data: &'a [u8], dates: &DateCache, f: &mut S) 
         };
         let (timestamp, ing_day_ms, ing_bcd) = dates.parse_event_ingest_bcd(fields[2], fields[3]);
         let (ek, eh) = EKey::new_and_hash(fields[0], SEED_ID);
-        let (uid_k, uh) = Key8::new_and_hash(fields[1], SEED_A);
+        let (uid_k, uh) = Key8::pack_inline_or_sentinel(fields[1], SEED_A);
         f.on_event(Event {
             ek,
             eh,
             uid_k,
             uh,
+            uid_bytes: fields[1],
             product: fields[5],
             timestamp,
             ing_day_ms,
@@ -170,8 +172,8 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
         let eid = data.get_unchecked(q0..c0 - q0);
         let uid = data.get_unchecked(c0 + 1 + q1..c1 - q1);
         let (ek, eh) = EKey::new_and_hash(eid, SEED_ID);
-        let (uid_k, uh) = Key8::new_and_hash(uid, SEED_A);
-        sink.prefetch_keys(eh, uh);
+        let (uid_k, uh) = Key8::pack_inline_or_sentinel(uid, SEED_A);
+        sink.prefetch_keys(ek.is_non_inline(), eh, uid_k.0 == Key8::NON_INLINE_SENTINEL.0, uh);
 
         let (timestamp, ing_day_ms, ing_bcd) = if tlen == 20 {
             dates.parse_event_ingest_bcd(data.get_unchecked(ta..ta + 20), data.get_unchecked(ia..ia + 20))
@@ -214,6 +216,7 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
             eh,
             uid_k,
             uh,
+            uid_bytes: uid,
             product: data.get_unchecked(c4 + 1 + pq..c5 - pq),
             timestamp,
             ing_day_ms,
@@ -253,12 +256,33 @@ fn parse_row_hi<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     if ((q_lo & !edges_lo) | (p_lo & seps_lo)) != 0 || ((q_hi & !edges_hi) | (p_hi & seps_hi)) != 0 {
         return None;
     }
-    let mut clo = c_lo;
-    let mut cmid = c_hi as u64;
-    let mut ctop = 0u32;
-    let c0 = next_comma3(&mut clo, &mut cmid, &mut ctop);
-    let c1 = next_comma3(&mut clo, &mut cmid, &mut ctop);
-    let c2 = next_comma3(&mut clo, &mut cmid, &mut ctop);
+    let (c0, c1, c2) = if c_lo != 0 {
+        let c0 = c_lo.trailing_zeros() as usize;
+        let low1 = c_lo & c_lo.wrapping_sub(1);
+        if low1 != 0 {
+            let c1 = low1.trailing_zeros() as usize;
+            let low2 = low1 & low1.wrapping_sub(1);
+            if low2 != 0 {
+                (c0, c1, low2.trailing_zeros() as usize)
+            } else {
+                (c0, c1, 64 + c_hi.trailing_zeros() as usize)
+            }
+        } else {
+            let mut clo = 0u64;
+            let mut cmid = c_hi as u64;
+            let mut ctop = 0u32;
+            (c0, next_comma3(&mut clo, &mut cmid, &mut ctop), next_comma3(&mut clo, &mut cmid, &mut ctop))
+        }
+    } else {
+        let mut clo = 0u64;
+        let mut cmid = c_hi as u64;
+        let mut ctop = 0u32;
+        (
+            next_comma3(&mut clo, &mut cmid, &mut ctop),
+            next_comma3(&mut clo, &mut cmid, &mut ctop),
+            next_comma3(&mut clo, &mut cmid, &mut ctop),
+        )
+    };
     let c5 = if c_hi != 0 {
         64 + (31 - c_hi.leading_zeros() as usize)
     } else {
@@ -326,12 +350,33 @@ fn parse_row_mid128<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     if ((q_lo & !edges_lo) | (p_lo & seps_lo)) != 0 || ((q_mid & !edges_mid) | (p_mid & seps_mid)) != 0 {
         return None;
     }
-    let mut clo = c_lo;
-    let mut cmid = c_mid;
-    let mut ctop = 0u32;
-    let c0 = next_comma3(&mut clo, &mut cmid, &mut ctop);
-    let c1 = next_comma3(&mut clo, &mut cmid, &mut ctop);
-    let c2 = next_comma3(&mut clo, &mut cmid, &mut ctop);
+    let (c0, c1, c2) = if c_lo != 0 {
+        let c0 = c_lo.trailing_zeros() as usize;
+        let low1 = c_lo & c_lo.wrapping_sub(1);
+        if low1 != 0 {
+            let c1 = low1.trailing_zeros() as usize;
+            let low2 = low1 & low1.wrapping_sub(1);
+            if low2 != 0 {
+                (c0, c1, low2.trailing_zeros() as usize)
+            } else {
+                (c0, c1, 64 + c_mid.trailing_zeros() as usize)
+            }
+        } else {
+            let mut clo = 0u64;
+            let mut cmid = c_mid;
+            let mut ctop = 0u32;
+            (c0, next_comma3(&mut clo, &mut cmid, &mut ctop), next_comma3(&mut clo, &mut cmid, &mut ctop))
+        }
+    } else {
+        let mut clo = 0u64;
+        let mut cmid = c_mid;
+        let mut ctop = 0u32;
+        (
+            next_comma3(&mut clo, &mut cmid, &mut ctop),
+            next_comma3(&mut clo, &mut cmid, &mut ctop),
+            next_comma3(&mut clo, &mut cmid, &mut ctop),
+        )
+    };
     let c5 = if c_mid != 0 {
         64 + (63 - c_mid.leading_zeros() as usize)
     } else {
@@ -526,75 +571,57 @@ unsafe fn handle_row_lo_avx2<'a, S: EventSink<'a>>(
     end + 1
 }
 
-/// Fast AVX2 handler for event rows exceeding 96 bytes (96..160 B, e.g. 32-char hex IDs).
-/// Not marked `#[cold]` because ~23% of v5 rows enter here.
+/// Cold AVX2 handler for rare event rows >= 128 bytes (~1.5% of v5 rows: both IDs 33B).
 #[cfg(target_arch = "x86_64")]
+#[cold]
 #[inline(never)]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,pclmulqdq")]
-unsafe fn handle_row_long_avx2<'a, S: EventSink<'a>>(
+unsafe fn handle_row_160_avx2<'a, S: EventSink<'a>>(
     data: &'a [u8],
     c_lo: u64,
-    cm2: u32,
+    c_mid: u64,
     q_lo: u64,
-    qt2: u32,
+    q_mid: u64,
     dates: &DateCache,
     f: &mut S,
 ) -> usize {
     use core::arch::x86_64::*;
-    let v_cm = _mm256_set1_epi8(b',' as i8);
-    let v_nl = _mm256_set1_epi8(b'\n' as i8);
-    let v_qt = _mm256_set1_epi8(b'"' as i8);
-    let v_ones = _mm_set1_epi64x(-1);
-    let parity64 = |q: u64| -> u64 {
-        _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(q as i64), v_ones)) as u64
-    };
-    if data.len() >= 128 {
+    if data.len() >= 160 {
         let p = data.as_ptr();
-        let b3 = _mm256_loadu_si256(p.add(96).cast());
-        let cm3 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_cm)) as u32;
-        let nl3 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_nl)) as u32;
-        let qt3 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_qt)) as u32;
-        let c_mid = (cm2 as u64) | ((cm3 as u64) << 32);
-        let q_mid = (qt2 as u64) | ((qt3 as u64) << 32);
-        if nl3 != 0 {
-            let end_mid = 32 + nl3.trailing_zeros() as usize;
-            let end = 64 + end_mid;
-            if let Some(ev) = parse_row_mid128(data, end_mid, c_lo, c_mid, q_lo, q_mid, dates, &parity64, f) {
+        let v_cm = _mm256_set1_epi8(b',' as i8);
+        let v_nl = _mm256_set1_epi8(b'\n' as i8);
+        let v_qt = _mm256_set1_epi8(b'"' as i8);
+        let v_ones = _mm_set1_epi64x(-1);
+        let parity64 = |q: u64| -> u64 {
+            _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(q as i64), v_ones)) as u64
+        };
+        let b4 = _mm256_loadu_si256(p.add(128).cast());
+        let cm4 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b4, v_cm)) as u32;
+        let nl4 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b4, v_nl)) as u32;
+        let qt4 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b4, v_qt)) as u32;
+        if nl4 != 0 {
+            let end_top = nl4.trailing_zeros() as usize;
+            let end = 128 + end_top;
+            if let Some(ev) =
+                parse_row_top160(data, end_top, c_lo, c_mid, cm4, q_lo, q_mid, qt4, dates, &parity64, f)
+            {
                 f.on_event(ev);
             } else {
                 fallback(data.get_unchecked(..end + 1), dates, f);
             }
             return end + 1;
         }
-        if data.len() >= 160 {
-            let b4 = _mm256_loadu_si256(p.add(128).cast());
-            let cm4 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b4, v_cm)) as u32;
-            let nl4 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b4, v_nl)) as u32;
-            let qt4 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b4, v_qt)) as u32;
-            if nl4 != 0 {
-                let end_top = nl4.trailing_zeros() as usize;
-                let end = 128 + end_top;
-                if let Some(ev) =
-                    parse_row_top160(data, end_top, c_lo, c_mid, cm4, q_lo, q_mid, qt4, dates, &parity64, f)
-                {
-                    f.on_event(ev);
-                } else {
-                    fallback(data.get_unchecked(..end + 1), dates, f);
-                }
-                return end + 1;
-            }
-            let end = data[160..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(data.len(), |pos| 160 + pos + 1);
-            fallback(&data[..end], dates, f);
-            return end;
-        }
+        let end = data[160..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(data.len(), |pos| 160 + pos + 1);
+        fallback(&data[..end], dates, f);
+        return end;
     }
-    let end = data[96..]
+    let end = data[128..]
         .iter()
         .position(|&b| b == b'\n')
-        .map_or(data.len(), |pos| 96 + pos + 1);
+        .map_or(data.len(), |pos| 128 + pos + 1);
     fallback(&data[..end], dates, f);
     end
 }
@@ -639,9 +666,36 @@ unsafe fn scan_avx2<'a, S: EventSink<'a>>(mut data: &'a [u8], dates: &DateCache,
                     fallback(data.get_unchecked(..end + 1), dates, &mut f);
                 }
                 data = data.get_unchecked(end + 1..);
+            } else if data.len() >= 128 {
+                // Inline 4th vector (96..128B): covers 98.4% of all v5 rows with zero call/reload overhead!
+                let b3 = _mm256_loadu_si256(p.add(96).cast());
+                let cm3 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_cm)) as u32;
+                let nl3 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_nl)) as u32;
+                let qt3 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_qt)) as u32;
+                let c_mid = (cm2 as u64) | ((cm3 as u64) << 32);
+                let q_mid = (qt2 as u64) | ((qt3 as u64) << 32);
+                if nl3 != 0 {
+                    let end_mid = 32 + nl3.trailing_zeros() as usize;
+                    let end = 64 + end_mid;
+                    if let Some(ev) =
+                        parse_row_mid128(data, end_mid, c_lo, c_mid, q_lo, q_mid, dates, &parity64, &f)
+                    {
+                        f.on_event(ev);
+                    } else {
+                        fallback(data.get_unchecked(..end + 1), dates, &mut f);
+                    }
+                    data = data.get_unchecked(end + 1..);
+                } else {
+                    let adv = handle_row_160_avx2(data, c_lo, c_mid, q_lo, q_mid, dates, &mut f);
+                    data = data.get_unchecked(adv..);
+                }
             } else {
-                let adv = handle_row_long_avx2(data, c_lo, cm2, q_lo, qt2, dates, &mut f);
-                data = data.get_unchecked(adv..);
+                let end = data[96..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(data.len(), |pos| 96 + pos + 1);
+                fallback(&data[..end], dates, &mut f);
+                data = &data[end..];
             }
         } else {
             let adv = handle_row_lo_avx2(data, bytes, c_lo, q_lo, dates, &mut f);
@@ -844,58 +898,6 @@ pub fn scan_clicks<'a, S: ClickSink<'a>>(data: &'a [u8], f: S) {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline(never)]
-#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,pclmulqdq")]
-unsafe fn handle_click_long_avx2<'a, S: ClickSink<'a>>(
-    data: &'a [u8],
-    c_lo: u64,
-    q_lo: u64,
-    f: &mut S,
-) -> usize {
-    use core::arch::x86_64::*;
-    if data.len() >= 128 {
-        let p = data.as_ptr();
-        let v_cm = _mm256_set1_epi8(b',' as i8);
-        let v_nl = _mm256_set1_epi8(b'\n' as i8);
-        let v_qt = _mm256_set1_epi8(b'"' as i8);
-        let v_ones = _mm_set1_epi64x(-1);
-        let parity = |q: u64| -> u64 {
-            _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(q as i64), v_ones)) as u64
-        };
-        let b2 = _mm256_loadu_si256(p.add(64).cast());
-        let b3 = _mm256_loadu_si256(p.add(96).cast());
-        let c_hi = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b2, v_cm)) as u32 as u64)
-            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_cm)) as u32 as u64) << 32);
-        let l_hi = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b2, v_nl)) as u32 as u64)
-            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_nl)) as u32 as u64) << 32);
-        let q_hi = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b2, v_qt)) as u32 as u64)
-            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_qt)) as u32 as u64) << 32);
-        if l_hi != 0 {
-            let end_hi = l_hi.trailing_zeros() as usize;
-            let end = 64 + end_hi;
-            if let Some(fields) = parse_click_row_128(data, end_hi, c_lo, c_hi, q_lo, q_hi, &parity) {
-                f.on_click(&fields);
-            } else {
-                fallback_clicks(data.get_unchecked(..end + 1), f);
-            }
-            return end + 1;
-        }
-        let end = data[128..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(data.len(), |pos| 128 + pos + 1);
-        fallback_clicks(&data[..end], f);
-        return end;
-    }
-    let end = data[64..]
-        .iter()
-        .position(|&b| b == b'\n')
-        .map_or(data.len(), |pos| 64 + pos + 1);
-    fallback_clicks(&data[..end], f);
-    end
-}
-
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,pclmulqdq")]
 unsafe fn scan_clicks_avx2<'a, S: ClickSink<'a>>(mut data: &'a [u8], mut f: S) {
     use core::arch::x86_64::*;
@@ -926,9 +928,40 @@ unsafe fn scan_clicks_avx2<'a, S: ClickSink<'a>>(mut data: &'a [u8], mut f: S) {
                 fallback_clicks(data.get_unchecked(..end + 1), &mut f);
             }
             data = data.get_unchecked(end + 1..);
+        } else if data.len() >= 128 {
+            // Inline 64..128B click extension: covers 100% of v5 clicks with zero call/reload overhead!
+            let b2 = _mm256_loadu_si256(p.add(64).cast());
+            let b3 = _mm256_loadu_si256(p.add(96).cast());
+            let c_hi = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b2, v_cm)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_cm)) as u32 as u64) << 32);
+            let l_hi = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b2, v_nl)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_nl)) as u32 as u64) << 32);
+            let q_hi = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b2, v_qt)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, v_qt)) as u32 as u64) << 32);
+            if l_hi != 0 {
+                let end_hi = l_hi.trailing_zeros() as usize;
+                let end = 64 + end_hi;
+                if let Some(fields) = parse_click_row_128(data, end_hi, commas, c_hi, quotes, q_hi, &parity) {
+                    f.on_click(&fields);
+                } else {
+                    fallback_clicks(data.get_unchecked(..end + 1), &mut f);
+                }
+                data = data.get_unchecked(end + 1..);
+            } else {
+                let end = data[128..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(data.len(), |pos| 128 + pos + 1);
+                fallback_clicks(&data[..end], &mut f);
+                data = &data[end..];
+            }
         } else {
-            let adv = handle_click_long_avx2(data, commas, quotes, &mut f);
-            data = data.get_unchecked(adv..);
+            let end = data[64..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(data.len(), |pos| 64 + pos + 1);
+            fallback_clicks(&data[..end], &mut f);
+            data = &data[end..];
         }
     }
     if !data.is_empty() {
@@ -1101,13 +1134,13 @@ mod tests {
             let (ing_day_ms, ing_bcd) = dates.parse_f1_ingest_bcd(f[3]);
             let ek = EKey::new(f[0]);
             let eh = ek.hash(SEED_ID);
-            let uid_k = Key8::new(f[1]);
-            let uh = uid_k.hash(SEED_A);
+            let (uid_k, uh) = Key8::pack_inline_or_sentinel(f[1], SEED_A);
             out.push(Event {
                 ek,
                 eh,
                 uid_k,
                 uh,
+                uid_bytes: f[1],
                 product: f[5],
                 timestamp: dates.parse_ts(f[2]),
                 ing_day_ms,

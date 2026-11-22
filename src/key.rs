@@ -241,6 +241,19 @@ fn pack_slow(s: &[u8]) -> u64 {
 
 #[inline(never)]
 fn pack_slow_and_hash(s: &[u8], seed: u64) -> (u64, u64) {
+    let n = s.len();
+    if n >= 10 {
+        // Fast path for 33-byte v5 IDs in contiguous input mmap: zero nested call, zero branch.
+        let ilen = INPUT_LEN.load(AOrd::Relaxed);
+        if ilen != 0 && n < REF_MAX_LEN {
+            let base = INPUT_BASE.load(AOrd::Relaxed);
+            let off = (s.as_ptr() as usize).wrapping_sub(base);
+            if off < ilen && n <= ilen - off {
+                return (REF_TAG | ((n as u64) << 36) | (off as u64), crate::hash::hash(s, seed));
+            }
+        }
+        return (OVF_TAG | overflow_store().intern(s), crate::hash::hash(s, seed));
+    }
     let v = pack_slow(s);
     let h = if !is_non_inline_raw(v) {
         mum(v ^ seed, P0)
@@ -346,6 +359,9 @@ impl Key8 {
     /// Impossible sentinel key used to mark deduplicated-away `PEv` tombstones in place
     /// (real overflow/ref keys always have top byte `0xC0`/`0xD0`, never `0xFF`).
     pub const TOMBSTONE: Key8 = Key8(u64::MAX);
+    /// Sentinel returned by `pack_inline_or_sentinel` when a `user_id` does not fit inline
+    /// (strictly disjoint from EMPTY, inline keys `<= 0x87`, valid OVF/REF keys, and TOMBSTONE).
+    pub const NON_INLINE_SENTINEL: Key8 = Key8(0xCFFF_FFFF_FFFF_FFFF);
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
@@ -358,13 +374,44 @@ impl Key8 {
         is_non_inline_raw(self.0)
     }
 
+    /// Fast-path inline pack+hash for `user_id`: avoids `REF_TAG` calculation and 33-byte hashing
+    /// for non-inline IDs (returns `(NON_INLINE_SENTINEL, 0)` so callers can hex128-pack them directly).
     #[inline(always)]
-    pub fn prefetch_ref(&self) {
-        if (self.0 >> 56) == REF_TAG_BYTE {
-            let base = INPUT_BASE.load(AOrd::Relaxed);
-            let off = (self.0 & REF_OFF_MASK) as usize;
-            crate::links::prefetch((base + off) as *const u8);
+    pub fn pack_inline_or_sentinel(s: &[u8], seed: u64) -> (Key8, u64) {
+        let n = s.len();
+        let p = s.as_ptr();
+        if n == 9 {
+            unsafe {
+                if *p == b'u' {
+                    let v = (p.add(1) as *const u64).read_unaligned();
+                    if (v as i64) > 0 {
+                        return (Key8(v), mum(v ^ seed, P0));
+                    }
+                }
+            }
+            return (Key8::NON_INLINE_SENTINEL, 0);
         }
+        if n == 8 {
+            unsafe {
+                let w0 = (p as *const u64).read_unaligned();
+                if (w0 as u8) == b'u' {
+                    let v = (w0 >> 8) | (0x80u64 << 56);
+                    return (Key8(v), mum(v ^ seed, P0));
+                }
+            }
+            return (Key8::NON_INLINE_SENTINEL, 0);
+        }
+        if n == 0 {
+            return (Key8::EMPTY, 0);
+        }
+        if n <= 7 {
+            let mut v = (0x80u64 | n as u64) << 56;
+            for (i, &b) in s.iter().enumerate() {
+                v |= (b as u64) << (i * 8);
+            }
+            return (Key8(v), mum(v ^ seed, P0));
+        }
+        (Key8::NON_INLINE_SENTINEL, 0)
     }
 
     #[cfg(test)]
@@ -441,6 +488,106 @@ impl OverflowStore {
         let sh = (idx as usize) & (OVF_SHARDS - 1);
         self.shards[sh].lock().unwrap().strs[(idx >> OVF_SHARD_BITS) as usize]
     }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+static HEX_DEC_LUT: [u8; 256] = {
+    let mut t = [0xFFu8; 256];
+    let mut i = 0usize;
+    while i < 10 {
+        t[(b'0' as usize) + i] = i as u8;
+        i += 1;
+    }
+    let mut j = 0usize;
+    while j < 6 {
+        t[(b'a' as usize) + j] = (10 + j) as u8;
+        j += 1;
+    }
+    t
+};
+
+static HEX_ENC_PAIR: [[u8; 2]; 256] = {
+    const DIG: &[u8; 16] = b"0123456789abcdef";
+    let mut t = [[0u8; 2]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = [DIG[i >> 4], DIG[i & 15]];
+        i += 1;
+    }
+    t
+};
+
+/// Lossless bijection for `'u'` + 32 lowercase ASCII hex bytes (`[0-9a-f]{32}`) -> `(lo, hi)`.
+/// Returns `None` for any other length, prefix, uppercase hex, or non-hex byte.
+#[inline(always)]
+pub fn try_pack_hex33(s: &[u8]) -> Option<(u64, u64)> {
+    if s.len() != 33 || unsafe { *s.get_unchecked(0) } != b'u' {
+        return None;
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use core::arch::x86_64::*;
+        let v = _mm256_loadu_si256(s.as_ptr().add(1) as *const __m256i);
+        // Unsigned range checks via +0x80 signed shift:
+        // '0'..='9' (0x30..=0x39): base_s = 0x30 - 0x80 = -80i8, limit = -118i8
+        // 'a'..='f' (0x61..=0x66): base_s = 0x61 - 0x80 = -31i8, limit = -122i8
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(-80i8));
+        let is_dig = _mm256_cmpgt_epi8(_mm256_set1_epi8(-118i8), d);
+        let a = _mm256_sub_epi8(v, _mm256_set1_epi8(-31i8));
+        let is_hex = _mm256_cmpgt_epi8(_mm256_set1_epi8(-122i8), a);
+        if _mm256_movemask_epi8(_mm256_or_si256(is_dig, is_hex)) != -1i32 {
+            return None;
+        }
+        let nib = _mm256_add_epi8(
+            _mm256_and_si256(v, _mm256_set1_epi8(0x0F)),
+            _mm256_and_si256(is_hex, _mm256_set1_epi8(9)),
+        );
+        let paired = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+        let packed = _mm256_packus_epi16(paired, paired);
+        let lo = _mm_cvtsi128_si64(_mm256_castsi256_si128(packed)) as u64;
+        let hi = _mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(packed)) as u64;
+        Some((lo, hi))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    unsafe {
+        let p = s.as_ptr().add(1);
+        let mut bad = 0u8;
+        let mut b = [0u8; 16];
+        for i in 0..16 {
+            let h0 = *HEX_DEC_LUT.get_unchecked(*p.add(i * 2) as usize);
+            let h1 = *HEX_DEC_LUT.get_unchecked(*p.add(i * 2 + 1) as usize);
+            bad |= h0 | h1;
+            *b.get_unchecked_mut(i) = (h0 << 4) | h1;
+        }
+        if (bad & 0x80) != 0 {
+            return None;
+        }
+        let lo = u64::from_le_bytes(*(b.as_ptr() as *const [u8; 8]));
+        let hi = u64::from_le_bytes(*(b.as_ptr().add(8) as *const [u8; 8]));
+        Some((lo, hi))
+    }
+}
+
+/// Exact inverse of `try_pack_hex33`: writes `'u'` + 32 lowercase hex bytes into `out`.
+#[inline(always)]
+pub fn unpack_hex33(lo: u64, hi: u64, out: &mut [u8; 33]) {
+    unsafe {
+        *out.get_unchecked_mut(0) = b'u';
+        let mut dst = out.as_mut_ptr().add(1) as *mut [u8; 2];
+        for byte in lo.to_le_bytes() {
+            dst.write_unaligned(*HEX_ENC_PAIR.get_unchecked(byte as usize));
+            dst = dst.add(1);
+        }
+        for byte in hi.to_le_bytes() {
+            dst.write_unaligned(*HEX_ENC_PAIR.get_unchecked(byte as usize));
+            dst = dst.add(1);
+        }
+    }
+}
+
+#[inline(always)]
+pub fn hash_hex128(lo: u64, hi: u64, seed: u64) -> u64 {
+    mum(lo ^ seed, P0) ^ mum(hi ^ seed, P1)
 }
 
 #[cfg(test)]
@@ -581,5 +728,35 @@ mod tests {
         assert!(cnt_hi.iter().all(|&c| c > 700 && c < 1300), "hi: {cnt_hi:?}");
         assert!(cnt_lo.iter().all(|&c| c > 700 && c < 1300), "lo: {cnt_lo:?}");
         assert!(cnt_tag.iter().all(|&c| c > 1500 && c < 2500), "tag: {cnt_tag:?}");
+    }
+
+    #[test]
+    fn hex33_roundtrip_and_validation() {
+        let mut buf = [0u8; 33];
+        for i in 0..4096u64 {
+            let a = mum(i ^ 0x1234_5678, P0);
+            let b = mum(i ^ 0x9abc_def0, P1);
+            let s = format!("u{a:016x}{b:016x}");
+            let (lo, hi) = try_pack_hex33(s.as_bytes()).expect("valid hex33");
+            unpack_hex33(lo, hi, &mut buf);
+            assert_eq!(&buf[..], s.as_bytes());
+        }
+        let base = b"u0123456789abcdef0123456789abcdef";
+        assert!(try_pack_hex33(base).is_some());
+        assert!(try_pack_hex33(&base[..32]).is_none());
+        assert!(try_pack_hex33(b"e0123456789abcdef0123456789abcdef").is_none());
+        for pos in 1..33 {
+            for ch in 0..=255u8 {
+                let mut mutated = *base;
+                mutated[pos] = ch;
+                let ok = ch.is_ascii_digit() || (b'a'..=b'f').contains(&ch);
+                let res = try_pack_hex33(&mutated);
+                assert_eq!(res.is_some(), ok, "pos={pos} ch={ch:#x}");
+                if let Some((lo, hi)) = res {
+                    unpack_hex33(lo, hi, &mut buf);
+                    assert_eq!(&buf[..], &mutated[..]);
+                }
+            }
+        }
     }
 }

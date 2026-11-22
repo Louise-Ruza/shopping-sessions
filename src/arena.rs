@@ -25,6 +25,8 @@ pub const MAX_BLOCKS: usize = 8_190;
 pub const LOC_EMPTY: u32 = u32::MAX - 1;
 pub const LOC_INVALID: u32 = u32::MAX;
 pub const LOC_PURCH_BIT: u32 = 0x8000_0000;
+pub const LOC_LONG_BIT: u32 = 0x4000_0000;
+pub const LOC_OTHER_BIT: u32 = LOC_PURCH_BIT | LOC_LONG_BIT;
 
 static BLOCK_ADDRS: [AtomicUsize; MAX_BLOCKS] = [const { AtomicUsize::new(0) }; MAX_BLOCKS];
 
@@ -48,6 +50,18 @@ pub unsafe fn loc_ptr12<T>(loc: u32) -> *mut T {
     }
     let bid = (loc >> 18) as usize;
     let off = (loc & 0x3_FFFF) as usize;
+    let base = BLOCK_ADDRS.get_unchecked(bid).load(Ordering::Relaxed);
+    (base as *mut T).add(off)
+}
+
+/// Resolves a `loc` returned by `Scatter::push_with_loc24` into a raw pointer to the 24-byte record.
+#[inline(always)]
+pub unsafe fn loc_ptr24<T>(loc: u32) -> *mut T {
+    const {
+        assert!(std::mem::size_of::<T>() == 24);
+    }
+    let bid = ((loc & 0x3FFF_FFFF) >> 17) as usize;
+    let off = (loc & 0x1_FFFF) as usize;
     let base = BLOCK_ADDRS.get_unchecked(bid).load(Ordering::Relaxed);
     (base as *mut T).add(off)
 }
@@ -763,13 +777,27 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         sc
     }
 
-    /// Creates a `Scatter` for 12-byte records supporting `push_with_loc12` (bit 31 always 0).
+    /// Creates a `Scatter` for 12-byte records supporting `push_with_loc12` (bits 30..31 always 0).
     pub fn new_located12(set: &'a ShardSet<T, SEG_SZ>) -> Scatter<'a, T, STAGE, SEG_SZ> {
         const {
             assert!(std::mem::size_of::<T>() == 12);
             assert!((STAGE / 12).is_power_of_two());
             assert!((SEG_SZ / 12) % (STAGE / 12) == 0);
             assert!((BLOCK / SEG_SZ) * (SEG_SZ / 12) < (1 << 18));
+        }
+        let mut sc = Self::new(set);
+        sc.located = true;
+        unsafe { std::ptr::write_bytes(sc.loc_ptr, 0xFF, sc.nshards) }; // LOC_INVALID = u32::MAX
+        sc
+    }
+
+    /// Creates a `Scatter` for 24-byte records supporting buffered NT `push_with_loc24` (bit 30 = 1).
+    pub fn new_located24(set: &'a ShardSet<T, SEG_SZ>) -> Scatter<'a, T, STAGE, SEG_SZ> {
+        const {
+            assert!(std::mem::size_of::<T>() == 24);
+            assert!((STAGE / 24).is_power_of_two());
+            assert!((SEG_SZ / 24) % (STAGE / 24) == 0);
+            assert!((BLOCK / SEG_SZ) * (SEG_SZ / 24) < (1 << 17));
         }
         let mut sc = Self::new(set);
         sc.located = true;
@@ -801,6 +829,7 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         let gc = unsafe { self.gcur.get_unchecked_mut(g) };
         if gc.next_seg == Self::SEGS_PER_BLK {
             let (b, bid) = get_block();
+            assert!(bid < 4096, "PEv12 block id overflow");
             gc.blocks.push((b, bid));
             gc.block = b;
             gc.block_id = bid;
@@ -809,6 +838,25 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         let seg_idx = gc.next_seg;
         let p = gc.block + seg_idx * SEG_SZ;
         let loc = (gc.block_id << 18) | ((seg_idx * (SEG_SZ / 12)) as u32);
+        gc.next_seg = seg_idx + 1;
+        (p, loc)
+    }
+
+    #[inline(always)]
+    fn alloc_local_seg24(&mut self, s: usize) -> (usize, u32) {
+        let g = self.set.group_of(s);
+        let gc = unsafe { self.gcur.get_unchecked_mut(g) };
+        if gc.next_seg == Self::SEGS_PER_BLK {
+            let (b, bid) = get_block();
+            assert!(bid < 8192, "LongPEv block id overflow");
+            gc.blocks.push((b, bid));
+            gc.block = b;
+            gc.block_id = bid;
+            gc.next_seg = 0;
+        }
+        let seg_idx = gc.next_seg;
+        let p = gc.block + seg_idx * SEG_SZ;
+        let loc = LOC_LONG_BIT | (gc.block_id << 17) | ((seg_idx * (SEG_SZ / 24)) as u32);
         gc.next_seg = seg_idx + 1;
         (p, loc)
     }
@@ -836,6 +884,16 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
     #[inline(never)]
     fn ensure_seg_loc12(&mut self, s: usize) -> u32 {
         let (p, loc) = self.alloc_local_seg12(s);
+        unsafe {
+            *self.dest_ptr.add(s) = Dest { dst: p, rem: SEG_SZ as u32 };
+        }
+        loc
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn ensure_seg_loc24(&mut self, s: usize) -> u32 {
+        let (p, loc) = self.alloc_local_seg24(s);
         unsafe {
             *self.dest_ptr.add(s) = Dest { dst: p, rem: SEG_SZ as u32 };
         }
@@ -920,6 +978,32 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
             let mut loc = *lp;
             if loc == LOC_INVALID {
                 loc = self.ensure_seg_loc12(s);
+            }
+            let f = (loc & per_mask) as usize;
+            let st = self.stage_ptr.add(s * STAGE) as *mut T;
+            st.add(f).write(x);
+            let nloc = loc + 1;
+            *lp = nloc;
+            if (nloc & per_mask) == 0 {
+                self.flush_located(s);
+            }
+            loc
+        }
+    }
+
+    /// Buffers 24-byte records in a 192B (8-record, 3-cacheline) staging slot and flushes via NT stores.
+    #[inline(always)]
+    pub fn push_with_loc24(&mut self, s: usize, x: T) -> u32 {
+        const {
+            assert!(std::mem::size_of::<T>() == 24);
+            assert!((STAGE / 24).is_power_of_two());
+        }
+        let per_mask = (Self::PER as u32) - 1;
+        unsafe {
+            let lp = self.loc_ptr.add(s);
+            let mut loc = *lp;
+            if loc == LOC_INVALID {
+                loc = self.ensure_seg_loc24(s);
             }
             let f = (loc & per_mask) as usize;
             let st = self.stage_ptr.add(s * STAGE) as *mut T;

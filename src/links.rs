@@ -132,6 +132,48 @@ impl LinkTable {
         prefetch(unsafe { self.tab.as_ptr().add(self.slot(h)) } as *const u8);
     }
 
+    /// Dense canonical component id `cid` (`0..num_canon()`) for guaranteed-inline `Key8`s
+    /// (zero `is_non_inline` check, pure single-line AVX2 `vpcmpeqq` on x86-64).
+    #[inline(always)]
+    pub fn lookup_inline(&self, h: u64, uid: Key8) -> Option<u32> {
+        let mask = self.mask;
+        let mut i = (h >> self.tab_shift) as usize;
+        loop {
+            let b = unsafe { self.tab.get_unchecked(i) };
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            unsafe {
+                use core::arch::x86_64::*;
+                let v = _mm256_load_si256(b.keys.as_ptr() as *const __m256i);
+                let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(
+                    v,
+                    _mm256_set1_epi64x(uid.0 as i64),
+                ))) as u32;
+                if eq != 0 {
+                    return Some(*b.cids.get_unchecked(eq.trailing_zeros() as usize));
+                }
+                if b.keys[4].0 == uid.0 {
+                    return Some(b.cids[4]);
+                }
+                if b.len < 5 {
+                    return None;
+                }
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            {
+                let n = b.len as usize;
+                for k in 0..n {
+                    if unsafe { *b.keys.get_unchecked(k) }.0 == uid.0 {
+                        return Some(unsafe { *b.cids.get_unchecked(k) });
+                    }
+                }
+                if n < 5 {
+                    return None;
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
     /// Dense canonical component id `cid` (`0..num_canon()`) if `uid` belongs to a linked component of size >= 2.
     #[inline(always)]
     pub fn lookup(&self, h: u64, uid: Key8) -> Option<u32> {
@@ -180,6 +222,28 @@ impl LinkTable {
                 if n < 5 {
                     return None;
                 }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Exact lookup by precomputed hash `h` and raw `user_id` bytes (for long inline-byte streams).
+    #[inline(always)]
+    pub fn lookup_bytes(&self, h: u64, bytes: &[u8]) -> Option<u32> {
+        let mask = self.mask;
+        let mut i = (h >> self.tab_shift) as usize;
+        let mut buf = [0u8; 16];
+        loop {
+            let b = unsafe { self.tab.get_unchecked(i) };
+            let n = b.len as usize;
+            for k in 0..n {
+                let kk = unsafe { *b.keys.get_unchecked(k) };
+                if kk.is_non_inline() && kk.as_slice(&mut buf) == bytes {
+                    return Some(unsafe { *b.cids.get_unchecked(k) });
+                }
+            }
+            if n < 5 {
+                return None;
             }
             i = (i + 1) & mask;
         }

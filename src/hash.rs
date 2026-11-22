@@ -23,11 +23,11 @@ unsafe fn r4(p: *const u8) -> u64 {
 pub fn hash(s: &[u8], seed: u64) -> u64 {
     let len = s.len();
     let p = s.as_ptr();
-    let mut seed = seed ^ P0;
-    let a;
-    let b;
+    let seed = seed ^ P0;
     unsafe {
         if len <= 16 {
+            let a;
+            let b;
             if len >= 4 {
                 let off = (len >> 3) << 2;
                 a = (r4(p) << 32) | r4(p.add(off));
@@ -39,17 +39,36 @@ pub fn hash(s: &[u8], seed: u64) -> u64 {
                 a = 0;
                 b = 0;
             }
-        } else {
-            let mut i = len;
-            let mut q = p;
-            while i > 16 {
-                seed = mum(r8(q) ^ P1, r8(q.add(8)) ^ seed);
-                q = q.add(16);
-                i -= 16;
-            }
-            a = r8(p.add(len - 16));
-            b = r8(p.add(len - 8));
+            return mum(P1 ^ (len as u64), mum(a ^ P1, b ^ seed));
         }
+        if len == 33 {
+            // Exact 3-mum depth-2 fast path for 33-byte v5 hex IDs (4 non-overlapping u64 loads).
+            let s0 = mum(r8(p.add(1)) ^ P1, r8(p.add(9)) ^ seed);
+            let s1 = mum(r8(p.add(17)) ^ P0, r8(p.add(25)) ^ (seed ^ (*p as u64)));
+            return mum(s0 ^ P1, s1 ^ (33u64 << 32));
+        }
+        if len <= 48 {
+            // 2-way ILP fast path for 17..=48 byte IDs (zero loop).
+            let s0 = mum(r8(p) ^ P1, r8(p.add(8)) ^ seed);
+            let s1 = if len > 32 {
+                mum(r8(p.add(16)) ^ P0, r8(p.add(24)) ^ seed)
+            } else {
+                seed
+            };
+            let a = r8(p.add(len - 16));
+            let b = r8(p.add(len - 8));
+            return mum(P1 ^ (len as u64), mum(a ^ s0, b ^ s1));
+        }
+        let mut s = seed;
+        let mut i = len;
+        let mut q = p;
+        while i > 16 {
+            s = mum(r8(q) ^ P1, r8(q.add(8)) ^ s);
+            q = q.add(16);
+            i -= 16;
+        }
+        let a = r8(p.add(len - 16));
+        let b = r8(p.add(len - 8));
+        mum(P1 ^ (len as u64), mum(a ^ P1, b ^ s))
     }
-    mum(P1 ^ (len as u64), mum(a ^ P1, b ^ seed))
 }

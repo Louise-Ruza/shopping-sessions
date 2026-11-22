@@ -692,6 +692,22 @@ impl UserDailyBuf {
     }
 
     #[inline(always)]
+    pub fn begin_person_bytes(&mut self, s: &[u8], carver: &mut BlockCarver) {
+        let slen = s.len();
+        if self.user_dict.cap - self.user_dict.len < 4 + slen {
+            self.user_dict.grow_arena(4 + slen, carver);
+        }
+        unsafe {
+            let dst = self.user_dict.ptr.add(self.user_dict.len);
+            (dst as *mut u32).write_unaligned((slen as u32).to_le());
+            std::ptr::copy_nonoverlapping(s.as_ptr(), dst.add(4), slen);
+            self.user_dict.len += 4 + slen;
+        }
+        self.person_start = self.nrows;
+        self.npersons += 1;
+    }
+
+    #[inline(always)]
     pub fn begin_person(&mut self, person: Key8, carver: &mut BlockCarver) {
         let v = person.0;
         let hi = v >> 56;
