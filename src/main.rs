@@ -1441,8 +1441,10 @@ struct AggBin {
 const AGG_BIN_EMPTY: AggBin = AggBin { inv_min_ts: 0, max_ts: 0, cnt: 0, head: u32::MAX };
 const BIN_AGG_MIN_EVENTS: usize = 9;
 
+/// Between persons every `CampState` is all-zero, so `attribute_mask` can reuse it as a u32
+/// per-campaign session bitmask (`align(4)` makes that reinterpretation sound).
 #[derive(Clone, Copy, Default)]
-#[repr(C)]
+#[repr(C, align(4))]
 struct CampState {
     cnt: u16,
     since: u16,
@@ -2118,13 +2120,10 @@ impl<'a> Worker<'a> {
             let mut w = 0usize;
             let n = clicks.len();
             for i in 0..n {
+                // Branch-free: always store (w <= i), advance only for in-range clicks.
                 let c = unsafe { *clicks.get_unchecked(i) };
-                if c.ts >= first_lo && c.ts <= last_hi {
-                    if w != i {
-                        unsafe { *clicks.get_unchecked_mut(w) = c };
-                    }
-                    w += 1;
-                }
+                unsafe { *clicks.get_unchecked_mut(w) = c };
+                w += usize::from(c.ts.wrapping_sub(first_lo) <= last_hi.wrapping_sub(first_lo));
             }
             if w == 0 {
                 for j in 0..nsess {
@@ -2201,6 +2200,18 @@ impl<'a> Worker<'a> {
             }
             return;
         }
+        if nsess <= 8 {
+            self.attribute_mask::<8>(clicks);
+            return;
+        }
+        if nsess <= 32 {
+            if nsess <= 16 {
+                self.attribute_mask::<16>(clicks);
+            } else {
+                self.attribute_mask::<32>(clicks);
+            }
+            return;
+        }
         if clicks.len() >= u16::MAX as usize || nsess >= u16::MAX as usize {
             self.attribute_clicks_wide(clicks, ctmp);
             return;
@@ -2248,6 +2259,7 @@ impl<'a> Worker<'a> {
                 st.cnt -= 1;
                 if st.cnt == 0 {
                     let a = st.since as u32;
+                    st.since = 0;
                     self.close(k, a, j as u32);
                 }
                 cl += 1;
@@ -2261,9 +2273,107 @@ impl<'a> Worker<'a> {
             if st.cnt > 0 {
                 st.cnt = 0;
                 let a = st.since as u32;
+                st.since = 0;
                 self.close(k, a, nsess as u32);
             }
         }
+    }
+
+    /// Sort-free attribution for 2..=L (L <= 32) sessions and >= 3 unsorted clicks. Each click's eligible
+    /// sessions form one run `[first, end)` (sessions with `ts <= start <= ts + 7d`), counted
+    /// branch-free against an L-lane start array. Clicks first eligible at the same session share
+    /// one bucket; the best of the latest non-empty bucket at or before a session is the latest
+    /// click overall at or before its start, so it is credited iff it is still within 7 days.
+    #[inline(never)]
+    fn attribute_mask<const L: usize>(&mut self, clicks: &[Cl24]) {
+        const WEEK: u32 = SEVEN_DAYS_MS as u32;
+        let nsess = self.sess.len();
+        debug_assert!((2..=L).contains(&nsess) && L <= 32);
+        let mut st = [u32::MAX; L];
+        for j in 0..nsess {
+            unsafe { *st.get_unchecked_mut(j) = self.sess.get_unchecked(j).start };
+        }
+        let mut best_ts = [0u32; L];
+        let mut best_ix = [0u32; L];
+        let mut occ = 0u32;
+        let ns = nsess as u32;
+        // `touched` may still hold category ids from `flush_row`; only our suffix is campaigns.
+        let t0 = self.touched.len();
+        self.touched.reserve(clicks.len());
+        let tptr = self.touched.as_mut_ptr();
+        let mut tl = t0;
+        let cst = self.camp_st.as_mut_ptr();
+        // Branch-free per click: unsorted clicks make "newer than the bucket best" and
+        // "first touch of this campaign" coin flips, so both are folded into masks/selects.
+        for (i, c) in clicks.iter().enumerate() {
+            let ts = c.ts;
+            let ts7 = ts.saturating_add(WEEK);
+            let mut first = 0u32;
+            let mut end = 0u32;
+            for &x in &st {
+                first += u32::from(x < ts);
+                end += u32::from(x <= ts7);
+            }
+            let end = end.min(ns);
+            let valid = first < end;
+            // `first <= end <= ns <= 32`; an empty run gives mask 0.
+            let mask = ((1u64 << end) - (1u64 << first.min(end))) as u32;
+            let k = c.camp as usize;
+            // `camp_st[k]` (all-zero between persons) doubles as the u32 session bitmask.
+            let cm = unsafe { &mut *(cst.add(k) as *mut u32) };
+            let old = *cm;
+            unsafe { tptr.add(tl).write(k as u32) };
+            tl += usize::from((old == 0) & (mask != 0));
+            *cm = old | mask;
+            let f = (first as usize).min(L - 1);
+            let bt = unsafe { *best_ts.get_unchecked(f) };
+            let bix = unsafe { *best_ix.get_unchecked(f) };
+            let occupied = (occ >> f) & 1 != 0;
+            let mut better = !occupied | (ts > bt);
+            if occupied & (ts == bt) {
+                better = c.cid.cmp_bytes(unsafe { &clicks.get_unchecked(bix as usize).cid })
+                    == std::cmp::Ordering::Less;
+            }
+            let bm = u32::from(better & valid).wrapping_neg();
+            unsafe {
+                *best_ts.get_unchecked_mut(f) = (ts & bm) | (bt & !bm);
+                *best_ix.get_unchecked_mut(f) = (i as u32 & bm) | (bix & !bm);
+            }
+            occ |= (bm & 1) << f;
+        }
+        unsafe { self.touched.set_len(tl) };
+        let mut cur_ts = 0u32;
+        let mut cur_camp = 0usize;
+        let mut have = false;
+        for j in 0..nsess {
+            let s = unsafe { *self.sess.get_unchecked(j) };
+            unsafe { *self.day_end.get_unchecked_mut(s.day as usize) = j as u32 + 1 };
+            if (occ >> j) & 1 != 0 {
+                have = true;
+                cur_ts = unsafe { *best_ts.get_unchecked(j) };
+                cur_camp = unsafe { clicks.get_unchecked(*best_ix.get_unchecked(j) as usize).camp as usize };
+            }
+            let credited = if have && s.start - cur_ts <= WEEK { cur_camp } else { 0 };
+            self.add_session(credited, s.day as usize, s.purch, s.rev);
+        }
+        for t in t0..self.touched.len() {
+            let k = unsafe { *self.touched.get_unchecked(t) } as usize;
+            let cm = unsafe { &mut *(self.camp_st.as_mut_ptr().add(k) as *mut u32) };
+            let mut rem = *cm;
+            *cm = 0;
+            while rem != 0 {
+                let a = rem.trailing_zeros();
+                let len = (rem >> a).trailing_ones();
+                self.close(k, a, a + len);
+                // Clear the lowest run of ones (a carry out of bit 31 wraps away harmlessly).
+                if L == 32 {
+                    rem &= !((((1u64 << len) - 1) << a) as u32);
+                } else {
+                    rem &= rem.wrapping_add(1u32 << a);
+                }
+            }
+        }
+        self.touched.truncate(t0);
     }
 
     #[cold]
