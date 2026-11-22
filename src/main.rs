@@ -78,6 +78,98 @@ impl Mmap {
     }
 }
 
+/// Reserves a single contiguous virtual address range sized to the input CSVs (`PROT_NONE`,
+/// zero RSS) and `MAP_FIXED`-maps all input CSVs into it so any variable-width ID slice in
+/// `events/`, `clicks/`, or `links/` encodes zero-copy into an 8-byte `(len << 36) | off` key.
+struct InputArena {
+    base: usize,
+    cap: usize,
+    cursor: usize,
+    page: usize,
+}
+
+impl InputArena {
+    fn new(dirs: &[PathBuf]) -> Self {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }.max(4096);
+        let mut cap = 0usize;
+        for dir in dirs {
+            for p in list_csv(dir) {
+                if let Ok(m) = std::fs::metadata(&p) {
+                    let len = m.len() as usize;
+                    if len > 0 {
+                        cap = cap.saturating_add((len + page - 1) & !(page - 1));
+                    }
+                }
+            }
+        }
+        // Cap at 64 GiB (36-bit offset limit in REF_TAG).
+        cap = cap.min(64usize << 30);
+        if cap == 0 {
+            return InputArena { base: 0, cap: 0, cursor: 0, page };
+        }
+        #[cfg(target_os = "linux")]
+        let extra = libc::MAP_NORESERVE;
+        #[cfg(not(target_os = "linux"))]
+        let extra = 0;
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                cap,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | extra,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            InputArena { base: 0, cap: 0, cursor: 0, page }
+        } else {
+            InputArena { base: p as usize, cap, cursor: 0, page }
+        }
+    }
+
+    fn map_file(&mut self, path: &Path) -> std::io::Result<&'static [u8]> {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::File::open(path)?;
+        let len = f.metadata()?.len() as usize;
+        if len == 0 {
+            return Ok(&[]);
+        }
+        let aligned = (len + self.page - 1) & !(self.page - 1);
+        if self.base != 0 && self.cursor.saturating_add(aligned) <= self.cap {
+            let addr = (self.base + self.cursor) as *mut libc::c_void;
+            let p = unsafe {
+                libc::mmap(
+                    addr,
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE | libc::MAP_FIXED,
+                    f.as_raw_fd(),
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED {
+                self.cursor += aligned;
+                return Ok(unsafe { std::slice::from_raw_parts(p as *const u8, len) });
+            }
+        }
+        Ok(Mmap::open(path)?.data())
+    }
+
+    fn map_dir(&mut self, dir: &Path) -> Vec<&'static [u8]> {
+        list_csv(dir)
+            .iter()
+            .map(|p| self.map_file(p).unwrap_or_else(|e| panic!("mmap {}: {e}", p.display())))
+            .collect()
+    }
+
+    fn finish(self) {
+        if self.base != 0 && self.cursor > 0 {
+            key::register_input_region(self.base, self.cursor);
+        }
+    }
+}
+
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -92,16 +184,6 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     }
     v.sort();
     v
-}
-
-fn map_dir(dir: &Path) -> Vec<&'static [u8]> {
-    list_csv(dir)
-        .iter()
-        .map(|p| {
-            // Mappings live for the whole process (no Drop / munmap).
-            Mmap::open(p).unwrap_or_else(|e| panic!("mmap {}: {e}", p.display())).data()
-        })
-        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -415,6 +497,18 @@ struct DedupRec {
     loc: u32,
 }
 
+/// 24-byte event_id dedup record for long/non-inline `event_id`s (disjoint from inline `DedupRec`).
+/// Carries precomputed `eh` so `dedup_long_shard` never hashes or dereferences `eid` except on
+/// exact 64-bit hash matches (~0.3% true duplicates).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LongDedupRec {
+    eh: u64,
+    eid: EKey,
+    ingest: u32,
+    loc: u32,
+}
+
 #[cold]
 #[inline(never)]
 fn encode_special_ingest(ing_bcd: u32, exact_ms: i64, oob: &Mutex<Vec<i64>>) -> u32 {
@@ -548,12 +642,14 @@ struct Cl24 {
 }
 
 const _: () = assert!(std::mem::size_of::<DedupRec>() == 16);
+const _: () = assert!(std::mem::size_of::<LongDedupRec>() == 24);
 const _: () = assert!(std::mem::size_of::<PEv12>() == 12);
 const _: () = assert!(std::mem::size_of::<PPurch>() == 16);
 const _: () = assert!(std::mem::size_of::<Click>() == 24);
 const _: () = assert!(std::mem::size_of::<Ev8>() == 8);
 const _: () = assert!(std::mem::size_of::<Cl24>() == 16);
 const _: () = assert!(arena::SEG / std::mem::size_of::<DedupRec>() <= 1024);
+const _: () = assert!(arena::SEG / std::mem::size_of::<LongDedupRec>() <= 1024);
 
 struct Ctx {
     ws: i64,
@@ -894,6 +990,249 @@ fn dedup_shard(
         }
     }
     // Deferred 16-ahead prefetched tombstone pass: overlaps cold DRAM RFO writes into `ev_set`/`purch_set`.
+    let nl = loser_locs.len();
+    if nl > 0 {
+        let lp = loser_locs.as_ptr();
+        let pre = nl.min(PF);
+        for i in 0..pre {
+            unsafe { prefetch_ev_loc(*lp.add(i)) };
+        }
+        let main_end = nl.saturating_sub(PF);
+        for i in 0..main_end {
+            unsafe {
+                prefetch_ev_loc(*lp.add(i + PF));
+                tombstone_ev_loc(*lp.add(i));
+            }
+        }
+        for i in main_end..nl {
+            unsafe { tombstone_ev_loc(*lp.add(i)) };
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn dedup_long_shard_wide(
+    segs: &Segs<LongDedupRec>,
+    buckets: &mut Vec<DedupBucket>,
+    base: i64,
+    oob: &[i64],
+) {
+    let n = segs.len();
+    let nseg = segs.segs.len();
+    assert!(nseg < (1 << 22), "long event_id shard too large");
+    let nbuckets = ((n / 5) + 1).next_power_of_two().max(4);
+    if buckets.len() < nbuckets {
+        buckets.resize(nbuckets, DEDUP_BUCKET_EMPTY);
+    }
+    unsafe { std::ptr::write_bytes(buckets.as_mut_ptr(), 0, nbuckets) };
+    let bmask = nbuckets - 1;
+    let bptr = buckets.as_mut_ptr();
+    let seg_meta = segs.segs.as_ptr();
+    for si in 0..nseg {
+        let seg = segs.seg(si);
+        for ri in 0..seg.len() {
+            let r = unsafe { seg.get_unchecked(ri) };
+            let h = r.eh;
+            let tag = (h as u32) | 1;
+            let me = ((si << 10) | ri) as u32;
+            let mut bi = ((h >> 32) as usize) & bmask;
+            'probe: loop {
+                unsafe {
+                    let bkt = bptr.add(bi);
+                    let (mut eq, em) = bucket_masks((*bkt).tags.as_ptr(), tag);
+                    while eq != 0 {
+                        let lane = eq.trailing_zeros() as usize;
+                        eq &= eq - 1;
+                        let oi = *(*bkt).pos.get_unchecked(lane);
+                        let os = *seg_meta.add((oi >> 10) as usize);
+                        let o = &*(os.ptr as *const LongDedupRec).add((oi & 1023) as usize);
+                        if o.eh == r.eh && o.eid == r.eid {
+                            let loser_loc = if ingest_less(r.ingest, o.ingest, base, oob) {
+                                *(*bkt).pos.get_unchecked_mut(lane) = me;
+                                o.loc
+                            } else {
+                                r.loc
+                            };
+                            if loser_loc != arena::LOC_INVALID {
+                                tombstone_ev_loc(loser_loc);
+                            }
+                            break 'probe;
+                        }
+                    }
+                    if em != 0 {
+                        let lane = em.trailing_zeros() as usize;
+                        *(*bkt).tags.get_unchecked_mut(lane) = tag;
+                        *(*bkt).pos.get_unchecked_mut(lane) = me;
+                        break;
+                    }
+                    bi = (bi + 1) & bmask;
+                }
+            }
+        }
+    }
+}
+
+/// L1-resident single-pass exact dedup over the disjoint long/non-inline `event_id` stream.
+/// Uses precomputed `r.eh` (zero hashing, zero CSV mmap derefs except on exact 64-bit hash matches).
+fn dedup_long_shard(
+    segs: &mut Segs<LongDedupRec>,
+    buckets16: &mut HugeBuf<DedupBucket16>,
+    buckets32: &mut Vec<DedupBucket>,
+    seg_starts: &mut Vec<u32>,
+    loser_locs: &mut Vec<u32>,
+    base: i64,
+    oob: &[i64],
+) {
+    let n = segs.len();
+    if n < 2 {
+        return;
+    }
+    if n > u16::MAX as usize {
+        dedup_long_shard_wide(segs, buckets32, base, oob);
+        return;
+    }
+    const LONG_SEG_CAP: u32 = (arena::SEG / std::mem::size_of::<LongDedupRec>()) as u32;
+    let nseg = segs.segs.len();
+    let mut n_full = 0usize;
+    for i in 0..nseg {
+        if segs.segs[i].n == LONG_SEG_CAP {
+            if i != n_full {
+                segs.segs.swap(i, n_full);
+            }
+            n_full += 1;
+        }
+    }
+    let full_end = n_full as u32 * LONG_SEG_CAP;
+    seg_starts.clear();
+    let mut off = full_end;
+    for s in &segs.segs[n_full..] {
+        seg_starts.push(off);
+        off += s.n;
+    }
+    let nbuckets = ((n / 10) + 64) & !63;
+    buckets16.reset_zeroed(nbuckets);
+    let bptr = buckets16.as_mut_ptr();
+    let seg_meta = segs.segs.as_ptr();
+    loser_locs.clear();
+
+    const PF: usize = 16;
+    let mut bring = [(0u32, 0u16); PF];
+    let mut me = 0u16;
+    for si in 0..nseg {
+        let seg = segs.seg(si);
+        let slen = seg.len();
+        let pre = slen.min(PF);
+        for ri in 0..pre {
+            let h = unsafe { seg.get_unchecked(ri).eh };
+            let bi = fast_bucket(h, nbuckets);
+            bring[ri] = (bi as u32, (h as u16) | 1);
+            prefetch(unsafe { bptr.add(bi) } as *const u8);
+        }
+        let main_end = slen.saturating_sub(PF);
+        for ri in 0..main_end {
+            let (bi0, tag) = bring[ri & (PF - 1)];
+            let fh = unsafe { seg.get_unchecked(ri + PF).eh };
+            let fbi = fast_bucket(fh, nbuckets);
+            bring[(ri + PF) & (PF - 1)] = (fbi as u32, (fh as u16) | 1);
+            prefetch(unsafe { bptr.add(fbi) } as *const u8);
+            let mut bi = bi0 as usize;
+            'probe: loop {
+                unsafe {
+                    let bkt = bptr.add(bi);
+                    let (mut eq, em) = bucket16_masks((*bkt).tags.as_ptr(), tag);
+                    while eq != 0 {
+                        let lane = (eq.trailing_zeros() >> 1) as usize;
+                        eq &= eq - 1;
+                        eq &= eq - 1;
+                        let oi = *(*bkt).pos.get_unchecked(lane) as u32;
+                        let (osi, ori) = if oi < full_end {
+                            let s = oi / LONG_SEG_CAP;
+                            (s as usize, (oi - s * LONG_SEG_CAP) as usize)
+                        } else {
+                            let t = seg_starts.partition_point(|&st| st <= oi) - 1;
+                            (n_full + t, (oi - *seg_starts.get_unchecked(t)) as usize)
+                        };
+                        let os = *seg_meta.add(osi);
+                        let o = &*(os.ptr as *const LongDedupRec).add(ori);
+                        let r = seg.get_unchecked(ri);
+                        if o.eh == r.eh && o.eid == r.eid {
+                            let loser_loc = if ingest_less(r.ingest, o.ingest, base, oob) {
+                                *(*bkt).pos.get_unchecked_mut(lane) = me;
+                                o.loc
+                            } else {
+                                r.loc
+                            };
+                            if loser_loc != arena::LOC_INVALID {
+                                loser_locs.push(loser_loc);
+                            }
+                            break 'probe;
+                        }
+                    }
+                    if em != 0 {
+                        let lane = (em.trailing_zeros() >> 1) as usize;
+                        *(*bkt).tags.get_unchecked_mut(lane) = tag;
+                        *(*bkt).pos.get_unchecked_mut(lane) = me;
+                        break;
+                    }
+                    bi += 1;
+                    if bi == nbuckets {
+                        bi = 0;
+                    }
+                }
+            }
+            me = me.wrapping_add(1);
+        }
+        for ri in main_end..slen {
+            let (bi0, tag) = bring[ri & (PF - 1)];
+            let mut bi = bi0 as usize;
+            'probe: loop {
+                unsafe {
+                    let bkt = bptr.add(bi);
+                    let (mut eq, em) = bucket16_masks((*bkt).tags.as_ptr(), tag);
+                    while eq != 0 {
+                        let lane = (eq.trailing_zeros() >> 1) as usize;
+                        eq &= eq - 1;
+                        eq &= eq - 1;
+                        let oi = *(*bkt).pos.get_unchecked(lane) as u32;
+                        let (osi, ori) = if oi < full_end {
+                            let s = oi / LONG_SEG_CAP;
+                            (s as usize, (oi - s * LONG_SEG_CAP) as usize)
+                        } else {
+                            let t = seg_starts.partition_point(|&st| st <= oi) - 1;
+                            (n_full + t, (oi - *seg_starts.get_unchecked(t)) as usize)
+                        };
+                        let os = *seg_meta.add(osi);
+                        let o = &*(os.ptr as *const LongDedupRec).add(ori);
+                        let r = seg.get_unchecked(ri);
+                        if o.eh == r.eh && o.eid == r.eid {
+                            let loser_loc = if ingest_less(r.ingest, o.ingest, base, oob) {
+                                *(*bkt).pos.get_unchecked_mut(lane) = me;
+                                o.loc
+                            } else {
+                                r.loc
+                            };
+                            if loser_loc != arena::LOC_INVALID {
+                                loser_locs.push(loser_loc);
+                            }
+                            break 'probe;
+                        }
+                    }
+                    if em != 0 {
+                        let lane = (em.trailing_zeros() >> 1) as usize;
+                        *(*bkt).tags.get_unchecked_mut(lane) = tag;
+                        *(*bkt).pos.get_unchecked_mut(lane) = me;
+                        break;
+                    }
+                    bi += 1;
+                    if bi == nbuckets {
+                        bi = 0;
+                    }
+                }
+            }
+            me = me.wrapping_add(1);
+        }
+    }
     let nl = loser_locs.len();
     if nl > 0 {
         let lp = loser_locs.as_ptr();
@@ -2895,13 +3234,19 @@ impl SolveScratch {
         self.ev_pids16.clear();
         self.ev_pids16.reserve_uninit(nev);
 
-        // Pass 1 over 12B non-purchase events: intern exact raw Key8 uids in inline 16B HtEnt
+        // Pass 1 over 12B non-purchase events: 2-stage prefetch (PF_REF=16 for long mmap uids, PF=8 for ht)
         const PF: usize = 8;
+        const PF_REF: usize = 16;
         let mut hring = [0u64; PF];
         let pid_out = self.ev_pids16.as_mut_ptr();
         let mut pk = 0usize;
         for seg in es.iter() {
             let slen = seg.len();
+            let pre_ref = slen.min(PF_REF);
+            for ri in 0..pre_ref {
+                let p = unsafe { seg.get_unchecked(ri).person };
+                p.prefetch_ref();
+            }
             let pre = slen.min(PF);
             for ri in 0..pre {
                 let person = unsafe { seg.get_unchecked(ri).person };
@@ -2909,8 +3254,10 @@ impl SolveScratch {
                 hring[ri] = h;
                 prefetch(unsafe { self.ht.as_ptr().add(h as usize & self.ht_mask) } as *const u8);
             }
-            let main_end = slen.saturating_sub(PF);
+            let main_end = slen.saturating_sub(PF_REF);
             for ri in 0..main_end {
+                let rp = unsafe { seg.get_unchecked(ri + PF_REF).person };
+                rp.prefetch_ref();
                 let h = hring[ri & (PF - 1)];
                 let fperson = unsafe { seg.get_unchecked(ri + PF).person };
                 let fh = fperson.hash(SEED_A);
@@ -2921,7 +3268,19 @@ impl SolveScratch {
                 unsafe { pid_out.add(pk).write(pid as u16) };
                 pk += 1;
             }
-            for ri in main_end..slen {
+            let tail_pf = slen.saturating_sub(PF);
+            for ri in main_end..tail_pf {
+                let h = hring[ri & (PF - 1)];
+                let fperson = unsafe { seg.get_unchecked(ri + PF).person };
+                let fh = fperson.hash(SEED_A);
+                hring[(ri + PF) & (PF - 1)] = fh;
+                prefetch(unsafe { self.ht.as_ptr().add(fh as usize & self.ht_mask) } as *const u8);
+                let person = unsafe { seg.get_unchecked(ri).person };
+                let pid = self.intern(person, h);
+                unsafe { pid_out.add(pk).write(pid as u16) };
+                pk += 1;
+            }
+            for ri in tail_pf..slen {
                 let h = hring[ri & (PF - 1)];
                 let person = unsafe { seg.get_unchecked(ri).person };
                 let pid = self.intern(person, h);
@@ -3023,6 +3382,10 @@ impl SolveScratch {
             let mut ck = 0usize;
             for seg in cs.iter() {
                 let slen = seg.len();
+                let pre_ref = slen.min(PF_REF);
+                for ri in 0..pre_ref {
+                    unsafe { seg.get_unchecked(ri).person.prefetch_ref() };
+                }
                 let pre = slen.min(PF);
                 for ri in 0..pre {
                     let h = unsafe { seg.get_unchecked(ri).person.hash(SEED_A) };
@@ -3031,6 +3394,9 @@ impl SolveScratch {
                 }
                 let main_end = slen.saturating_sub(PF);
                 for ri in 0..main_end {
+                    if ri + PF_REF < slen {
+                        unsafe { seg.get_unchecked(ri + PF_REF).person.prefetch_ref() };
+                    }
                     let h = hring[ri & (PF - 1)];
                     let fh = unsafe { seg.get_unchecked(ri + PF).person.hash(SEED_A) };
                     hring[(ri + PF) & (PF - 1)] = fh;
@@ -3699,6 +4065,7 @@ struct EventHandler<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAG
     oob_ref: &'b Mutex<Vec<i64>>,
     wide_ref: &'b Mutex<Vec<(u32, u16)>>,
     id_w: Scatter<'b, DedupRec, EV_STAGE>,
+    long_id_w: Scatter<'b, LongDedupRec, 192>,
     ev_w: Scatter<'b, PEv12, P_STAGE>,
     purch_w: Scatter<'b, PPurch, 64, PURCH_SEG>,
 }
@@ -3783,7 +4150,11 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
                 );
             }
         }
-        self.id_w.push(id_sh, DedupRec { eid: ek, ingest: ing_u32, loc });
+        if !ek.is_non_inline() {
+            self.id_w.push(id_sh, DedupRec { eid: ek, ingest: ing_u32, loc });
+        } else {
+            self.long_id_w.push(id_sh, LongDedupRec { eh: ev.eh, eid: ek, ingest: ing_u32, loc });
+        }
     }
 }
 
@@ -3804,8 +4175,7 @@ impl<'a, 'b, const P_BITS: u32, const CL_STAGE: usize> event_front::ClickSink<'_
         if cid.is_empty() || uid.is_empty() {
             return;
         }
-        let uid_k = Key8::new(uid);
-        let uh = uid_k.hash(SEED_A);
+        let (uid_k, uh) = Key8::new_and_hash(uid, SEED_A);
         let sh = (uh >> (64 - P_BITS)) as usize;
         self.w.prefetch_shard(sh);
         let Some(camp) = self.ctx.camps.get_swar(f[2]) else { return };
@@ -3841,6 +4211,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
     let inline_links = threads >= 2 && link_bytes * 4 < event_bytes;
     let chunks = make_chunks(event_files, chunk_target(event_files, threads));
     let id_set: ShardSet<DedupRec> = ShardSet::new_shared(id_shards);
+    let long_id_set: ShardSet<LongDedupRec> = ShardSet::new_shared(id_shards);
     let ev_set: ShardSet<PEv12> = ShardSet::new_shared(p_shards);
     let purch_set: ShardSet<PPurch, PURCH_SEG> = ShardSet::new_shared(p_shards);
     let oob_ingest: Mutex<Vec<i64>> = Mutex::new(Vec::new());
@@ -3876,6 +4247,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                 oob_ref: &oob_ingest,
                 wide_ref: &wide_store,
                 id_w: Scatter::<DedupRec, EV_STAGE>::new(&id_set),
+                long_id_w: Scatter::<LongDedupRec, 192>::new(&long_id_set),
                 ev_w: Scatter::<PEv12, P_STAGE>::new_located12(&ev_set),
                 purch_w: Scatter::<PPurch, 64, PURCH_SEG>::new_located(&purch_set),
             };
@@ -3889,6 +4261,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                 event_front::scan(d, &ctx.dates, &mut handler);
             }
             handler.id_w.finish();
+            handler.long_id_w.finish();
             handler.ev_w.finish();
             handler.purch_w.finish();
         });
@@ -3922,9 +4295,21 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                     oob_slice,
                 );
                 segs.free();
+                let mut lsegs = long_id_set.take(s);
+                dedup_long_shard(
+                    &mut lsegs,
+                    &mut buckets16,
+                    &mut buckets32,
+                    &mut seg_starts,
+                    &mut loser_locs,
+                    base_day_ms,
+                    oob_slice,
+                );
+                lsegs.free();
             }
         });
         id_set.free_all();
+        long_id_set.free_all();
         mark("dedup");
 
         // ---- clicks: parse, validate, scatter directly by raw user_id (ZERO LinkTable lookups!)
@@ -4138,9 +4523,14 @@ fn main() {
         }
     }
 
-    let link_files = map_dir(&data_dir.join("links"));
-    let click_files = map_dir(&data_dir.join("clicks"));
-    let event_files = map_dir(&data_dir.join("events"));
+    let links_dir = data_dir.join("links");
+    let clicks_dir = data_dir.join("clicks");
+    let events_dir = data_dir.join("events");
+    let mut input_arena = InputArena::new(&[links_dir.clone(), clicks_dir.clone(), events_dir.clone()]);
+    let link_files = input_arena.map_dir(&links_dir);
+    let click_files = input_arena.map_dir(&clicks_dir);
+    let event_files = input_arena.map_dir(&events_dir);
+    input_arena.finish();
     let wide = cat_names.len() > 256;
     let ctx = Ctx {
         ws,

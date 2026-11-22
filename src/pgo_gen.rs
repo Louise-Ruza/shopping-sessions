@@ -28,12 +28,20 @@ impl Rng {
     }
 }
 
-/// 93% 9-byte and 7% 8-byte base36 IDs, matching the real generator.
+/// Matches v5 generator: 1 in 8 distinct IDs gets a 32-char lowercase hex suffix,
+/// the rest get 7-8 char lowercase base36.
 fn b36(prefix: u8, v: u64, out: &mut String) {
     const DIG: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     out.clear();
     out.push(prefix as char);
     let mut x = v.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (v >> 17);
+    if (x & 7) == 0 {
+        use std::fmt::Write as _;
+        let hi = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let lo = (x ^ 0x94d0_49bb_1331_11eb).wrapping_mul(0x94d0_49bb_1331_11eb);
+        let _ = write!(out, "{hi:016x}{lo:016x}");
+        return;
+    }
     let len = if (x & 15) == 0 { 7 } else { 8 };
     let mut buf = [0u8; 8];
     for i in (0..len).rev() {

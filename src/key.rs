@@ -1,19 +1,28 @@
 //! Exact 8-byte keys for IDs (`Key8`, `EKey`, `CKey`).
 //!
-//! All three use prefix-stripped little-endian raw 8-byte loads for the 99.8%
+//! All three use prefix-stripped little-endian raw 8-byte loads for the
 //! common 8- and 9-byte IDs (`'u'` for `Key8`, `'e'` for `EKey`, `'k'` for `CKey`),
 //! skipping `bswap`, 7-bit ASCII validation, and `_pext_u64`/`_pdep_u64` entirely.
 //!
-//! Tag spaces (by top byte `hi = val >> 56`) are strictly disjoint and bijective:
+//! Arbitrary variable-width IDs (`> 9` bytes or non-prefixed `8..=9` bytes) from
+//! the contiguous input mmap region are encoded zero-copy as 8-byte slice refs
+//! (`REF_TAG | (len << 36) | off`) with ZERO mutexes, ZERO `HashMap` lookups, and
+//! ZERO heap allocations. Non-mmap strings (e.g. unit tests, `products.csv`) fall
+//! back to `OverflowStore` (`OVF_TAG | idx`).
+//!
+//! Tag spaces (by top byte `hi = val >> 56`) are strictly disjoint:
 //! - `val == 0`: empty slice `b""` (`EMPTY`)
 //! - `hi <= 0x7F` (`val != 0`): 9-byte prefix + 8 raw bytes (exact, verbatim)
 //! - `hi == 0x80`: 8-byte prefix + 7 raw bytes (exact, verbatim)
 //! - `hi in 0x81..=0x87`: raw 1..=7 byte string (any bytes, verbatim)
 //! - `hi == 0xC0`: interned in global sharded `OverflowStore` (`OVF_TAG | idx`)
+//! - `hi == 0xD0`: zero-copy slice into contiguous input mmap (`REF_TAG | (len << 36) | off`)
 //! - `val == u64::MAX` (`hi == 0xFF`): `Key8::TOMBSTONE` (impossible for real IDs)
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
 use std::sync::{Mutex, OnceLock};
 
 pub const P0: u64 = 0xa076_1d64_78bd_642f;
@@ -26,22 +35,130 @@ pub fn mum(a: u64, b: u64) -> u64 {
 }
 
 const OVF_TAG: u64 = 0xC000_0000_0000_0000;
+const REF_TAG: u64 = 0xD000_0000_0000_0000;
+const REF_TAG_BYTE: u64 = 0xD0;
+const REF_OFF_MASK: u64 = (1u64 << 36) - 1; // up to 64 GiB of contiguous mapped CSVs
+const REF_MAX_LEN: usize = 1 << 20;         // up to 1 MiB per single ID string
 const OVF_SHARD_BITS: u32 = 6;
 const OVF_SHARDS: usize = 1 << OVF_SHARD_BITS;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+static INPUT_BASE: AtomicUsize = AtomicUsize::new(0);
+static INPUT_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Registers the contiguous virtual address range containing all mapped input CSVs.
+/// Must be called once during single-threaded init before parsing threads start.
+pub fn register_input_region(base: usize, len: usize) {
+    INPUT_BASE.store(base, AOrd::Release);
+    INPUT_LEN.store(len, AOrd::Release);
+}
+
+#[inline(always)]
+fn is_non_inline_raw(v: u64) -> bool {
+    // Matches 0xC0 (OVF_TAG) and 0xD0 (REF_TAG); excludes 0x00..=0x87 and 0xFF (TOMBSTONE).
+    ((v >> 56) & 0xE0) == 0xC0
+}
+
+#[inline(always)]
+unsafe fn ref_bytes(v: u64) -> &'static [u8] {
+    let base = INPUT_BASE.load(AOrd::Relaxed);
+    let off = (v & REF_OFF_MASK) as usize;
+    let len = ((v >> 36) & ((REF_MAX_LEN - 1) as u64)) as usize;
+    std::slice::from_raw_parts((base + off) as *const u8, len)
+}
+
+#[inline(always)]
+fn non_inline_bytes(v: u64) -> &'static [u8] {
+    if (v >> 56) == REF_TAG_BYTE {
+        unsafe { ref_bytes(v) }
+    } else {
+        overflow_store().get(v & !OVF_TAG)
+    }
+}
+
+#[inline(never)]
+fn key_eq_slow(a: u64, b: u64) -> bool {
+    if (a >> 56) == REF_TAG_BYTE && (b >> 56) == REF_TAG_BYTE {
+        if ((a ^ b) >> 36) != 0 {
+            return false;
+        }
+        return unsafe { ref_bytes(a) == ref_bytes(b) };
+    }
+    non_inline_bytes(a) == non_inline_bytes(b)
+}
+
+#[inline(always)]
+fn key_eq(a: u64, b: u64) -> bool {
+    if a == b {
+        return true;
+    }
+    if is_non_inline_raw(a) && is_non_inline_raw(b) {
+        return key_eq_slow(a, b);
+    }
+    false
+}
+
+#[inline(never)]
+fn key_hash_slow(v: u64, seed: u64) -> u64 {
+    crate::hash::hash(non_inline_bytes(v), seed)
+}
+
+#[inline(always)]
+fn key_hash(v: u64, seed: u64) -> u64 {
+    if !is_non_inline_raw(v) {
+        mum(v ^ seed, P0)
+    } else {
+        key_hash_slow(v, seed)
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug)]
 #[repr(transparent)]
 pub struct Key8(pub u64);
 
+impl PartialEq for Key8 {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        key_eq(self.0, other.0)
+    }
+}
+impl Eq for Key8 {}
+
+impl Hash for Key8 {
+    #[inline(always)]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        if !is_non_inline_raw(self.0) {
+            self.0.hash(state);
+        } else {
+            non_inline_bytes(self.0).hash(state);
+        }
+    }
+}
+
 /// Exact 8-byte equality+hash key for `event_id` (`EKey`), fast-pathed for `'e'`-prefixed 8/9B IDs.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug)]
 #[repr(transparent)]
 pub struct EKey(pub u64);
 
+impl PartialEq for EKey {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        key_eq(self.0, other.0)
+    }
+}
+impl Eq for EKey {}
+
 /// Exact 8-byte ordered key for `click_id` (`CKey`), fast-pathed for `'k'`-prefixed 8/9B IDs.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug)]
 #[repr(transparent)]
 pub struct CKey(pub u64);
+
+impl PartialEq for CKey {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        key_eq(self.0, other.0)
+    }
+}
+impl Eq for CKey {}
 
 #[inline(always)]
 fn pack_prefixed<const PREFIX: u8>(s: &[u8]) -> u64 {
@@ -70,7 +187,34 @@ fn pack_prefixed<const PREFIX: u8>(s: &[u8]) -> u64 {
     pack_slow(s)
 }
 
-#[cold]
+#[inline(always)]
+fn pack_prefixed_and_hash<const PREFIX: u8>(s: &[u8], seed: u64) -> (u64, u64) {
+    let n = s.len();
+    let p = s.as_ptr();
+    if n == 9 {
+        unsafe {
+            if *p == PREFIX {
+                let v = (p.add(1) as *const u64).read_unaligned();
+                if (v as i64) > 0 {
+                    return (v, mum(v ^ seed, P0));
+                }
+            }
+        }
+        return pack_slow_and_hash(s, seed);
+    }
+    if n == 8 {
+        unsafe {
+            let w0 = (p as *const u64).read_unaligned();
+            if (w0 as u8) == PREFIX {
+                let v = (w0 >> 8) | (0x80u64 << 56);
+                return (v, mum(v ^ seed, P0));
+            }
+        }
+        return pack_slow_and_hash(s, seed);
+    }
+    pack_slow_and_hash(s, seed)
+}
+
 #[inline(never)]
 fn pack_slow(s: &[u8]) -> u64 {
     let n = s.len();
@@ -84,7 +228,26 @@ fn pack_slow(s: &[u8]) -> u64 {
         }
         return v;
     }
+    let ilen = INPUT_LEN.load(AOrd::Relaxed);
+    if ilen != 0 && n < REF_MAX_LEN {
+        let base = INPUT_BASE.load(AOrd::Relaxed);
+        let off = (s.as_ptr() as usize).wrapping_sub(base);
+        if off < ilen && n <= ilen - off {
+            return REF_TAG | ((n as u64) << 36) | (off as u64);
+        }
+    }
     OVF_TAG | overflow_store().intern(s)
+}
+
+#[inline(never)]
+fn pack_slow_and_hash(s: &[u8], seed: u64) -> (u64, u64) {
+    let v = pack_slow(s);
+    let h = if !is_non_inline_raw(v) {
+        mum(v ^ seed, P0)
+    } else {
+        crate::hash::hash(s, seed)
+    };
+    (v, h)
 }
 
 #[inline(always)]
@@ -101,7 +264,6 @@ fn unpack_prefixed<'a, const PREFIX: u8>(v: u64, buf: &'a mut [u8; 16]) -> &'a [
     unpack_slow(v, buf)
 }
 
-#[cold]
 #[inline(never)]
 fn unpack_slow<'a>(v: u64, buf: &'a mut [u8; 16]) -> &'a [u8] {
     if v == 0 {
@@ -115,7 +277,7 @@ fn unpack_slow<'a>(v: u64, buf: &'a mut [u8; 16]) -> &'a [u8] {
             return buf.get_unchecked(..len);
         }
     }
-    overflow_store().get(v & !OVF_TAG)
+    non_inline_bytes(v)
 }
 
 #[inline(always)]
@@ -134,7 +296,6 @@ fn cmp_prefixed<const PREFIX: u8>(a: u64, b: u64) -> Ordering {
     cmp_prefixed_slow::<PREFIX>(a, b)
 }
 
-#[cold]
 #[inline(never)]
 fn cmp_prefixed_slow<const PREFIX: u8>(a: u64, b: u64) -> Ordering {
     let (mut ba, mut bb) = ([0u8; 16], [0u8; 16]);
@@ -142,14 +303,27 @@ fn cmp_prefixed_slow<const PREFIX: u8>(a: u64, b: u64) -> Ordering {
 }
 
 impl EKey {
+    #[allow(dead_code)]
     #[inline(always)]
     pub fn new(s: &[u8]) -> EKey {
         EKey(pack_prefixed::<b'e'>(s))
     }
 
     #[inline(always)]
+    pub fn new_and_hash(s: &[u8], seed: u64) -> (EKey, u64) {
+        let (v, h) = pack_prefixed_and_hash::<b'e'>(s, seed);
+        (EKey(v), h)
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn is_non_inline(&self) -> bool {
+        is_non_inline_raw(self.0)
+    }
+
+    #[inline(always)]
     pub fn hash(&self, seed: u64) -> u64 {
-        mum(self.0 ^ seed, P0)
+        key_hash(self.0, seed)
     }
 }
 
@@ -170,12 +344,27 @@ impl CKey {
 impl Key8 {
     pub const EMPTY: Key8 = Key8(0);
     /// Impossible sentinel key used to mark deduplicated-away `PEv` tombstones in place
-    /// (real overflow keys always have top byte `0xC0`, never `0xFF`).
+    /// (real overflow/ref keys always have top byte `0xC0`/`0xD0`, never `0xFF`).
     pub const TOMBSTONE: Key8 = Key8(u64::MAX);
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.0 == 0
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn is_non_inline(&self) -> bool {
+        is_non_inline_raw(self.0)
+    }
+
+    #[inline(always)]
+    pub fn prefetch_ref(&self) {
+        if (self.0 >> 56) == REF_TAG_BYTE {
+            let base = INPUT_BASE.load(AOrd::Relaxed);
+            let off = (self.0 & REF_OFF_MASK) as usize;
+            crate::links::prefetch((base + off) as *const u8);
+        }
     }
 
     #[cfg(test)]
@@ -189,10 +378,16 @@ impl Key8 {
         Key8(pack_prefixed::<b'u'>(s))
     }
 
-    /// Single-multiply wyhash-grade 64-bit hash with full avalanche across all 64 bits.
+    #[inline(always)]
+    pub fn new_and_hash(s: &[u8], seed: u64) -> (Key8, u64) {
+        let (v, h) = pack_prefixed_and_hash::<b'u'>(s, seed);
+        (Key8(v), h)
+    }
+
+    /// Single-multiply wyhash-grade 64-bit hash for inline keys; full byte wyhash for long keys.
     #[inline(always)]
     pub fn hash(&self, seed: u64) -> u64 {
-        mum(self.0 ^ seed, P0)
+        key_hash(self.0, seed)
     }
 
     /// The ID bytes; inline keys are decoded into `buf` with a single unaligned u64 store.

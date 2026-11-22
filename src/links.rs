@@ -140,20 +140,32 @@ impl LinkTable {
         loop {
             let b = unsafe { self.tab.get_unchecked(i) };
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            unsafe {
-                use core::arch::x86_64::*;
-                let v = _mm256_load_si256(b.keys.as_ptr() as *const __m256i);
-                let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(
-                    v,
-                    _mm256_set1_epi64x(uid.0 as i64),
-                ))) as u32;
-                if eq != 0 {
-                    return Some(*b.cids.get_unchecked(eq.trailing_zeros() as usize));
+            if !uid.is_non_inline() {
+                unsafe {
+                    use core::arch::x86_64::*;
+                    let v = _mm256_load_si256(b.keys.as_ptr() as *const __m256i);
+                    let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(
+                        v,
+                        _mm256_set1_epi64x(uid.0 as i64),
+                    ))) as u32;
+                    if eq != 0 {
+                        return Some(*b.cids.get_unchecked(eq.trailing_zeros() as usize));
+                    }
+                    if b.keys[4] == uid {
+                        return Some(b.cids[4]);
+                    }
+                    if b.len < 5 {
+                        return None;
+                    }
                 }
-                if b.keys[4] == uid {
-                    return Some(b.cids[4]);
+            } else {
+                let n = b.len as usize;
+                for k in 0..n {
+                    if unsafe { *b.keys.get_unchecked(k) } == uid {
+                        return Some(unsafe { *b.cids.get_unchecked(k) });
+                    }
                 }
-                if b.len < 5 {
+                if n < 5 {
                     return None;
                 }
             }
@@ -599,10 +611,8 @@ fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
             if a.is_empty() || b.is_empty() {
                 return;
             }
-            let ka = Key8::new(a);
-            let kb = Key8::new(b);
-            let ha = ka.hash(SEED_L);
-            let hb = kb.hash(SEED_L);
+            let (ka, ha) = Key8::new_and_hash(a, SEED_L);
+            let (kb, hb) = Key8::new_and_hash(b, SEED_L);
             let ep = self.ne * 2;
             self.w.push((ha >> (64 - SIDE_BITS)) as usize, LSideSeq { key: ka, ep, h32: ha as u32 });
             self.w.push((hb >> (64 - SIDE_BITS)) as usize, LSideSeq { key: kb, ep: ep + 1, h32: hb as u32 });
