@@ -806,7 +806,6 @@ fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
     let ep_pairs = eps.len() >> 1;
     let eptr_ro = eps.as_ptr();
     let pptr = parent.as_ptr();
-    let kptr = keys.as_ptr();
     const UPF: usize = 16;
     for ei in 0..ep_pairs {
         if ei + UPF < ep_pairs {
@@ -815,8 +814,6 @@ fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
                 let fb = *eptr_ro.add((ei + UPF) * 2 + 1) as usize;
                 prefetch(pptr.add(fa) as *const u8);
                 prefetch(pptr.add(fb) as *const u8);
-                prefetch(kptr.add(fa) as *const u8);
-                prefetch(kptr.add(fb) as *const u8);
             }
         }
         let ea = unsafe { *eptr_ro.add(ei * 2) };
@@ -824,81 +821,48 @@ fn build_links_seq_sharded(files: &[&'static [u8]]) -> LinkTable {
         let a = find_seq(&mut parent, ea);
         let b = find_seq(&mut parent, eb);
         if a != b {
-            if unsafe { keys.get_unchecked(a as usize).cmp_bytes(keys.get_unchecked(b as usize)) }
-                == std::cmp::Ordering::Less
-            {
-                unsafe { *parent.get_unchecked_mut(b as usize) = a };
-            } else {
-                unsafe { *parent.get_unchecked_mut(a as usize) = b };
-            }
+            // Choosing the smaller node makes every non-root point backward.
+            // Canonical byte ordering is resolved later, outside this random-access loop.
+            parent[a.max(b) as usize] = a.min(b);
         }
     }
     if let Some(m) = eps.detach_mmap() {
         scratch_mmaps.push(m);
     }
 
-    // Flatten union-find & tag each component root in place in `parent[r] = 0x8000_0000 | cid`
-    // (zero extra `root_cid` / `has_alias` allocation!).
-    #[inline(always)]
-    fn find_seq_tagged(parent: &mut [u32], mut x: u32) -> u32 {
-        loop {
-            let p = unsafe { *parent.get_unchecked(x as usize) };
-            if p == x || (p & 0x8000_0000) != 0 {
-                return x;
-            }
-            let g = unsafe { *parent.get_unchecked(p as usize) };
-            if (g & 0x8000_0000) != 0 {
-                return p;
-            }
-            unsafe { *parent.get_unchecked_mut(x as usize) = g };
-            x = g;
-        }
-    }
-
-    assert!(n < 0x8000_0000, "too many link nodes");
+    const ASSIGNED: u32 = 1 << 31;
+    assert!(n < ASSIGNED as usize, "too many link nodes");
     let mut canon_keys = HugeBuf::<Key8>::empty();
-    canon_keys.reserve_uninit(n / 2 + 16);
-    let ck_ptr = canon_keys.as_mut_ptr();
+    canon_keys.reserve_uninit(n / 2 + 1);
     let mut n_canon = 0usize;
+    let mut total_nr = 0usize;
     for x in 0..n {
-        let p0 = unsafe { *parent.get_unchecked(x) };
-        if (p0 & 0x8000_0000) != 0 {
+        let p = parent[x] as usize;
+        if p == x {
             continue;
         }
-        let r = find_seq_tagged(&mut parent, x as u32);
-        if r != x as u32 {
-            unsafe {
-                *parent.get_unchecked_mut(x) = r;
-                let pr = parent.get_unchecked_mut(r as usize);
-                if (*pr & 0x8000_0000) == 0 {
-                    *pr = 0x8000_0000 | (n_canon as u32);
-                    ck_ptr.add(n_canon).write(*keys.get_unchecked(r as usize));
-                    n_canon += 1;
-                }
-            }
+        // p < x, so p is either an untouched root or already holds its final
+        // component tag. A first child assigns the root and counts both nodes.
+        let parent_tag = parent[p];
+        let cid = if parent_tag & ASSIGNED == 0 {
+            debug_assert_eq!(parent_tag as usize, p);
+            let cid = n_canon;
+            unsafe { canon_keys.as_mut_ptr().add(cid).write(keys[p]) };
+            n_canon += 1;
+            parent[p] = ASSIGNED | cid as u32;
+            total_nr += 1;
+            cid
+        } else {
+            (parent_tag & !ASSIGNED) as usize
+        };
+        parent[x] = ASSIGNED | cid as u32;
+        total_nr += 1;
+        let canonical = unsafe { &mut *canon_keys.as_mut_ptr().add(cid) };
+        if keys[x].cmp_bytes(canonical).is_lt() {
+            *canonical = keys[x];
         }
     }
     unsafe { canon_keys.set_len(n_canon) };
-    // Resolve every node's cid tag in place in `parent` (zero `linked` Vec allocation!)
-    // and count `total_nr`. Because `keys[0..n]` is already grouped by top `SIDE_BITS` (8 bits)
-    // of `key.hash(SEED_L)`, top-bit indexing into `bloom` and `ltab` keeps every 1/256th
-    // slice L1/L2-resident during insertion AND aligns with `ev_set`/`click_set` P_BITS in Tier 1!
-    let mut total_nr = 0usize;
-    for x in 0..n {
-        let p = unsafe { *parent.get_unchecked(x) };
-        let cid_tag = if (p & 0x8000_0000) != 0 {
-            p
-        } else {
-            unsafe { *parent.get_unchecked(p as usize) }
-        };
-        if (cid_tag & 0x8000_0000) != 0 {
-            unsafe { *parent.get_unchecked_mut(x) = cid_tag };
-            total_nr += 1;
-        } else {
-            unsafe { *parent.get_unchecked_mut(x) = 0 };
-        }
-    }
-
     let bloom_words = ((total_nr * 12 / 64).next_power_of_two()).clamp(1 << 10, 1 << 20);
     let bloom_shift = 64 - bloom_words.trailing_zeros();
     let nbuckets = link_nbuckets(total_nr);

@@ -337,6 +337,35 @@ fn cmp_prefixed_slow<const PREFIX: u8>(a: u64, b: u64) -> Ordering {
     unpack_prefixed::<PREFIX>(a, &mut ba).cmp(unpack_prefixed::<PREFIX>(b, &mut bb))
 }
 
+/// Select compact offsets once for the entire input. Equal IDs can occur in
+/// different files, so per-record eligibility would split their deduplication.
+#[derive(Clone, Copy)]
+pub struct CompactEventIds {
+    reference_tag: u64,
+}
+
+impl CompactEventIds {
+    pub fn for_files(files: &[&[u8]]) -> Self {
+        let base = input_base();
+        let capacity = INPUT_LEN.load(AOrd::Relaxed).min(1usize << 34);
+        Self::for_region(files, base, capacity)
+    }
+
+    fn for_region(files: &[&[u8]], base: usize, capacity: usize) -> Self {
+        let fits = files.iter().all(|file| {
+            let offset = (file.as_ptr() as usize).wrapping_sub(base);
+            file.is_empty() || (offset < capacity && file.len() <= capacity - offset)
+        });
+        let reference_tag = if fits { (REF_TAG >> 36) | 33 } else { u64::MAX };
+        Self { reference_tag }
+    }
+
+    #[inline(always)]
+    pub fn offset(self, key: EKey) -> Option<u64> {
+        ((key.0 >> 36) == self.reference_tag).then_some(key.0 & REF_OFF_MASK)
+    }
+}
+
 impl EKey {
     #[allow(dead_code)]
     #[inline(always)]
@@ -354,15 +383,6 @@ impl EKey {
     #[inline(always)]
     pub fn is_non_inline(&self) -> bool {
         is_non_inline_raw(self.0)
-    }
-
-    #[inline(always)]
-    pub fn ref_off_len(&self) -> Option<(u64, usize)> {
-        if (self.0 >> 56) == REF_TAG_BYTE {
-            Some((self.0 & REF_OFF_MASK, ((self.0 >> 36) & ((REF_MAX_LEN - 1) as u64)) as usize))
-        } else {
-            None
-        }
     }
 
     #[inline(always)]
@@ -628,6 +648,24 @@ mod tests {
     fn rt(k: &Key8) -> Vec<u8> {
         let mut b = [0u8; 16];
         k.as_slice(&mut b).to_vec()
+    }
+
+    #[test]
+    fn duplicate_routing_is_independent_of_file_position() {
+        let storage = [0u8; 160];
+        let base = storage.as_ptr() as usize;
+        let first = EKey(REF_TAG | (33u64 << 36));
+        let later = EKey(first.0 | 100);
+        let files = [&storage[..33], &storage[100..133]];
+        let compact = CompactEventIds::for_region(&files, base, 133);
+        assert_eq!(compact.offset(first), Some(0));
+        assert_eq!(compact.offset(later), Some(100));
+        assert_eq!(compact.offset(EKey(REF_TAG | (32u64 << 36))), None);
+        for (start, len) in [(base, 132), (base + 1, 159), (0, 0)] {
+            let wide = CompactEventIds::for_region(&files, start, len);
+            assert_eq!(wide.offset(first), None);
+            assert_eq!(wide.offset(later), None);
+        }
     }
 
     #[test]

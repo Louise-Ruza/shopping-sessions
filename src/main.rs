@@ -1432,13 +1432,13 @@ struct UserDailyPart {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct AggBin {
-    min_ts: u32,
+    inv_min_ts: u32,
     max_ts: u32,
     cnt: u32,
     head: u32, // head index into `bin_purch`, or u32::MAX if no purchases in this bin
 }
 
-const AGG_BIN_EMPTY: AggBin = AggBin { min_ts: u32::MAX, max_ts: 0, cnt: 0, head: u32::MAX };
+const AGG_BIN_EMPTY: AggBin = AggBin { inv_min_ts: 0, max_ts: 0, cnt: 0, head: u32::MAX };
 const BIN_AGG_MIN_EVENTS: usize = 9;
 
 #[derive(Clone, Copy, Default)]
@@ -1872,53 +1872,26 @@ impl<'a> Worker<'a> {
         let nwords = self.bin_mask.len();
         let use_wmask = nwords <= 64;
         let mut word_mask = 0u64;
-#[inline(always)]
-#[allow(unused_mut)]
-fn min_u32_cmov(mut a: u32, b: u32) -> u32 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!(
-            "cmp {a:e}, {b:e}",
-            "cmova {a:e}, {b:e}",
-            a = inout(reg) a,
-            b = in(reg) b,
-            options(pure, nomem, nostack),
-        );
-        a
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        a.min(b)
-    }
-}
-
-#[inline(always)]
-#[allow(unused_mut)]
-fn max_u32_cmov(mut a: u32, b: u32) -> u32 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!(
-            "cmp {a:e}, {b:e}",
-            "cmovb {a:e}, {b:e}",
-            a = inout(reg) a,
-            b = in(reg) b,
-            options(pure, nomem, nostack),
-        );
-        a
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        a.max(b)
-    }
-}
-
         // Single branchless sequential pass over 4-byte non-purchase timestamps (97% of events).
         for &ts in tss {
             let b = ((ts - day0_off) / GAP_U32) as usize;
-            let bin = unsafe { &mut *bptr.add(b) };
-            bin.min_ts = min_u32_cmov(bin.min_ts, ts);
-            bin.max_ts = max_u32_cmov(bin.max_ts, ts);
-            bin.cnt += 1;
+            #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+            unsafe {
+                use std::arch::x86_64::*;
+                // The inverted minimum and ordinary maximum both accumulate with max.
+                // Zero in the remaining lanes preserves the count and purchase head.
+                let ptr = bptr.add(b).cast::<__m128i>();
+                let extrema = _mm_set_epi32(0, 0, ts as i32, !ts as i32);
+                let updated = _mm_max_epu32(_mm_loadu_si128(ptr), extrema);
+                _mm_storeu_si128(ptr, _mm_add_epi32(updated, _mm_set_epi32(0, 1, 0, 0)));
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+            {
+                let bin = unsafe { &mut *bptr.add(b) };
+                bin.inv_min_ts = bin.inv_min_ts.max(!ts);
+                bin.max_ts = bin.max_ts.max(ts);
+                bin.cnt += 1;
+            }
             let w = b >> 6;
             unsafe { *mptr.add(w) |= 1u64 << (b & 63) };
             word_mask |= 1u64 << (w & 63);
@@ -1944,7 +1917,7 @@ fn max_u32_cmov(mut a: u32, b: u32) -> u32 {
                         m &= m - 1;
                         let bin = unsafe { *bptr.add(b) };
                         unsafe { *bptr.add(b) = AGG_BIN_EMPTY };
-                        let min_ts = bin.min_ts as i64;
+                        let min_ts = (!bin.inv_min_ts) as i64;
                         if !have_sess || min_ts - prev_max > GAP_MS {
                             let new_day = (b / 48) as u32;
                             if have_sess {
@@ -1964,7 +1937,7 @@ fn max_u32_cmov(mut a: u32, b: u32) -> u32 {
                                 have_sess = true;
                                 cur_day = new_day;
                             }
-                            s_start = bin.min_ts;
+                            s_start = !bin.inv_min_ts;
                             ns += 1;
                         }
                         prev_max = bin.max_ts as i64;
@@ -2001,7 +1974,7 @@ fn max_u32_cmov(mut a: u32, b: u32) -> u32 {
         for &(ts, pc) in purch {
             let b = ((ts - day0_off) / GAP_U32) as usize;
             let bin = unsafe { &mut *bptr.add(b) };
-            bin.min_ts = bin.min_ts.min(ts);
+            bin.inv_min_ts = bin.inv_min_ts.max(!ts);
             bin.max_ts = bin.max_ts.max(ts);
             bin.cnt += 1;
             let w = b >> 6;
@@ -2030,7 +2003,7 @@ fn max_u32_cmov(mut a: u32, b: u32) -> u32 {
                     m &= m - 1;
                     let bin = unsafe { *bptr.add(b) };
                     unsafe { *bptr.add(b) = AGG_BIN_EMPTY };
-                    let min_ts = bin.min_ts as i64;
+                    let min_ts = (!bin.inv_min_ts) as i64;
                     if !have_sess || min_ts - prev_max > GAP_MS {
                         let new_day = (b / 48) as u32;
                         if have_sess {
@@ -2050,7 +2023,7 @@ fn max_u32_cmov(mut a: u32, b: u32) -> u32 {
                             have_sess = true;
                             cur_day = new_day;
                         }
-                        s_start = bin.min_ts;
+                        s_start = !bin.inv_min_ts;
                         s_rev = 0;
                         s_purch = false;
                         ns += 1;
@@ -4787,6 +4760,7 @@ struct EventHandler<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAG
     oob_ref: &'b Mutex<Vec<i64>>,
     wide_ref: &'b Mutex<Vec<(u32, u16)>>,
     id_w: Scatter<'b, DedupRec, EV_STAGE>,
+    compact_ids: key::CompactEventIds,
     long_id_w: Scatter<'b, LongDedupRec, 64>,
     other_id_set: &'b ShardSet<OtherDedupRec, OTHER_SEG>,
     other_id_w: Option<Scatter<'b, OtherDedupRec, 64, OTHER_SEG>>,
@@ -4891,13 +4865,11 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
 
     #[inline(always)]
     fn push_long_dedup(&mut self, ek: EKey, eh: u64, ingest: u32, loc: u32) {
-        if let Some((off, 33)) = ek.ref_off_len() {
-            if off < (1u64 << 34) {
-                let lid_sh = (eh >> (64 - (ID_BITS - 2))) as usize;
-                let h30 = (eh >> 26) & 0x3FFF_FFFF;
-                self.long_id_w.push(lid_sh, LongDedupRec { off_h30: (h30 << 34) | off, ingest, loc });
-                return;
-            }
+        if let Some(off) = self.compact_ids.offset(ek) {
+            let lid_sh = (eh >> (64 - (ID_BITS - 2))) as usize;
+            let h30 = (eh >> 26) & 0x3FFF_FFFF;
+            self.long_id_w.push(lid_sh, LongDedupRec { off_h30: (h30 << 34) | off, ingest, loc });
+            return;
         }
         push_other_dedup(self.other_id_set, &mut self.other_id_w, OtherDedupRec { eid: ek, ingest, loc });
     }
@@ -5041,6 +5013,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
     threads: usize,
     mark: &mut impl FnMut(&'static str),
 ) -> (Vec<(Vec<UserDailyPart>, Vec<CampAcc>)>, LinkTable) {
+    let compact_ids = key::CompactEventIds::for_files(event_files);
     let id_shards: usize = 1 << ID_BITS;
     let long_id_shards: usize = 1 << (ID_BITS - 2);
     let p_shards: usize = 1 << P_BITS;
@@ -5096,6 +5069,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                 oob_ref: &oob_ingest,
                 wide_ref: &wide_store,
                 id_w: Scatter::<DedupRec, EV_STAGE>::new_in(&id_set, &mut scatter_meta),
+                compact_ids,
                 long_id_w: Scatter::<LongDedupRec, 64>::new_in(&long_id_set, &mut scatter_meta),
                 other_id_set: &other_id_set,
                 other_id_w: None,

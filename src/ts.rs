@@ -273,6 +273,29 @@ impl DateCache {
 
     #[inline(always)]
     fn clock_strict(p: *const u8) -> Option<i64> {
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+        unsafe {
+            use core::arch::x86_64::*;
+            let text = _mm_loadl_epi64(p.cast());
+            let digits = _mm_sub_epi8(text, _mm_set_epi64x(0, i64::from_le_bytes(*b"00:00:00")));
+            // Unsigned saturation detects bad digits on either side of '0'..'9'.
+            // The separator lanes must be exactly zero after subtracting ':'.
+            let limits = _mm_set_epi64x(0, i64::from_le_bytes([9, 9, 0, 9, 9, 0, 9, 9]));
+            let bad_bytes = _mm_subs_epu8(digits, limits);
+            let lanes = _mm_shuffle_epi8(digits, _mm_setr_epi8(
+                0, 1, 3, 4, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            ));
+            let hms = _mm_maddubs_epi16(lanes, _mm_set1_epi16(0x010a));
+            let bad_time = _mm_cmpgt_epi16(hms, _mm_setr_epi16(23, 59, 59, 0, 0, 0, 0, 0));
+            let bad = _mm_or_si128(bad_bytes, bad_time);
+            if _mm_testz_si128(bad, bad) == 0 {
+                return None;
+            }
+            let partial = _mm_madd_epi16(hms, _mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0));
+            let total = _mm_add_epi32(partial, _mm_srli_si128::<4>(partial));
+            Some(i64::from(_mm_cvtsi128_si32(total)) * 1000)
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
         unsafe {
             let w = (p as *const u64).read_unaligned();
             let x = w ^ u64::from_le_bytes(*b"00:00:00");
@@ -290,8 +313,8 @@ impl DateCache {
                     return Some((h * 3600 + mi * 60 + s) * 1000);
                 }
             }
+            None
         }
-        None
     }
 
     #[inline(always)]
@@ -501,6 +524,27 @@ pub(crate) fn swar_dec8(x: u64) -> u64 {
 #[inline(always)]
 fn parse_f3_13(b: &[u8]) -> Option<i64> {
     let p = b.as_ptr();
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    unsafe {
+        use core::arch::x86_64::*;
+        // Two overlapping 8-byte loads stay inside the 13-byte field.
+        let first = _mm_loadl_epi64(p.cast());
+        let last = _mm_loadl_epi64(p.add(5).cast());
+        let digits = _mm_sub_epi8(_mm_unpacklo_epi64(first, last), _mm_set1_epi8(b'0' as i8));
+        let invalid = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+        if _mm_testz_si128(invalid, invalid) == 0 {
+            return None;
+        }
+        // Pad on the left, then reduce 16 digits to two eight-digit integers.
+        let padded = _mm_shuffle_epi8(digits, _mm_setr_epi8(
+            -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15,
+        ));
+        let pairs = _mm_maddubs_epi16(padded, _mm_set1_epi16(0x010a));
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0064));
+        let octets = _mm_madd_epi16(_mm_packs_epi32(quads, quads), _mm_set1_epi32(0x0001_2710));
+        Some(i64::from(_mm_cvtsi128_si32(octets)) * 100_000_000 + i64::from(_mm_extract_epi32::<1>(octets)))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
     unsafe {
         let x0 = (p as *const u64).read_unaligned() ^ 0x3030_3030_3030_3030;
         let x1 = (p.add(5) as *const u64).read_unaligned() ^ 0x3030_3030_3030_3030;

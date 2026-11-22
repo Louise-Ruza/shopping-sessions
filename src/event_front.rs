@@ -150,25 +150,32 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
     c1: usize,
     c2: usize,
     c5: usize,
+    quotes: Option<u8>,
     dates: &DateCache,
     sink: &S,
 ) -> Option<Event<'a>> {
+    let quoted = |field: u32, read: bool| -> usize {
+        match quotes {
+            Some(bits) => usize::from((bits >> field) & 1),
+            None => usize::from(read),
+        }
+    };
     let p = data.as_ptr();
     unsafe {
         if c1 + 1 >= c2 || c2 + 1 >= c5 {
             return None;
         }
-        let tq = (*p.add(c1 + 1) == b'"') as usize;
+        let tq = quoted(2, *p.add(c1 + 1) == b'"');
         let ta = c1 + 1 + tq;
         let tlen = (c2 - c1 - 1).wrapping_sub(tq << 1);
-        let iq = (*p.add(c2 + 1) == b'"') as usize;
+        let iq = quoted(3, *p.add(c2 + 1) == b'"');
         let ia = c2 + 1 + iq;
         let c3 = ia + 20 + iq;
         if c3 >= c5 || *p.add(c3) != b',' {
             return None;
         }
-        let q0 = (c0 > 0 && *p == b'"') as usize;
-        let q1 = (c0 + 1 < c1 && *p.add(c0 + 1) == b'"') as usize;
+        let q0 = quoted(0, c0 > 0 && *p == b'"');
+        let q1 = quoted(1, c0 + 1 < c1 && *p.add(c0 + 1) == b'"');
         let eid = data.get_unchecked(q0..c0 - q0);
         let uid = data.get_unchecked(c0 + 1 + q1..c1 - q1);
         let (ek, eh) = EKey::new_and_hash(eid, SEED_ID);
@@ -185,7 +192,7 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
         } else {
             return None;
         };
-        let kq = (*p.add(c3 + 1) == b'"') as usize;
+        let kq = quoted(4, *p.add(c3 + 1) == b'"');
         let ka = c3 + 1 + kq;
         let (kind, c4) = if ka + 4 + kq < c5 {
             let k4 = (p.add(ka) as *const u32).read_unaligned();
@@ -204,9 +211,9 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
         } else {
             return None;
         };
-        let pq = (c4 + 1 < c5 && *p.add(c4 + 1) == b'"') as usize;
+        let pq = quoted(5, c4 + 1 < c5 && *p.add(c4 + 1) == b'"');
         let price = if kind == 2 {
-            let prq = (c5 + 1 < end && *p.add(c5 + 1) == b'"') as usize;
+            let prq = quoted(6, c5 + 1 < end && *p.add(c5 + 1) == b'"');
             parse_price(data.get_unchecked(c5 + 1 + prq..end - prq))
         } else {
             0
@@ -288,7 +295,7 @@ fn parse_row_hi<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     } else {
         63 - c_lo.leading_zeros() as usize
     };
-    parse_row_tail(data, 64 + end_hi, c0, c1, c2, c5, dates, sink)
+    parse_row_tail(data, 64 + end_hi, c0, c1, c2, c5, None, dates, sink)
 }
 
 #[inline(always)]
@@ -319,7 +326,7 @@ fn parse_row_lo<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
         return None;
     }
     let c5 = 63 - c.leading_zeros() as usize;
-    parse_row_tail(data, end, c0, c1, c2, c5, dates, sink)
+    parse_row_tail(data, end, c0, c1, c2, c5, None, dates, sink)
 }
 
 #[inline(always)]
@@ -374,7 +381,21 @@ fn parse_row_mid128<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     } else {
         63 - c_lo.leading_zeros() as usize
     };
-    parse_row_tail(data, 64 + end_mid, c0, c1, c2, c5, dates, sink)
+    // Extract one opening-quote bit per field from the validated masks.
+    // This removes dependent byte loads between discovering separators and
+    // decoding the two IDs, timestamps and event type.
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    let quotes = unsafe {
+        use core::arch::x86_64::_pext_u64;
+        let starts_lo = (c_lo << 1) | 1;
+        let starts_hi = (c_mid << 1) | (c_lo >> 63);
+        let a = _pext_u64(q_lo, starts_lo);
+        let b = _pext_u64(q_mid, starts_hi);
+        Some((a | (b << starts_lo.count_ones())) as u8)
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    let quotes = None;
+    parse_row_tail(data, 64 + end_mid, c0, c1, c2, c5, quotes, dates, sink)
 }
 
 #[inline(always)]
@@ -427,7 +448,7 @@ fn parse_row_top160<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     } else {
         63 - c_lo.leading_zeros() as usize
     };
-    parse_row_tail(data, 128 + end_top, c0, c1, c2, c5, dates, sink)
+    parse_row_tail(data, 128 + end_top, c0, c1, c2, c5, None, dates, sink)
 }
 
 #[inline(always)]
