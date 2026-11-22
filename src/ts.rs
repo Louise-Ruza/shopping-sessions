@@ -281,19 +281,31 @@ impl DateCache {
     }
 
     #[inline(always)]
-    fn clock_strict(p: *const u8) -> Option<i64> {
+    fn clock_strict<const F1: bool>(p: *const u8) -> Option<i64> {
         #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
         unsafe {
             use core::arch::x86_64::*;
-            let text = _mm_loadl_epi64(p.cast());
-            let digits = _mm_sub_epi8(text, _mm_set_epi64x(0, i64::from_le_bytes(*b"00:00:00")));
-            // Unsigned saturation detects bad digits on either side of '0'..'9'.
-            // The separator lanes must be exactly zero after subtracting ':'.
-            let limits = _mm_set_epi64x(0, i64::from_le_bytes([9, 9, 0, 9, 9, 0, 9, 9]));
+            let (text, base, limits, shuffle) = if F1 {
+                // Read through the end of the 20-byte value so the clock,
+                // 'T' and 'Z' all share one range-check branch.
+                (
+                    _mm_loadu_si128(p.add(4).cast()),
+                    _mm_setr_epi8(0, 0, 0, 0, 0, 0, b'T' as i8, 48, 48, 58, 48, 48, 58, 48, 48, b'Z' as i8),
+                    _mm_setr_epi8(-1, -1, -1, -1, -1, -1, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0),
+                    _mm_setr_epi8(7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
+                )
+            } else {
+                (
+                    _mm_loadl_epi64(p.add(11).cast()),
+                    _mm_set_epi64x(0, i64::from_le_bytes(*b"00:00:00")),
+                    _mm_set_epi64x(0, i64::from_le_bytes([9, 9, 0, 9, 9, 0, 9, 9])),
+                    _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
+                )
+            };
+            let digits = _mm_sub_epi8(text, base);
+            // Unsigned saturation detects bad digits and nonzero separators.
             let bad_bytes = _mm_subs_epu8(digits, limits);
-            let lanes = _mm_shuffle_epi8(digits, _mm_setr_epi8(
-                0, 1, 3, 4, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-            ));
+            let lanes = _mm_shuffle_epi8(digits, shuffle);
             let hms = _mm_maddubs_epi16(lanes, _mm_set1_epi16(0x010a));
             let bad_time = _mm_cmpgt_epi16(hms, _mm_setr_epi16(23, 59, 59, 0, 0, 0, 0, 0));
             let bad = _mm_or_si128(bad_bytes, bad_time);
@@ -306,7 +318,10 @@ impl DateCache {
         }
         #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
         unsafe {
-            let w = (p as *const u64).read_unaligned();
+            if F1 && (*p.add(10) != b'T' || *p.add(19) != b'Z') {
+                return None;
+            }
+            let w = (p.add(11) as *const u64).read_unaligned();
             let x = w ^ u64::from_le_bytes(*b"00:00:00");
             let bad = (x & 0xF0F0_FFF0_F0FF_F0F0)
                 | (x.wrapping_add(0x0606_0006_0600_0606) & 0xF0F0_00F0_F000_F0F0);
@@ -333,25 +348,25 @@ impl DateCache {
             if unsafe { *p.add(10) } != b'T' {
                 return None;
             }
-            return Self::clock_strict(unsafe { p.add(11) }).map(|ms| day_ms + ms);
+            return Self::clock_strict::<false>(p).map(|ms| day_ms + ms);
         }
         calendar(b)
     }
 
     #[cold]
     #[inline(never)]
-    fn parse_event_ingest_bcd_slow(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64, u32) {
+    fn parse_event_ingest_bcd_slow(&self, event: &[u8], ingest: &[u8]) -> (i64, i64, u32) {
         let (ing_day_ms, ing_bcd) = self.parse_f1_ingest_bcd(ingest);
-        (self.parse_ts(event), ing_day_ms, ing_bcd)
+        (self.parse_ts(event).unwrap_or(i64::MAX), ing_day_ms, ing_bcd)
     }
 
     #[inline(always)]
-    pub fn parse_event_ingest_bcd(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64, u32) {
+    pub fn parse_event_ingest_bcd(&self, event: &[u8], ingest: &[u8]) -> (i64, i64, u32) {
         if event.len() == 20 && ingest.len() == 20 {
             let ep = event.as_ptr();
             let ip = ingest.as_ptr();
             unsafe {
-                if ((*ep.add(19) ^ b'Z') | (*ip.add(19) ^ b'Z')) == 0 {
+                if *ip.add(19) == b'Z' {
                     let ep_pref = (ep as *const u64).read_unaligned();
                     let ep_dd = (ep.add(8) as *const u16).read_unaligned();
                     let ip_pref = (ip as *const u64).read_unaligned();
@@ -367,13 +382,9 @@ impl DateCache {
                             }
                             s
                         };
-                        let ev_ms = if *ep.add(10) == b'T' {
-                            Self::clock_strict(ep.add(11)).map(|ms| eslot.day_ms + ms)
-                        } else {
-                            None
-                        };
+                        let ev_ms = Self::clock_strict::<true>(ep).map(|ms| eslot.day_ms + ms);
                         let ing_bcd = islot.day_tag | bcd_hms(ip.add(11));
-                        return (ev_ms, islot.day_ms, ing_bcd);
+                        return (ev_ms.unwrap_or(i64::MAX), islot.day_ms, ing_bcd);
                     }
                 }
             }
@@ -383,13 +394,13 @@ impl DateCache {
 
     #[cold]
     #[inline(never)]
-    fn parse_f2_ingest_bcd_slow(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64, u32) {
+    fn parse_f2_ingest_bcd_slow(&self, event: &[u8], ingest: &[u8]) -> (i64, i64, u32) {
         let (ing_day_ms, ing_bcd) = self.parse_f1_ingest_bcd(ingest);
-        (self.parse_ts_25(event), ing_day_ms, ing_bcd)
+        (self.parse_ts_25(event).unwrap_or(i64::MAX), ing_day_ms, ing_bcd)
     }
 
     #[inline(always)]
-    pub fn parse_f2_ingest_bcd(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64, u32) {
+    pub fn parse_f2_ingest_bcd(&self, event: &[u8], ingest: &[u8]) -> (i64, i64, u32) {
         if event.len() == 25 && ingest.len() == 20 {
             let ep = event.as_ptr();
             let ip = ingest.as_ptr();
@@ -413,7 +424,7 @@ impl DateCache {
                         };
                         let ing_bcd = islot.day_tag | bcd_hms(ip.add(11));
                         let ev_ms = if *ep.add(10) == b'T' {
-                            Self::clock_strict(ep.add(11)).and_then(|ms| {
+                            Self::clock_strict::<false>(ep).and_then(|ms| {
                                 let h0 = (*ep.add(20)).wrapping_sub(b'0');
                                 let h1 = (*ep.add(21)).wrapping_sub(b'0');
                                 let m0 = (*ep.add(23)).wrapping_sub(b'0');
@@ -439,7 +450,7 @@ impl DateCache {
                         } else {
                             None
                         };
-                        return (ev_ms, islot.day_ms, ing_bcd);
+                        return (ev_ms.unwrap_or(i64::MAX), islot.day_ms, ing_bcd);
                     }
                 }
             }

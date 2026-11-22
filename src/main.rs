@@ -597,7 +597,7 @@ macro_rules! place_pad {
 #[cold]
 #[inline(never)]
 fn is_late_slow(ing_bcd: u32, ing_day_ms: i64, ts: i64) -> bool {
-    place_pad!(30); // +32 B: scan_avx2 / dedup_shard / scan_clicks placement
+    place_pad!(62); // +64 B: scan_avx2 placement
     let ing_ms = if ing_bcd < INGEST_OOB_BASE {
         ing_day_ms + bcd_hms_to_ms(ing_bcd)
     } else {
@@ -5061,6 +5061,8 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
 impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const P_STAGE: usize>
     event_front::EventSink<'_> for &mut EventHandler<'a, 'b, ID_BITS, P_BITS, EV_STAGE, P_STAGE>
 {
+    #[cfg(target_arch = "x86_64")]
+    const PAD_ROW_160: bool = ID_BITS == 9;
     #[inline(always)]
     fn prefetch_keys(&self, _ek_long: bool, eh: u64, _uid_long: bool, uh: u64) {
         // Always the short-ID stage line: the long-ID stage (1/4 the shards, 8-16 KB) stays
@@ -5091,10 +5093,10 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
             if ev.product.is_empty() {
                 break 'v;
             }
-            let ts = match ev.timestamp {
-                Some(t) if (t.wrapping_sub(self.ws) as u64) < self.wlen => t,
-                _ => break 'v,
-            };
+            let ts = ev.timestamp;
+            if ts.wrapping_sub(self.ws) as u64 >= self.wlen {
+                break 'v;
+            }
             if ev.ing_day_ms.saturating_sub(ts) > LATE_MS - DAY_MS
                 && is_late_slow(ev.ing_bcd, ev.ing_day_ms, ts)
             {

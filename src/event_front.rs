@@ -20,7 +20,8 @@ pub struct Event<'a> {
     pub uh: u64,
     pub uid_bytes: &'a [u8],
     pub product: &'a [u8],
-    pub timestamp: Option<i64>,
+    // i64::MAX is outside every half-open event window.
+    pub timestamp: i64,
     pub ing_day_ms: i64,
     pub ing_bcd: u32,
     pub kind: u8, // 0 invalid (then `product` is empty); 1 view/cart; 2 purchase
@@ -28,6 +29,8 @@ pub struct Event<'a> {
 }
 
 pub trait EventSink<'a> {
+    #[cfg(target_arch = "x86_64")]
+    const PAD_ROW_160: bool = false;
     #[inline(always)]
     fn prefetch_keys(&self, _ek_long: bool, _eh: u64, _uid_long: bool, _uh: u64) {}
     fn on_event(&mut self, ev: Event<'a>);
@@ -189,7 +192,7 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
             dates.parse_event_ingest_bcd(data.get_unchecked(ta..ta + 20), data.get_unchecked(ia..ia + 20))
         } else if tlen == 13 {
             let (id, ib) = dates.parse_f1_ingest_bcd(data.get_unchecked(ia..ia + 20));
-            (DateCache::parse_ts_13(data.get_unchecked(ta..ta + 13)), id, ib)
+            (DateCache::parse_ts_13(data.get_unchecked(ta..ta + 13)).unwrap_or(i64::MAX), id, ib)
         } else if tlen == 25 {
             dates.parse_f2_ingest_bcd(data.get_unchecked(ta..ta + 25), data.get_unchecked(ia..ia + 20))
         } else {
@@ -610,6 +613,10 @@ unsafe fn handle_row_160_avx2<'a, S: EventSink<'a>>(
     f: &mut S,
 ) -> usize {
     use core::arch::x86_64::*;
+    // Pad the first instantiation to preserve alignment of the <10> handler and click scanner.
+    if S::PAD_ROW_160 {
+        core::arch::asm!("jmp 2f\n.skip 14, 0xcc\n2:", options(nomem, nostack, preserves_flags));
+    }
     if data.len() >= 160 {
         let p = data.as_ptr();
         let v_cm = _mm256_set1_epi8(b',' as i8);
@@ -1148,7 +1155,7 @@ mod tests {
                 uh,
                 uid_bytes: f[1],
                 product: if kind == 0 { &[] } else { f[5] },
-                timestamp: dates.parse_ts(f[2]),
+                timestamp: dates.parse_ts(f[2]).unwrap_or(i64::MAX),
                 ing_day_ms,
                 ing_bcd,
                 kind,
