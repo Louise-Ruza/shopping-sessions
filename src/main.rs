@@ -973,21 +973,27 @@ fn dedup_shard(
     let nseg = segs.segs.len();
     // Partition full segments (n == 1008) first so 85-95% of duplicate/collision lookups
     // resolve `(osi, ori)` in 2 branchless ops instead of a 5-step binary search on `seg_starts`.
+    // 64 or fewer segments can encode the segment and record directly in u16.
+    let direct_pos = nseg <= 64;
     let mut n_full = 0usize;
-    for i in 0..nseg {
-        if segs.segs[i].n == DEDUP_SEG_CAP {
-            if i != n_full {
-                segs.segs.swap(i, n_full);
+    if !direct_pos {
+        for i in 0..nseg {
+            if segs.segs[i].n == DEDUP_SEG_CAP {
+                if i != n_full {
+                    segs.segs.swap(i, n_full);
+                }
+                n_full += 1;
             }
-            n_full += 1;
         }
     }
     let full_end = n_full as u32 * DEDUP_SEG_CAP;
     seg_starts.clear();
     let mut off = full_end;
-    for s in &segs.segs[n_full..] {
-        seg_starts.push(off);
-        off += s.n;
+    if !direct_pos {
+        for s in &segs.segs[n_full..] {
+            seg_starts.push(off);
+            off += s.n;
+        }
     }
     // Non-power-of-2 Lemire fast-range sizing (~61.5% load factor on 16-way buckets, zero 2x cliff):
     // ~3968 buckets (248 KB) @ 20M, ~5888 buckets (368 KB vs 512 KB, -28%!) @ 60M, backed by 1 pooled 2MB THP block!
@@ -999,9 +1005,10 @@ fn dedup_shard(
 
     const PF: usize = 16;
     let mut bring = [(0u32, 0u16); PF];
-    let mut me = 0u16;
+    let mut next = 0u16;
     for si in 0..nseg {
         let seg = segs.seg(si);
+        let mut me = if direct_pos { (si << 10) as u16 } else { next };
         let slen = seg.len();
         let pre = slen.min(PF);
         for ri in 0..pre {
@@ -1027,7 +1034,9 @@ fn dedup_shard(
                         eq &= eq - 1;
                         eq &= eq - 1;
                         let oi = *(*bkt).pos.get_unchecked(lane) as u32;
-                        let (osi, ori) = if oi < full_end {
+                        let (osi, ori) = if direct_pos {
+                            ((oi >> 10) as usize, (oi & 1023) as usize)
+                        } else if oi < full_end {
                             let s = oi / DEDUP_SEG_CAP;
                             (s as usize, (oi - s * DEDUP_SEG_CAP) as usize)
                         } else {
@@ -1076,7 +1085,9 @@ fn dedup_shard(
                         eq &= eq - 1;
                         eq &= eq - 1;
                         let oi = *(*bkt).pos.get_unchecked(lane) as u32;
-                        let (osi, ori) = if oi < full_end {
+                        let (osi, ori) = if direct_pos {
+                            ((oi >> 10) as usize, (oi & 1023) as usize)
+                        } else if oi < full_end {
                             let s = oi / DEDUP_SEG_CAP;
                             (s as usize, (oi - s * DEDUP_SEG_CAP) as usize)
                         } else {
@@ -1113,6 +1124,7 @@ fn dedup_shard(
             }
             me = me.wrapping_add(1);
         }
+        next = me;
     }
     // Deferred 16-ahead prefetched tombstone pass: overlaps cold DRAM RFO writes into `ev_set`/`purch_set`.
     let nl = loser_locs.len();
@@ -1244,6 +1256,89 @@ fn dedup_long_shard_wide(
     }
 }
 
+#[derive(Clone, Copy)]
+struct LongMatch {
+    anchor: *mut LongDedupRec,
+    anchor_id: *const u8,
+    row: LongDedupRec,
+}
+
+const LONG_OFF_MASK: u64 = (1u64 << 34) - 1;
+
+impl LongDedupRec {
+    #[inline(always)]
+    fn id_ptr(self, input: usize) -> *const u8 {
+        (input + (self.off_h30 & LONG_OFF_MASK) as usize) as *const u8
+    }
+}
+
+#[inline(never)]
+fn resolve_long_matches(
+    matches: &[LongMatch],
+    loser_locs: &mut Vec<u32>,
+    input: usize,
+    base: i64,
+    oob: &[i64],
+) {
+    // The first record with a fingerprint anchors its group. A true hash collision
+    // belongs to a separate exact-key map and never changes the anchor's winner.
+    let mut collisions = std::collections::HashMap::<&[u8], (u32, u32)>::new();
+    const DIST: usize = 24;
+    let pre = matches.len().min(DIST);
+    let prefetch_pair = |pair: &LongMatch| {
+        let row = pair.row.id_ptr(input);
+        prefetch(pair.anchor_id);
+        prefetch(pair.anchor_id.wrapping_add(32));
+        prefetch(row);
+        prefetch(row.wrapping_add(32));
+    };
+    for pair in &matches[..pre] {
+        prefetch_pair(pair);
+    }
+    let mut resolve = |pair: &LongMatch| {
+        let row = pair.row;
+        let id = row.id_ptr(input);
+        let loser = if unsafe { eq33(pair.anchor_id, id) } {
+            // All segment views from the probe pass have expired. This shard
+            // owns the anchor segment, so it can retain the winner in place.
+            let winner = unsafe { &mut *pair.anchor };
+            if ingest_less(row.ingest, winner.ingest, base, oob) {
+                winner.ingest = row.ingest;
+                std::mem::replace(&mut winner.loc, row.loc)
+            } else {
+                row.loc
+            }
+        } else {
+            let id = unsafe { std::slice::from_raw_parts(id, 33) };
+            match collisions.entry(id) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((row.ingest, row.loc));
+                    return;
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let winner = o.get_mut();
+                    if ingest_less(row.ingest, winner.0, base, oob) {
+                        std::mem::replace(winner, (row.ingest, row.loc)).1
+                    } else {
+                        row.loc
+                    }
+                }
+            }
+        };
+        if loser != arena::LOC_INVALID {
+            loser_locs.push(loser);
+        }
+    };
+    let main_end = matches.len() - pre;
+    for (pair, next) in matches[..main_end].iter().zip(&matches[pre..]) {
+        prefetch_pair(next);
+        resolve(pair);
+    }
+    for pair in &matches[main_end..] {
+        resolve(pair);
+    }
+}
+
 /// L2-resident single-pass exact dedup over the disjoint 16B 33-byte `event_id` stream.
 /// Uses precomputed 30-bit hash (zero hashing, zero CSV mmap derefs except on 30-bit hash matches).
 fn dedup_long_shard(
@@ -1252,10 +1347,11 @@ fn dedup_long_shard(
     buckets32: &mut Vec<DedupBucket>,
     seg_starts: &mut Vec<u32>,
     loser_locs: &mut Vec<u32>,
+    matches: &mut Vec<LongMatch>,
     base: i64,
     oob: &[i64],
 ) {
-    place_pad!(30); // +32 B: dedup_shard / scan_clicks placement
+    place_pad!(62); // +64 B: scan_clicks placement
     let n = segs.len();
     if n < 2 {
         return;
@@ -1265,23 +1361,28 @@ fn dedup_long_shard(
         return;
     }
     const LONG_SEG_CAP: u32 = (arena::SEG / std::mem::size_of::<LongDedupRec>()) as u32;
-    const OFF_MASK: u64 = (1u64 << 34) - 1;
     let nseg = segs.segs.len();
+    // 64 or fewer segments can encode the segment and record directly in u16.
+    let direct_pos = nseg <= 64;
     let mut n_full = 0usize;
-    for i in 0..nseg {
-        if segs.segs[i].n == LONG_SEG_CAP {
-            if i != n_full {
-                segs.segs.swap(i, n_full);
+    if !direct_pos {
+        for i in 0..nseg {
+            if segs.segs[i].n == LONG_SEG_CAP {
+                if i != n_full {
+                    segs.segs.swap(i, n_full);
+                }
+                n_full += 1;
             }
-            n_full += 1;
         }
     }
     let full_end = n_full as u32 * LONG_SEG_CAP;
     seg_starts.clear();
     let mut off = full_end;
-    for s in &segs.segs[n_full..] {
-        seg_starts.push(off);
-        off += s.n;
+    if !direct_pos {
+        for s in &segs.segs[n_full..] {
+            seg_starts.push(off);
+            off += s.n;
+        }
     }
     let nbuckets = ((n / 10) + 64) & !63;
     buckets16.reset_zeroed(nbuckets);
@@ -1289,12 +1390,14 @@ fn dedup_long_shard(
     let seg_meta = segs.segs.as_ptr();
     let in_base = key::input_base();
     loser_locs.clear();
+    matches.clear();
 
     const PF: usize = 16;
     let mut bring = [(0u32, 0u16); PF];
-    let mut me = 0u16;
+    let mut next = 0u16;
     for si in 0..nseg {
         let seg = segs.seg(si);
+        let mut me = if direct_pos { (si << 10) as u16 } else { next };
         let slen = seg.len();
         let pre = slen.min(PF);
         for ri in 0..pre {
@@ -1320,7 +1423,9 @@ fn dedup_long_shard(
                         eq &= eq - 1;
                         eq &= eq - 1;
                         let oi = *(*bkt).pos.get_unchecked(lane) as u32;
-                        let (osi, ori) = if oi < full_end {
+                        let (osi, ori) = if direct_pos {
+                            ((oi >> 10) as usize, (oi & 1023) as usize)
+                        } else if oi < full_end {
                             let s = oi / LONG_SEG_CAP;
                             (s as usize, (oi - s * LONG_SEG_CAP) as usize)
                         } else {
@@ -1328,23 +1433,11 @@ fn dedup_long_shard(
                             (n_full + t, (oi - *seg_starts.get_unchecked(t)) as usize)
                         };
                         let os = *seg_meta.add(osi);
-                        let o = &*(os.ptr as *const LongDedupRec).add(ori);
+                        let anchor = (os.ptr as *mut LongDedupRec).add(ori);
+                        let o = &*anchor;
                         let r = seg.get_unchecked(ri);
-                        if ((o.off_h30 ^ r.off_h30) >> 34) == 0
-                            && eq33(
-                                (in_base + (o.off_h30 & OFF_MASK) as usize) as *const u8,
-                                (in_base + (r.off_h30 & OFF_MASK) as usize) as *const u8,
-                            )
-                        {
-                            let loser_loc = if ingest_less(r.ingest, o.ingest, base, oob) {
-                                *(*bkt).pos.get_unchecked_mut(lane) = me;
-                                o.loc
-                            } else {
-                                r.loc
-                            };
-                            if loser_loc != arena::LOC_INVALID {
-                                loser_locs.push(loser_loc);
-                            }
+                        if ((o.off_h30 ^ r.off_h30) >> 34) == 0 {
+                            matches.push(LongMatch { anchor, anchor_id: o.id_ptr(in_base), row: *r });
                             break 'probe;
                         }
                     }
@@ -1374,7 +1467,9 @@ fn dedup_long_shard(
                         eq &= eq - 1;
                         eq &= eq - 1;
                         let oi = *(*bkt).pos.get_unchecked(lane) as u32;
-                        let (osi, ori) = if oi < full_end {
+                        let (osi, ori) = if direct_pos {
+                            ((oi >> 10) as usize, (oi & 1023) as usize)
+                        } else if oi < full_end {
                             let s = oi / LONG_SEG_CAP;
                             (s as usize, (oi - s * LONG_SEG_CAP) as usize)
                         } else {
@@ -1382,23 +1477,11 @@ fn dedup_long_shard(
                             (n_full + t, (oi - *seg_starts.get_unchecked(t)) as usize)
                         };
                         let os = *seg_meta.add(osi);
-                        let o = &*(os.ptr as *const LongDedupRec).add(ori);
+                        let anchor = (os.ptr as *mut LongDedupRec).add(ori);
+                        let o = &*anchor;
                         let r = seg.get_unchecked(ri);
-                        if ((o.off_h30 ^ r.off_h30) >> 34) == 0
-                            && eq33(
-                                (in_base + (o.off_h30 & OFF_MASK) as usize) as *const u8,
-                                (in_base + (r.off_h30 & OFF_MASK) as usize) as *const u8,
-                            )
-                        {
-                            let loser_loc = if ingest_less(r.ingest, o.ingest, base, oob) {
-                                *(*bkt).pos.get_unchecked_mut(lane) = me;
-                                o.loc
-                            } else {
-                                r.loc
-                            };
-                            if loser_loc != arena::LOC_INVALID {
-                                loser_locs.push(loser_loc);
-                            }
+                        if ((o.off_h30 ^ r.off_h30) >> 34) == 0 {
+                            matches.push(LongMatch { anchor, anchor_id: o.id_ptr(in_base), row: *r });
                             break 'probe;
                         }
                     }
@@ -1416,7 +1499,9 @@ fn dedup_long_shard(
             }
             me = me.wrapping_add(1);
         }
+        next = me;
     }
+    resolve_long_matches(matches, loser_locs, in_base, base, oob);
     let nl = loser_locs.len();
     if nl > 0 {
         let lp = loser_locs.as_ptr();
@@ -5297,10 +5382,14 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
         let oob_slice = &oob_ingest[..];
         let base_day_ms = ctx.dates.base_day_ms;
         par(threads, |_| {
+            if ID_BITS == 9 {
+                place_pad!(30); // +32 B: following short dedup entry.
+            }
             let mut buckets16: HugeBuf<DedupBucket16> = HugeBuf::empty();
             let mut buckets32: Vec<DedupBucket> = Vec::new();
             let mut seg_starts: Vec<u32> = Vec::new();
             let mut loser_locs: Vec<u32> = Vec::new();
+            let mut long_matches = Vec::new();
             loop {
                 let s = next.fetch_add(1, Ordering::Relaxed);
                 if s >= total_dedup {
@@ -5326,6 +5415,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                         &mut buckets32,
                         &mut seg_starts,
                         &mut loser_locs,
+                        &mut long_matches,
                         base_day_ms,
                         oob_slice,
                     );
