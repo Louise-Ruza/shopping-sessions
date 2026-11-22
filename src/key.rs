@@ -17,6 +17,7 @@
 //! - `hi in 0x81..=0x87`: raw 1..=7 byte string (any bytes, verbatim)
 //! - `hi == 0xC0`: interned in global sharded `OverflowStore` (`OVF_TAG | idx`)
 //! - `hi == 0xD0`: zero-copy slice into contiguous input mmap (`REF_TAG | (len << 36) | off`)
+//! - `hi == 0xD1`: 33-byte Key8 mmap ref (`tag | (fingerprint20 << 36) | off`)
 //! - `val == u64::MAX` (`hi == 0xFF`): `Key8::TOMBSTONE` (impossible for real IDs)
 
 use std::cmp::Ordering;
@@ -37,6 +38,7 @@ pub fn mum(a: u64, b: u64) -> u64 {
 const OVF_TAG: u64 = 0xC000_0000_0000_0000;
 const REF_TAG: u64 = 0xD000_0000_0000_0000;
 const REF_TAG_BYTE: u64 = 0xD0;
+const USER_REF_TAG_BYTE: u64 = 0xD1;
 const REF_OFF_MASK: u64 = (1u64 << 36) - 1; // up to 64 GiB of contiguous mapped CSVs
 const REF_MAX_LEN: usize = 1 << 20;         // up to 1 MiB per single ID string
 const OVF_SHARD_BITS: u32 = 6;
@@ -54,8 +56,13 @@ pub fn register_input_region(base: usize, len: usize) {
 
 #[inline(always)]
 fn is_non_inline_raw(v: u64) -> bool {
-    // Matches 0xC0 (OVF_TAG) and 0xD0 (REF_TAG); excludes 0x00..=0x87 and 0xFF (TOMBSTONE).
+    // Includes overflow, ordinary refs, and cached user refs; excludes inline and tombstone.
     ((v >> 56) & 0xE0) == 0xC0
+}
+
+#[inline(always)]
+fn is_ref_raw(v: u64) -> bool {
+    (v >> 56) == REF_TAG_BYTE || (v >> 56) == USER_REF_TAG_BYTE
 }
 
 #[inline(always)]
@@ -63,12 +70,14 @@ unsafe fn ref_bytes(v: u64) -> &'static [u8] {
     let base = INPUT_BASE.load(AOrd::Relaxed);
     let off = (v & REF_OFF_MASK) as usize;
     let len = ((v >> 36) & ((REF_MAX_LEN - 1) as u64)) as usize;
+
+    let len = if (v >> 56) == USER_REF_TAG_BYTE { 33 } else { len };
     std::slice::from_raw_parts((base + off) as *const u8, len)
 }
 
 #[inline(always)]
 fn non_inline_bytes(v: u64) -> &'static [u8] {
-    if (v >> 56) == REF_TAG_BYTE {
+    if is_ref_raw(v) {
         unsafe { ref_bytes(v) }
     } else {
         overflow_store().get(v & !OVF_TAG)
@@ -77,6 +86,15 @@ fn non_inline_bytes(v: u64) -> &'static [u8] {
 
 #[inline(never)]
 fn key_eq_slow(a: u64, b: u64) -> bool {
+
+    if (a >> 56) == USER_REF_TAG_BYTE && (b >> 56) == USER_REF_TAG_BYTE {
+        // Different cached fingerprints reject without reading either mmap slice.
+        // Equal fingerprints are only a filter: compare all 33 bytes, even on collision.
+        if ((a ^ b) >> 36) != 0 {
+            return false;
+        }
+        return unsafe { ref_bytes(a) == ref_bytes(b) };
+    }
     if (a >> 56) == REF_TAG_BYTE && (b >> 56) == REF_TAG_BYTE {
         if ((a ^ b) >> 36) != 0 {
             return false;
@@ -108,6 +126,50 @@ fn key_hash(v: u64, seed: u64) -> u64 {
         mum(v ^ seed, P0)
     } else {
         key_hash_slow(v, seed)
+    }
+}
+
+
+#[inline(always)]
+fn user_fingerprint(s: &[u8]) -> u64 {
+    debug_assert_eq!(s.len(), 33);
+    crate::hash::hash(s, P1) & ((1 << 20) - 1)
+}
+
+
+#[inline(always)]
+fn fingerprint_hash(fingerprint: u64, seed: u64) -> u64 {
+    mum(fingerprint ^ seed, P0)
+}
+
+
+#[inline(always)]
+fn pack_user33(s: &[u8], fingerprint: u64) -> u64 {
+    let ilen = INPUT_LEN.load(AOrd::Relaxed);
+    let base = INPUT_BASE.load(AOrd::Relaxed);
+    let off = (s.as_ptr() as usize).wrapping_sub(base);
+    if off < ilen && 33 <= ilen - off && (off as u64) <= REF_OFF_MASK {
+        (USER_REF_TAG_BYTE << 56) | (fingerprint << 36) | off as u64
+    } else {
+        OVF_TAG | overflow_store().intern(s)
+    }
+}
+
+
+#[inline(always)]
+fn user_key_hash(v: u64, seed: u64) -> u64 {
+    if (v >> 56) == USER_REF_TAG_BYTE {
+        fingerprint_hash((v >> 36) & ((1 << 20) - 1), seed)
+    } else if !is_non_inline_raw(v) {
+        mum(v ^ seed, P0)
+    } else {
+        let s = non_inline_bytes(v);
+        if s.len() == 33 {
+            // Owned and ordinary-ref copies must use the same hash for every seed.
+            fingerprint_hash(user_fingerprint(s), seed)
+        } else {
+            crate::hash::hash(s, seed)
+        }
     }
 }
 
@@ -344,7 +406,7 @@ impl CKey {
 impl Key8 {
     pub const EMPTY: Key8 = Key8(0);
     /// Impossible sentinel key used to mark deduplicated-away `PEv` tombstones in place
-    /// (real overflow/ref keys always have top byte `0xC0`/`0xD0`, never `0xFF`).
+    /// (real overflow/ref keys always have top byte `0xC0`/`0xD0`/`0xD1`, never `0xFF`).
     pub const TOMBSTONE: Key8 = Key8(u64::MAX);
 
     #[inline(always)]
@@ -360,7 +422,7 @@ impl Key8 {
 
     #[inline(always)]
     pub fn prefetch_ref(&self) {
-        if (self.0 >> 56) == REF_TAG_BYTE {
+        if is_ref_raw(self.0) {
             let base = INPUT_BASE.load(AOrd::Relaxed);
             let off = (self.0 & REF_OFF_MASK) as usize;
             crate::links::prefetch((base + off) as *const u8);
@@ -375,19 +437,28 @@ impl Key8 {
 
     #[inline(always)]
     pub fn new(s: &[u8]) -> Key8 {
+
+        if s.len() == 33 {
+            return Key8(pack_user33(s, user_fingerprint(s)));
+        }
         Key8(pack_prefixed::<b'u'>(s))
     }
 
     #[inline(always)]
     pub fn new_and_hash(s: &[u8], seed: u64) -> (Key8, u64) {
+
+        if s.len() == 33 {
+            let fingerprint = user_fingerprint(s);
+            return (Key8(pack_user33(s, fingerprint)), fingerprint_hash(fingerprint, seed));
+        }
         let (v, h) = pack_prefixed_and_hash::<b'u'>(s, seed);
         (Key8(v), h)
     }
 
-    /// Single-multiply wyhash-grade 64-bit hash for inline keys; full byte wyhash for long keys.
+    /// Inline mixing, or full byte hashing; user-fingerprint caches a 20-bit 33-byte digest.
     #[inline(always)]
     pub fn hash(&self, seed: u64) -> u64 {
-        key_hash(self.0, seed)
+        user_key_hash(self.0, seed)
     }
 
     /// The ID bytes; inline keys are decoded into `buf` with a single unaligned u64 store.
@@ -560,6 +631,130 @@ mod tests {
             let s = &buf[off - n..off];
             assert_eq!(EKey::new(s), EKey::new(&s.to_vec()));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_user_fingerprints_match_owned_refs_and_exact_collisions() {
+        struct Mapping { ptr: *mut libc::c_void, len: usize, old_base: usize, old_len: usize }
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                register_input_region(self.old_base, self.old_len);
+                assert_eq!(unsafe { libc::munmap(self.ptr, self.len) }, 0);
+            }
+        }
+        let control = b"u0123456789abcdef0123456789abcdef";
+        let mut fingerprints = HashMap::new();
+        let (one, two) = (0..).find_map(|i: u32| {
+            let id = format!("u{i:032x}");
+            let fingerprint = user_fingerprint(id.as_bytes());
+            if fingerprint == user_fingerprint(control) { return None; }
+            fingerprints.insert(fingerprint, i).map(|prev| (format!("u{prev:032x}"), id))
+        }).unwrap();
+        let mut ids = vec![
+            control.to_vec(), one.into_bytes(), two.into_bytes(),
+            "\u{00e9}\u{6c49}\u{1f600}abcdefghijklmnopqrstuvwx".as_bytes().to_vec(),
+        ];
+        for i in 0..8u16 {
+            ids.push((0..33u16).map(|j| (i * 33 + j) as u8).collect());
+        }
+        for len in [0, 1, 7, 8, 9, 32, 34, 300] { ids.push(vec![b'X'; len]); }
+        assert!(ids[..12].iter().all(|s| s.len() == 33));
+        assert_ne!(ids[1], ids[2]);
+        assert_eq!(user_fingerprint(&ids[1]), user_fingerprint(&ids[2]));
+
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let needed: usize = ids.iter().map(|s| (s.len() + 1) * 2).sum();
+        let len = (needed + page - 1) & !(page - 1);
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE,
+                                     libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let mapping = Mapping { ptr, len, old_base: INPUT_BASE.load(AOrd::Relaxed), old_len: INPUT_LEN.load(AOrd::Relaxed) };
+        let mut offsets = Vec::new();
+        let mut off = 0;
+        for s in &ids {
+            offsets.push(off);
+            unsafe {
+                std::ptr::copy_nonoverlapping(s.as_ptr(), ptr.cast::<u8>().add(off), s.len());
+                std::ptr::copy_nonoverlapping(s.as_ptr(), ptr.cast::<u8>().add(off + s.len() + 1), s.len());
+            }
+            off += (s.len() + 1) * 2;
+        }
+        assert_eq!(unsafe { libc::mprotect(ptr, len, libc::PROT_READ) }, 0);
+        register_input_region(ptr as usize, len);
+        let trait_hash = |k: &Key8| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            Hash::hash(k, &mut hasher);
+            hasher.finish()
+        };
+        let mut mapped_keys = Vec::new();
+        for (i, s) in ids.iter().enumerate() {
+            let mapped = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().add(offsets[i]), s.len()) };
+            let second = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().add(offsets[i] + s.len() + 1), s.len()) };
+            let key = Key8::new(mapped);
+            let owned = Key8::new(s);
+            let duplicate = Key8::new(second);
+            assert_eq!(key, owned);
+            assert_eq!(key, duplicate);
+            assert_eq!(rt(&key), *s);
+            assert_eq!(key.cmp_bytes(&owned), Ordering::Equal);
+            assert_eq!(trait_hash(&key), trait_hash(&owned));
+            key.prefetch_ref();
+            if s.len() == 33 {
+                assert_eq!(key.0 >> 56, USER_REF_TAG_BYTE);
+                assert_eq!(owned.0 >> 56, OVF_TAG >> 56);
+                assert!(key.is_non_inline() && !key.is_inline());
+                assert_eq!(key.0 & REF_OFF_MASK, offsets[i] as u64);
+                let ordinary = Key8(REF_TAG | (33 << 36) | offsets[i] as u64);
+                assert_eq!(key, ordinary);
+                assert_eq!(trait_hash(&key), trait_hash(&ordinary));
+                assert_eq!(rt(&ordinary), *s);
+                for bit in 0..64 {
+                    for seed in [0, u64::MAX, 1u64 << bit, !(1u64 << bit)] {
+                        assert_eq!(key.hash(seed), owned.hash(seed));
+                        assert_eq!(key.hash(seed), ordinary.hash(seed));
+                        let (combined, hash) = Key8::new_and_hash(mapped, seed);
+                        let (fallback, fallback_hash) = Key8::new_and_hash(s, seed);
+                        assert_eq!(combined, key);
+                        assert_eq!(fallback, key);
+                        assert_eq!(hash, key.hash(seed));
+                        assert_eq!(hash, fallback_hash);
+                        // Event and click keys retain ordinary refs and full-byte hashing.
+                        let (event, event_hash) = EKey::new_and_hash(mapped, seed);
+                        assert_eq!(event.0 >> 56, REF_TAG_BYTE);
+                        assert_eq!(event_hash, crate::hash::hash(s, seed));
+                        assert_eq!(event_hash, EKey::new(s).hash(seed));
+                    }
+                }
+                assert_eq!(CKey::new(mapped).0 >> 56, REF_TAG_BYTE);
+                assert_eq!(CKey::new(mapped), CKey::new(s));
+            } else {
+                assert_ne!(key.0 >> 56, USER_REF_TAG_BYTE);
+                for seed in [0, P0, P1, u64::MAX] {
+                    assert_eq!(key.hash(seed), owned.hash(seed));
+                    assert_eq!(Key8::new_and_hash(mapped, seed), (key, key.hash(seed)));
+                }
+            }
+            mapped_keys.push(key);
+        }
+        // Exact collisions do not merge IDs; all cross-representation ordering stays bytewise.
+        assert_ne!(mapped_keys[1], mapped_keys[2]);
+        assert_eq!(mapped_keys[1].hash(P0), mapped_keys[2].hash(P0));
+        for (i, a) in mapped_keys.iter().enumerate() {
+            for (j, b) in mapped_keys.iter().enumerate() {
+                assert_eq!(a == b, ids[i] == ids[j]);
+                assert_eq!(a.cmp_bytes(b), ids[i].cmp(&ids[j]));
+                assert_eq!(a.cmp_bytes(&Key8::new(&ids[j])), ids[i].cmp(&ids[j]));
+            }
+        }
+        // A differing cached fingerprint must reject before any mmap read; cached hashing too.
+        assert_ne!(user_fingerprint(&ids[0]), user_fingerprint(&ids[1]));
+        let expected = mapped_keys[0].hash(P1);
+        assert_eq!(unsafe { libc::mprotect(ptr, len, libc::PROT_NONE) }, 0);
+        assert_ne!(mapped_keys[0], mapped_keys[1]);
+        assert_eq!(mapped_keys[0].hash(P1), expected);
+        assert_eq!(unsafe { libc::mprotect(ptr, len, libc::PROT_READ) }, 0);
+        drop(mapping);
     }
 
     #[test]
