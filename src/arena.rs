@@ -843,7 +843,7 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         }
         let mut sc = Self::new_with_meta(set, meta);
         sc.located = true;
-        unsafe { std::ptr::write_bytes(sc.loc_ptr, 0xFF, sc.nshards) }; // LOC_INVALID = u32::MAX
+        sc.alloc_all_located();
         sc
     }
 
@@ -872,7 +872,7 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         }
         let mut sc = Self::new_with_meta(set, meta);
         sc.located = true;
-        unsafe { std::ptr::write_bytes(sc.loc_ptr, 0xFF, sc.nshards) }; // LOC_INVALID = u32::MAX
+        sc.alloc_all_located();
         sc
     }
 
@@ -901,7 +901,7 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         }
         let mut sc = Self::new_with_meta(set, meta);
         sc.located = true;
-        unsafe { std::ptr::write_bytes(sc.loc_ptr, 0xFF, sc.nshards) }; // LOC_INVALID = u32::MAX
+        sc.alloc_all_located();
         sc
     }
 
@@ -1004,9 +1004,24 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
     #[inline(never)]
     fn finish_full_seg_loc(&mut self, s: usize, seg_end: usize) {
         self.set.push_seg(s, Seg { ptr: seg_end - SEG_SZ, n: (SEG_SZ / Self::SZ) as u32 });
-        unsafe {
-            *self.dest_ptr.add(s) = Dest { dst: 0, rem: 0 };
-            *self.loc_ptr.add(s) = LOC_INVALID;
+        let loc = self.ensure_seg_loc_any(s);
+        unsafe { *self.loc_ptr.add(s) = loc };
+    }
+
+    /// Every located shard always owns a current segment (allocated eagerly here and on
+    /// each segment rollover), so `push_with_loc*` never checks for a missing one per row.
+    fn alloc_all_located(&mut self) {
+        for s in 0..self.nshards {
+            let loc = self.ensure_seg_loc_any(s);
+            unsafe { *self.loc_ptr.add(s) = loc };
+        }
+    }
+
+    fn ensure_seg_loc_any(&mut self, s: usize) -> u32 {
+        match Self::SZ {
+            12 => self.ensure_seg_loc12(s),
+            24 => self.ensure_seg_loc24(s),
+            _ => self.ensure_seg_loc(s),
         }
     }
 
@@ -1055,10 +1070,7 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         let per_mask = (Self::PER as u32) - 1;
         unsafe {
             let lp = self.loc_ptr.add(s);
-            let mut loc = *lp;
-            if loc == LOC_INVALID {
-                loc = self.ensure_seg_loc(s);
-            }
+            let loc = *lp;
             let f = (loc & per_mask) as usize;
             let st = self.stage_ptr.add(s * STAGE) as *mut T;
             st.add(f).write(x);
@@ -1080,10 +1092,7 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         let per_mask = (Self::PER as u32) - 1;
         unsafe {
             let lp = self.loc_ptr.add(s);
-            let mut loc = *lp;
-            if loc == LOC_INVALID {
-                loc = self.ensure_seg_loc12(s);
-            }
+            let loc = *lp;
             let f = (loc & per_mask) as usize;
             let st = self.stage_ptr.add(s * STAGE) as *mut T;
             st.add(f).write(x);
@@ -1106,10 +1115,7 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         let per_mask = (Self::PER as u32) - 1;
         unsafe {
             let lp = self.loc_ptr.add(s);
-            let mut loc = *lp;
-            if loc == LOC_INVALID {
-                loc = self.ensure_seg_loc24(s);
-            }
+            let loc = *lp;
             let f = (loc & per_mask) as usize;
             let st = self.stage_ptr.add(s * STAGE) as *mut T;
             st.add(f).write(x);
@@ -1213,8 +1219,8 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
                 dst += bytes;
                 rem -= bytes;
             }
-            if dst != 0 {
-                let used = SEG_SZ - rem;
+            let used = SEG_SZ - rem;
+            if dst != 0 && used != 0 {
                 self.set.push_seg(s, Seg { ptr: dst - used, n: (used / Self::SZ) as u32 });
             }
         }
