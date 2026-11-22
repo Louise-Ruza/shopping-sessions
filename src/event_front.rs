@@ -197,9 +197,10 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
         };
         let kq = quoted(4, *p.add(c3 + 1) == b'"');
         let ka = c3 + 1 + kq;
-        // No `ka + 4 + kq < c5` bound: a matching `view`/`cart` followed by a comma makes that
-        // comma the first one after `c3`, i.e. `c4 < c5`. Reads reach at most `end + 3`, which
-        // stays inside the input (`INPUT_TAIL` slack after every file).
+        // The fixed-width kind read and its delimiter must precede the product's end.
+        if ka + 4 + kq >= c5 {
+            return None;
+        }
         let (kind, c4) = {
             let k4 = (p.add(ka) as *const u32).read_unaligned();
             let is_vc = ((k4 == u32::from_ne_bytes(*b"view")) | (k4 == u32::from_ne_bytes(*b"cart")))
