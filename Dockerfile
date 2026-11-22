@@ -45,11 +45,38 @@ RUN set -eu; \
         strip -o /shopping-sessions target/release/shopping-sessions; \
     fi
 
+# Preserve the trained v3 artifact and profile in the stock build layer.
+FROM build AS wide
+COPY dispatch.rs /src/dispatch.rs
+RUN set -eu; \
+    mv /shopping-sessions /shopping-sessions-v3; \
+    HOST="$(rustc -vV | sed -n 's/^host: //p')"; \
+    case "$HOST" in \
+        x86_64-*) \
+            FLAGS="-C target-cpu=x86-64-v4"; \
+            if [ -f /pgo-out/merged.profdata ]; then FLAGS="$FLAGS -Cprofile-use=/pgo-out/merged.profdata"; fi; \
+            RUSTFLAGS="$FLAGS" cargo build --release --locked --target "$HOST"; \
+            strip -o /shopping-sessions "target/$HOST/release/shopping-sessions";; \
+        *) cp /shopping-sessions-v3 /shopping-sessions;; \
+    esac; \
+    rustc --edition=2021 -O -Cstrip=symbols dispatch.rs -o /dispatch
+
+# Export unstripped symbols from the same scoring build to the research profiler.
+FROM wide AS research-symbol-copy
+RUN set -eu; host="$(rustc -vV | sed -n 's/^host: //p')"; \
+    for exe in "target/$host/release/shopping-sessions" target/release/shopping-sessions; do \
+        if [ -f "$exe" ]; then cp "$exe" /research-symbols; exit 0; fi; \
+    done; exit 1
+FROM scratch AS profile-symbols
+COPY --from=research-symbol-copy /research-symbols /shopping-sessions
+
 # Minimal runtime: plain glibc + libgcc only, no shell. Matches bookworm's glibc.
 FROM gcr.io/distroless/cc-debian12
-COPY --from=build /shopping-sessions /shopping-sessions
+COPY --from=wide /shopping-sessions /shopping-sessions
+COPY --from=wide /shopping-sessions-v3 /shopping-sessions-v3
+COPY --from=wide /dispatch /dispatch
 # Scorer env: DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch NCPU=8 MEM_GB=24.
 # The binary writes only under OUTPUT_DIR and needs no writable root or /tmp.
 ENV DATA_DIR=/data OUTPUT_DIR=/output
 USER 1000:1000
-ENTRYPOINT ["/shopping-sessions"]
+ENTRYPOINT ["/dispatch"]
