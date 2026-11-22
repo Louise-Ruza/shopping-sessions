@@ -4879,11 +4879,10 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
     event_front::EventSink<'_> for &mut EventHandler<'a, 'b, ID_BITS, P_BITS, EV_STAGE, P_STAGE>
 {
     #[inline(always)]
-    fn prefetch_keys(&self, ek_long: bool, eh: u64, _uid_long: bool, uh: u64) {
-        // Branchless cmov pointer select: eliminates 5M unpredictable 12.5% branch mispredicts!
-        let p_short = self.id_w.shard_stage_ptr((eh >> (64 - ID_BITS)) as usize);
-        let p_long = self.long_id_w.shard_stage_ptr((eh >> (64 - (ID_BITS - 2))) as usize);
-        prefetch(if !ek_long { p_short } else { p_long });
+    fn prefetch_keys(&self, _ek_long: bool, eh: u64, _uid_long: bool, uh: u64) {
+        // Always the short-ID stage line: the long-ID stage (1/4 the shards, 8-16 KB) stays
+        // cache-resident, so selecting its line per row cost more than the prefetch saved.
+        prefetch(self.id_w.shard_stage_ptr((eh >> (64 - ID_BITS)) as usize));
         // When uid_long, uh == 0 -> prefetches shard 0 (already L1-hot), zero branch!
         self.ev_w.prefetch_located_shard((uh >> (64 - P_BITS)) as usize);
     }

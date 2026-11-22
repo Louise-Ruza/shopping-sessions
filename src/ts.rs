@@ -214,7 +214,16 @@ struct DateSlot {
 
 #[inline(always)]
 fn dd_slot(dd: u16) -> usize {
-    (((dd & 3) << 4) | ((dd >> 8) & 15)) as usize
+    // Same 6 bits as `((dd & 3) << 4) | ((dd >> 8) & 15)`, gathered by one `pext` in a
+    // different (still bijective) order; `DateCache::new` indexes with this same function.
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        core::arch::x86_64::_pext_u32(dd as u32, 0x0F03) as usize
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        (((dd & 3) << 4) | ((dd >> 8) & 15)) as usize
+    }
 }
 
 pub struct DateCache {

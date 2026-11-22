@@ -162,16 +162,17 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
     };
     let p = data.as_ptr();
     unsafe {
-        if c1 + 1 >= c2 || c2 + 1 >= c5 {
-            return None;
-        }
+        // Callers pass exactly six commas, so `c2 + 3 <= c5` and every read below up to the
+        // ingest field stays before `c5`. An empty raw ts (`c1 + 1 == c2`) reads the comma at
+        // `c1 + 1` and gets `tlen == 0`, which the timestamp dispatch sends to `fallback`.
         let tq = quoted(2, *p.add(c1 + 1) == b'"');
         let ta = c1 + 1 + tq;
         let tlen = (c2 - c1 - 1).wrapping_sub(tq << 1);
         let iq = quoted(3, *p.add(c2 + 1) == b'"');
         let ia = c2 + 1 + iq;
         let c3 = ia + 20 + iq;
-        if c3 >= c5 || *p.add(c3) != b',' {
+        // One branch: `c3 >= c5` alone rejects; otherwise the byte at `c3` must be a comma.
+        if (c3 >= c5) | (*p.add(c3.min(c5)) != b',') {
             return None;
         }
         let q0 = quoted(0, c0 > 0 && *p == b'"');
@@ -344,9 +345,6 @@ fn parse_row_mid128<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     let end_bit_mid = 1u64 << end_mid;
     let below_mid = end_bit_mid - 1;
     let c_mid = c_mid_raw & below_mid;
-    if c_lo.count_ones() + c_mid.count_ones() != 6 {
-        return None;
-    }
     let q_mid = q_mid_raw & below_mid;
     let seps_lo = c_lo;
     let seps_mid = c_mid | end_bit_mid;
@@ -354,7 +352,10 @@ fn parse_row_mid128<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     let edges_mid = (seps_mid << 1) | (seps_lo >> 63) | (seps_mid >> 1);
     let p_lo = parity64(q_lo);
     let p_mid = parity64(q_mid) ^ 0u64.wrapping_sub(p_lo >> 63);
-    if ((q_lo & !edges_lo) | (p_lo & seps_lo)) != 0 || ((q_mid & !edges_mid) | (p_mid & seps_mid)) != 0 {
+    // Field count and quote legality share one (never-taken on clean rows) branch.
+    if (c_lo.count_ones() + c_mid.count_ones() != 6)
+        | (((q_lo & !edges_lo) | (p_lo & seps_lo) | (q_mid & !edges_mid) | (p_mid & seps_mid)) != 0)
+    {
         return None;
     }
     // 98.3% of v5 rows have >= 2 commas in c_lo (`low1 != 0`); branchless cmov picks c2 from low2 vs c_mid!
