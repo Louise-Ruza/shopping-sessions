@@ -497,13 +497,21 @@ struct DedupRec {
     loc: u32,
 }
 
-/// 24-byte event_id dedup record for long/non-inline `event_id`s (disjoint from inline `DedupRec`).
-/// Carries precomputed `eh` so `dedup_long_shard` never hashes or dereferences `eid` except on
-/// exact 64-bit hash matches (~0.3% true duplicates).
+/// Compact 16-byte event_id dedup record for 33-byte `REF_TAG` `event_id`s (100% of v5 long IDs):
+/// low 34 bits = byte offset in `INPUT_BASE` (up to 16 GiB); top 30 bits = independent hash bits
+/// (`bits 55..26` of `eh`) so `dedup_long_shard` never hashes and only touches CSV on 30-bit matches!
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct LongDedupRec {
-    eh: u64,
+    off_h30: u64,
+    ingest: u32,
+    loc: u32,
+}
+
+/// Cold fallback 24-byte event_id dedup record for non-33B / non-InputArena non-inline `event_id`s (0% of v5).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct OtherDedupRec {
     eid: EKey,
     ingest: u32,
     loc: u32,
@@ -692,7 +700,8 @@ struct Cl24 {
 }
 
 const _: () = assert!(std::mem::size_of::<DedupRec>() == 16);
-const _: () = assert!(std::mem::size_of::<LongDedupRec>() == 24);
+const _: () = assert!(std::mem::size_of::<LongDedupRec>() == 16);
+const _: () = assert!(std::mem::size_of::<OtherDedupRec>() == 16);
 const _: () = assert!(std::mem::size_of::<PEv12>() == 12);
 const _: () = assert!(std::mem::size_of::<PPurch>() == 16);
 const _: () = assert!(std::mem::size_of::<Click>() == 24);
@@ -1060,6 +1069,44 @@ fn dedup_shard(
     }
 }
 
+#[inline(always)]
+unsafe fn eq33(a: *const u8, b: *const u8) -> bool {
+    let x0 = (a as *const u64).read_unaligned() ^ (b as *const u64).read_unaligned();
+    let x1 = (a.add(8) as *const u64).read_unaligned() ^ (b.add(8) as *const u64).read_unaligned();
+    let x2 = (a.add(16) as *const u64).read_unaligned() ^ (b.add(16) as *const u64).read_unaligned();
+    let x3 = (a.add(24) as *const u64).read_unaligned() ^ (b.add(24) as *const u64).read_unaligned();
+    let x4 = (*a.add(32) ^ *b.add(32)) as u64;
+    (x0 | x1 | x2 | x3 | x4) == 0
+}
+
+#[cold]
+#[inline(never)]
+fn dedup_other_shard(segs: Segs<OtherDedupRec>, base: i64, oob: &[i64]) {
+    let mut map: std::collections::HashMap<EKey, (u32, u32)> = std::collections::HashMap::new();
+    for seg in segs.iter() {
+        for r in seg {
+            match map.entry(r.eid) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((r.ingest, r.loc));
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let (oi, oloc) = *o.get();
+                    let loser_loc = if ingest_less(r.ingest, oi, base, oob) {
+                        o.insert((r.ingest, r.loc));
+                        oloc
+                    } else {
+                        r.loc
+                    };
+                    if loser_loc != arena::LOC_INVALID {
+                        unsafe { tombstone_ev_loc(loser_loc) };
+                    }
+                }
+            }
+        }
+    }
+    segs.free();
+}
+
 #[cold]
 #[inline(never)]
 fn dedup_long_shard_wide(
@@ -1079,14 +1126,17 @@ fn dedup_long_shard_wide(
     let bmask = nbuckets - 1;
     let bptr = buckets.as_mut_ptr();
     let seg_meta = segs.segs.as_ptr();
+    let in_base = key::input_base();
+    const OFF_MASK: u64 = (1u64 << 34) - 1;
     for si in 0..nseg {
         let seg = segs.seg(si);
         for ri in 0..seg.len() {
             let r = unsafe { seg.get_unchecked(ri) };
-            let h = r.eh;
-            let tag = (h as u32) | 1;
+            let h30 = r.off_h30 >> 34;
+            let hm = key::mum(h30, key::P0);
+            let tag = (h30 as u32) | 1;
             let me = ((si << 10) | ri) as u32;
-            let mut bi = ((h >> 32) as usize) & bmask;
+            let mut bi = ((hm >> 32) as usize) & bmask;
             'probe: loop {
                 unsafe {
                     let bkt = bptr.add(bi);
@@ -1097,7 +1147,12 @@ fn dedup_long_shard_wide(
                         let oi = *(*bkt).pos.get_unchecked(lane);
                         let os = *seg_meta.add((oi >> 10) as usize);
                         let o = &*(os.ptr as *const LongDedupRec).add((oi & 1023) as usize);
-                        if o.eh == r.eh && o.eid == r.eid {
+                        if ((o.off_h30 ^ r.off_h30) >> 34) == 0
+                            && eq33(
+                                (in_base + (o.off_h30 & OFF_MASK) as usize) as *const u8,
+                                (in_base + (r.off_h30 & OFF_MASK) as usize) as *const u8,
+                            )
+                        {
                             let loser_loc = if ingest_less(r.ingest, o.ingest, base, oob) {
                                 *(*bkt).pos.get_unchecked_mut(lane) = me;
                                 o.loc
@@ -1123,8 +1178,8 @@ fn dedup_long_shard_wide(
     }
 }
 
-/// L1-resident single-pass exact dedup over the disjoint long/non-inline `event_id` stream.
-/// Uses precomputed `r.eh` (zero hashing, zero CSV mmap derefs except on exact 64-bit hash matches).
+/// L2-resident single-pass exact dedup over the disjoint 16B 33-byte `event_id` stream.
+/// Uses precomputed 30-bit hash (zero hashing, zero CSV mmap derefs except on 30-bit hash matches).
 fn dedup_long_shard(
     segs: &mut Segs<LongDedupRec>,
     buckets16: &mut HugeBuf<DedupBucket16>,
@@ -1143,6 +1198,7 @@ fn dedup_long_shard(
         return;
     }
     const LONG_SEG_CAP: u32 = (arena::SEG / std::mem::size_of::<LongDedupRec>()) as u32;
+    const OFF_MASK: u64 = (1u64 << 34) - 1;
     let nseg = segs.segs.len();
     let mut n_full = 0usize;
     for i in 0..nseg {
@@ -1164,6 +1220,7 @@ fn dedup_long_shard(
     buckets16.reset_zeroed(nbuckets);
     let bptr = buckets16.as_mut_ptr();
     let seg_meta = segs.segs.as_ptr();
+    let in_base = key::input_base();
     loser_locs.clear();
 
     const PF: usize = 16;
@@ -1174,17 +1231,17 @@ fn dedup_long_shard(
         let slen = seg.len();
         let pre = slen.min(PF);
         for ri in 0..pre {
-            let h = unsafe { seg.get_unchecked(ri).eh };
-            let bi = fast_bucket(h, nbuckets);
-            bring[ri] = (bi as u32, (h as u16) | 1);
+            let h30 = unsafe { seg.get_unchecked(ri).off_h30 } >> 34;
+            let bi = (((h30 >> 14) as usize) * nbuckets) >> 16;
+            bring[ri] = (bi as u32, (h30 as u16) | 1);
             prefetch(unsafe { bptr.add(bi) } as *const u8);
         }
         let main_end = slen.saturating_sub(PF);
         for ri in 0..main_end {
             let (bi0, tag) = bring[ri & (PF - 1)];
-            let fh = unsafe { seg.get_unchecked(ri + PF).eh };
-            let fbi = fast_bucket(fh, nbuckets);
-            bring[(ri + PF) & (PF - 1)] = (fbi as u32, (fh as u16) | 1);
+            let fh30 = unsafe { seg.get_unchecked(ri + PF).off_h30 } >> 34;
+            let fbi = (((fh30 >> 14) as usize) * nbuckets) >> 16;
+            bring[(ri + PF) & (PF - 1)] = (fbi as u32, (fh30 as u16) | 1);
             prefetch(unsafe { bptr.add(fbi) } as *const u8);
             let mut bi = bi0 as usize;
             'probe: loop {
@@ -1206,7 +1263,12 @@ fn dedup_long_shard(
                         let os = *seg_meta.add(osi);
                         let o = &*(os.ptr as *const LongDedupRec).add(ori);
                         let r = seg.get_unchecked(ri);
-                        if o.eh == r.eh && o.eid == r.eid {
+                        if ((o.off_h30 ^ r.off_h30) >> 34) == 0
+                            && eq33(
+                                (in_base + (o.off_h30 & OFF_MASK) as usize) as *const u8,
+                                (in_base + (r.off_h30 & OFF_MASK) as usize) as *const u8,
+                            )
+                        {
                             let loser_loc = if ingest_less(r.ingest, o.ingest, base, oob) {
                                 *(*bkt).pos.get_unchecked_mut(lane) = me;
                                 o.loc
@@ -1255,7 +1317,12 @@ fn dedup_long_shard(
                         let os = *seg_meta.add(osi);
                         let o = &*(os.ptr as *const LongDedupRec).add(ori);
                         let r = seg.get_unchecked(ri);
-                        if o.eh == r.eh && o.eid == r.eid {
+                        if ((o.off_h30 ^ r.off_h30) >> 34) == 0
+                            && eq33(
+                                (in_base + (o.off_h30 & OFF_MASK) as usize) as *const u8,
+                                (in_base + (r.off_h30 & OFF_MASK) as usize) as *const u8,
+                            )
+                        {
                             let loser_loc = if ingest_less(r.ingest, o.ingest, base, oob) {
                                 *(*bkt).pos.get_unchecked_mut(lane) = me;
                                 o.loc
@@ -4707,9 +4774,10 @@ fn manifest_value(m: &str, key: &str) -> i64 {
 }
 
 const PURCH_SEG: usize = 2048;
-const LONG_EV_SEG: usize = 7680; // 40 * 192 = 320 * 24B (273 segs/2MB block, 99.94% packing, 2x fewer seg locks)
-const LONG_CL_SEG: usize = 2048; // 16 * 128 = 64 * 32B
+const LONG_EV_SEG: usize = arena::SEG; // 84 * 192 = 672 * 24B (with 4x fewer shards -> 16MB @ 20M, 32MB @ 60M, minimal locks!)
+const LONG_CL_SEG: usize = 4096; // 32 * 128 = 128 * 32B
 const OTHER_SEG: usize = 2048;
+const OTHER_CL_SEG: usize = 3840;
 
 struct EventHandler<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const P_STAGE: usize> {
     ctx: &'a Ctx,
@@ -4719,7 +4787,9 @@ struct EventHandler<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAG
     oob_ref: &'b Mutex<Vec<i64>>,
     wide_ref: &'b Mutex<Vec<(u32, u16)>>,
     id_w: Scatter<'b, DedupRec, EV_STAGE>,
-    long_id_w: Scatter<'b, LongDedupRec, 192>,
+    long_id_w: Scatter<'b, LongDedupRec, 64>,
+    other_id_set: &'b ShardSet<OtherDedupRec, OTHER_SEG>,
+    other_id_w: Option<Scatter<'b, OtherDedupRec, 64, OTHER_SEG>>,
     ev_w: Scatter<'b, PEv12, P_STAGE>,
     purch_w: Scatter<'b, PPurch, 64, PURCH_SEG>,
     long_ev_w: Scatter<'b, LongPEv, 192, LONG_EV_SEG>,
@@ -4778,14 +4848,25 @@ fn push_other_event<'b>(
     arena::LOC_OTHER_BIT | w.push_with_loc(0, OtherPEv { person: Key8::new(uid_bytes), ts: ts_rel, pc })
 }
 
+#[cold]
+#[inline(never)]
+fn push_other_dedup<'b>(
+    other_id_set: &'b ShardSet<OtherDedupRec, OTHER_SEG>,
+    other_id_w: &mut Option<Scatter<'b, OtherDedupRec, 64, OTHER_SEG>>,
+    rec: OtherDedupRec,
+) {
+    let w = other_id_w.get_or_insert_with(|| Scatter::<OtherDedupRec, 64, OTHER_SEG>::new(other_id_set));
+    w.push(0, rec);
+}
+
 impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const P_STAGE: usize>
     EventHandler<'a, 'b, ID_BITS, P_BITS, EV_STAGE, P_STAGE>
 {
-    #[inline(never)]
+    #[inline(always)]
     fn push_long_non_purch(&mut self, uid_bytes: &[u8], ts_rel: u32) -> u32 {
         if let Some((lo, hi)) = key::try_pack_hex33(uid_bytes) {
             let uh = key::hash_hex128(lo, hi, SEED_A);
-            let p_sh = (uh >> (64 - P_BITS)) as usize;
+            let p_sh = (uh >> (64 - (P_BITS - 2))) as usize;
             self.long_ev_w.push_with_loc24(p_sh, LongPEv { lo, hi, ts: ts_rel, pc: 0 })
         } else {
             push_other_event(self.other_ev_set, &mut self.other_ev_w, uid_bytes, ts_rel, 0)
@@ -4801,11 +4882,24 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
         }
         if let Some((lo, hi)) = key::try_pack_hex33(uid_bytes) {
             let uh = key::hash_hex128(lo, hi, SEED_A);
-            let p_sh = (uh >> (64 - P_BITS)) as usize;
+            let p_sh = (uh >> (64 - (P_BITS - 2))) as usize;
             self.long_ev_w.push_with_loc24(p_sh, LongPEv { lo, hi, ts: ts_rel, pc })
         } else {
             push_other_event(self.other_ev_set, &mut self.other_ev_w, uid_bytes, ts_rel, pc)
         }
+    }
+
+    #[inline(always)]
+    fn push_long_dedup(&mut self, ek: EKey, eh: u64, ingest: u32, loc: u32) {
+        if let Some((off, 33)) = ek.ref_off_len() {
+            if off < (1u64 << 34) {
+                let lid_sh = (eh >> (64 - (ID_BITS - 2))) as usize;
+                let h30 = (eh >> 26) & 0x3FFF_FFFF;
+                self.long_id_w.push(lid_sh, LongDedupRec { off_h30: (h30 << 34) | off, ingest, loc });
+                return;
+            }
+        }
+        push_other_dedup(self.other_id_set, &mut self.other_id_w, OtherDedupRec { eid: ek, ingest, loc });
     }
 }
 
@@ -4813,16 +4907,13 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
     event_front::EventSink<'_> for &mut EventHandler<'a, 'b, ID_BITS, P_BITS, EV_STAGE, P_STAGE>
 {
     #[inline(always)]
-    fn prefetch_keys(&self, ek_long: bool, eh: u64, uid_long: bool, uh: u64) {
-        let id_sh = (eh >> (64 - ID_BITS)) as usize;
-        if !ek_long {
-            self.id_w.prefetch_shard(id_sh);
-        } else {
-            self.long_id_w.prefetch_shard(id_sh);
-        }
-        if !uid_long {
-            self.ev_w.prefetch_located_shard((uh >> (64 - P_BITS)) as usize);
-        }
+    fn prefetch_keys(&self, ek_long: bool, eh: u64, _uid_long: bool, uh: u64) {
+        // Branchless cmov pointer select: eliminates 5M unpredictable 12.5% branch mispredicts!
+        let p_short = self.id_w.shard_stage_ptr((eh >> (64 - ID_BITS)) as usize);
+        let p_long = self.long_id_w.shard_stage_ptr((eh >> (64 - (ID_BITS - 2))) as usize);
+        prefetch(if !ek_long { p_short } else { p_long });
+        // When uid_long, uh == 0 -> prefetches shard 0 (already L1-hot), zero branch!
+        self.ev_w.prefetch_located_shard((uh >> (64 - P_BITS)) as usize);
     }
 
     #[inline(always)]
@@ -4881,7 +4972,7 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
         if !ek.is_non_inline() {
             self.id_w.push(id_sh, DedupRec { eid: ek, ingest: ing_u32, loc });
         } else {
-            self.long_id_w.push(id_sh, LongDedupRec { eh: ev.eh, eid: ek, ingest: ing_u32, loc });
+            self.push_long_dedup(ek, ev.eh, ing_u32, loc);
         }
     }
 }
@@ -4893,21 +4984,21 @@ struct ClickHandler<'a, 'b, const P_BITS: u32, const CL_STAGE: usize> {
     base: i64,
     w: Scatter<'b, Click, CL_STAGE>,
     long_w: Scatter<'b, LongClick, 128, LONG_CL_SEG>,
-    other_set: &'b ShardSet<Click, LONG_EV_SEG>,
-    other_w: Option<Scatter<'b, Click, 192, LONG_EV_SEG>>,
+    other_set: &'b ShardSet<Click, OTHER_CL_SEG>,
+    other_w: Option<Scatter<'b, Click, 192, OTHER_CL_SEG>>,
 }
 
 #[cold]
 #[inline(never)]
 fn push_other_click<'b>(
-    other_set: &'b ShardSet<Click, LONG_EV_SEG>,
-    other_w: &mut Option<Scatter<'b, Click, 192, LONG_EV_SEG>>,
+    other_set: &'b ShardSet<Click, OTHER_CL_SEG>,
+    other_w: &mut Option<Scatter<'b, Click, 192, OTHER_CL_SEG>>,
     uid: &[u8],
     cid: CKey,
     ts: u32,
     camp: u32,
 ) {
-    let w = other_w.get_or_insert_with(|| Scatter::<Click, 192, LONG_EV_SEG>::new(other_set));
+    let w = other_w.get_or_insert_with(|| Scatter::<Click, 192, OTHER_CL_SEG>::new(other_set));
     w.push(0, Click { person: Key8::new(uid), cid, ts, camp });
 }
 
@@ -4922,13 +5013,9 @@ impl<'a, 'b, const P_BITS: u32, const CL_STAGE: usize> event_front::ClickSink<'_
         }
         let (uid_k, uh) = Key8::pack_inline_or_sentinel(uid, SEED_A);
         let is_inline = uid_k.0 != Key8::NON_INLINE_SENTINEL.0;
-        let sh = if is_inline {
-            let s = (uh >> (64 - P_BITS)) as usize;
-            self.w.prefetch_shard(s);
-            s
-        } else {
-            0
-        };
+        let sh = (uh >> (64 - P_BITS)) as usize;
+        // Unconditional prefetch: when non-inline, uh == 0 -> shard 0 (already L1-hot), zero branch!
+        self.w.prefetch_shard(sh);
         let Some(camp) = self.ctx.camps.get_swar(f[2]) else { return };
         let ts = match self.ctx.dates.parse_ts(f[3]) {
             Some(t) if (t.wrapping_sub(self.cws) as u64) < self.cwlen => t,
@@ -4938,7 +5025,7 @@ impl<'a, 'b, const P_BITS: u32, const CL_STAGE: usize> event_front::ClickSink<'_
         if is_inline {
             self.w.push(sh, Click { person: uid_k, cid: CKey::new(cid), ts: ts_rel, camp });
         } else if let Some((lo, hi)) = key::try_pack_hex33(uid) {
-            let lsh = (key::hash_hex128(lo, hi, SEED_A) >> (64 - P_BITS)) as usize;
+            let lsh = (key::hash_hex128(lo, hi, SEED_A) >> (64 - (P_BITS - 2))) as usize;
             self.long_w.push(lsh, LongClick { lo, hi, cid: CKey::new(cid), ts: ts_rel, camp });
         } else {
             push_other_click(self.other_set, &mut self.other_w, uid, CKey::new(cid), ts_rel, camp);
@@ -4955,7 +5042,9 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
     mark: &mut impl FnMut(&'static str),
 ) -> (Vec<(Vec<UserDailyPart>, Vec<CampAcc>)>, LinkTable) {
     let id_shards: usize = 1 << ID_BITS;
+    let long_id_shards: usize = 1 << (ID_BITS - 2);
     let p_shards: usize = 1 << P_BITS;
+    let long_p_shards: usize = 1 << (P_BITS - 2);
     let wlen: u64 = (ctx.we - ctx.ws).max(0) as u64;
 
     // ---- events + dedup + clicks with exact `threads`-on-`threads` scheduling:
@@ -4967,10 +5056,11 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
     let inline_links = threads >= 2 && link_bytes * 4 < event_bytes;
     let chunks = make_chunks(event_files, chunk_target(event_files, threads));
     let id_set: ShardSet<DedupRec> = ShardSet::new_shared(id_shards);
-    let long_id_set: ShardSet<LongDedupRec> = ShardSet::new_shared(id_shards);
+    let long_id_set: ShardSet<LongDedupRec> = ShardSet::new_shared(long_id_shards);
+    let other_id_set: ShardSet<OtherDedupRec, OTHER_SEG> = ShardSet::new_shared(1);
     let ev_set: ShardSet<PEv12> = ShardSet::new_shared(p_shards);
     let purch_set: ShardSet<PPurch, PURCH_SEG> = ShardSet::new_shared(p_shards);
-    let long_ev_set: ShardSet<LongPEv, LONG_EV_SEG> = ShardSet::new_shared(p_shards);
+    let long_ev_set: ShardSet<LongPEv, LONG_EV_SEG> = ShardSet::new_shared(long_p_shards);
     let other_ev_set: ShardSet<OtherPEv, OTHER_SEG> = ShardSet::new_shared(1);
     let oob_ingest: Mutex<Vec<i64>> = Mutex::new(Vec::new());
     let wide_store: Mutex<Vec<(u32, u16)>> = Mutex::new(Vec::new());
@@ -4997,6 +5087,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                     return;
                 }
             }
+            let mut scatter_meta = arena::ScatterMetaPool::new();
             let mut handler = EventHandler::<ID_BITS, P_BITS, EV_STAGE, P_STAGE> {
                 ctx,
                 ws: ctx.ws,
@@ -5004,11 +5095,13 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                 wlen,
                 oob_ref: &oob_ingest,
                 wide_ref: &wide_store,
-                id_w: Scatter::<DedupRec, EV_STAGE>::new(&id_set),
-                long_id_w: Scatter::<LongDedupRec, 192>::new(&long_id_set),
-                ev_w: Scatter::<PEv12, P_STAGE>::new_located12(&ev_set),
-                purch_w: Scatter::<PPurch, 64, PURCH_SEG>::new_located(&purch_set),
-                long_ev_w: Scatter::<LongPEv, 192, LONG_EV_SEG>::new_located24(&long_ev_set),
+                id_w: Scatter::<DedupRec, EV_STAGE>::new_in(&id_set, &mut scatter_meta),
+                long_id_w: Scatter::<LongDedupRec, 64>::new_in(&long_id_set, &mut scatter_meta),
+                other_id_set: &other_id_set,
+                other_id_w: None,
+                ev_w: Scatter::<PEv12, P_STAGE>::new_located12_in(&ev_set, &mut scatter_meta),
+                purch_w: Scatter::<PPurch, 64, PURCH_SEG>::new_located_in(&purch_set, &mut scatter_meta),
+                long_ev_w: Scatter::<LongPEv, 192, LONG_EV_SEG>::new_located24_in(&long_ev_set, &mut scatter_meta),
                 other_ev_set: &other_ev_set,
                 other_ev_w: None,
             };
@@ -5023,6 +5116,9 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
             }
             handler.id_w.finish();
             handler.long_id_w.finish();
+            if let Some(oiw) = handler.other_id_w {
+                oiw.finish();
+            }
             handler.ev_w.finish();
             handler.purch_w.finish();
             handler.long_ev_w.finish();
@@ -5036,6 +5132,8 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
         let wide_store = wide_store.into_inner().unwrap();
 
         // ---- dedup (exact event_id) via 1-pass 64B-line AVX2 16-way tag16/pos16 buckets, marking losing PEvs in place!
+        let has_other_id = other_id_set.count(0) > 0;
+        let total_dedup = id_shards + long_id_shards + usize::from(has_other_id);
         let next = AtomicUsize::new(0);
         let oob_slice = &oob_ingest[..];
         let base_day_ms = ctx.dates.base_day_ms;
@@ -5046,35 +5144,42 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
             let mut loser_locs: Vec<u32> = Vec::new();
             loop {
                 let s = next.fetch_add(1, Ordering::Relaxed);
-                if s >= id_shards {
+                if s >= total_dedup {
                     break;
                 }
-                let mut segs = id_set.take(s);
-                dedup_shard(
-                    &mut segs,
-                    &mut buckets16,
-                    &mut buckets32,
-                    &mut seg_starts,
-                    &mut loser_locs,
-                    base_day_ms,
-                    oob_slice,
-                );
-                segs.free();
-                let mut lsegs = long_id_set.take(s);
-                dedup_long_shard(
-                    &mut lsegs,
-                    &mut buckets16,
-                    &mut buckets32,
-                    &mut seg_starts,
-                    &mut loser_locs,
-                    base_day_ms,
-                    oob_slice,
-                );
-                lsegs.free();
+                if s < id_shards {
+                    let mut segs = id_set.take(s);
+                    dedup_shard(
+                        &mut segs,
+                        &mut buckets16,
+                        &mut buckets32,
+                        &mut seg_starts,
+                        &mut loser_locs,
+                        base_day_ms,
+                        oob_slice,
+                    );
+                    segs.free();
+                } else if s < id_shards + long_id_shards {
+                    let mut lsegs = long_id_set.take(s - id_shards);
+                    dedup_long_shard(
+                        &mut lsegs,
+                        &mut buckets16,
+                        &mut buckets32,
+                        &mut seg_starts,
+                        &mut loser_locs,
+                        base_day_ms,
+                        oob_slice,
+                    );
+                    lsegs.free();
+                } else {
+                    let osegs = other_id_set.take(0);
+                    dedup_other_shard(osegs, base_day_ms, oob_slice);
+                }
             }
         });
         id_set.free_all();
         long_id_set.free_all();
+        other_id_set.free_all();
         mark("dedup");
 
         // ---- clicks: parse, validate, scatter directly by raw user_id (ZERO LinkTable lookups!)
@@ -5082,17 +5187,18 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
         let cwlen: u64 = (ctx.we - cws).max(0) as u64;
         let chunks = make_chunks(click_files, chunk_target(click_files, threads));
         let click_set: ShardSet<Click> = ShardSet::new_shared(p_shards);
-        let long_click_set: ShardSet<LongClick, LONG_CL_SEG> = ShardSet::new_shared(p_shards);
-        let other_click_set: ShardSet<Click, LONG_EV_SEG> = ShardSet::new_shared(1);
+        let long_click_set: ShardSet<LongClick, LONG_CL_SEG> = ShardSet::new_shared(long_p_shards);
+        let other_click_set: ShardSet<Click, OTHER_CL_SEG> = ShardSet::new_shared(1);
         let next = AtomicUsize::new(0);
         par(threads, |_| {
+            let mut scatter_meta = arena::ScatterMetaPool::new();
             let mut handler = ClickHandler::<P_BITS, CL_STAGE> {
                 ctx,
                 cws,
                 cwlen,
                 base: ctx.base,
-                w: Scatter::<Click, CL_STAGE>::new(&click_set),
-                long_w: Scatter::<LongClick, 128, LONG_CL_SEG>::new(&long_click_set),
+                w: Scatter::<Click, CL_STAGE>::new_in(&click_set, &mut scatter_meta),
+                long_w: Scatter::<LongClick, 128, LONG_CL_SEG>::new_in(&long_click_set, &mut scatter_meta),
                 other_set: &other_click_set,
                 other_w: None,
             };
@@ -5132,19 +5238,24 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
 
     // ---- Two-tier solve: Tier 1 resolves distinct uids once, solves unlinked in place,
     // forwards linked by dense cid (8B LEv8 + 16B LPurch + 16B LClick) to hash-free Tier 2!
-    let mut order: Vec<(usize, usize)> = (0..p_shards)
-        .map(|p| {
-            (
-                p,
-                (ev_set.count(p) + purch_set.count(p) + long_ev_set.count(p)) * 2
-                    + click_set.count(p)
-                    + long_click_set.count(p),
-            )
-        })
-        .collect();
+    // Schedule short shards (`0..p_shards`) and long shards (`p_shards..p_shards+long_p_shards`)
+    // together longest-job-first for optimal multi-core balance!
+    let mut order: Vec<(usize, usize)> = Vec::with_capacity(p_shards + long_p_shards);
+    for p in 0..p_shards {
+        let w = (ev_set.count(p) + purch_set.count(p)) * 2 + click_set.count(p);
+        if w > 0 {
+            order.push((p, w));
+        }
+    }
+    for lp in 0..long_p_shards {
+        let w = long_ev_set.count(lp) * 3 + long_click_set.count(lp);
+        if w > 0 {
+            order.push((p_shards + lp, w));
+        }
+    }
     order.sort_by_key(|x| std::cmp::Reverse(x.1));
     let has_other = other_ev_set.count(0) > 0 || other_click_set.count(0) > 0;
-    let total_t1 = p_shards + usize::from(has_other);
+    let total_t1 = order.len() + usize::from(has_other);
     let l_bits = P_BITS - 1;
     let l_shards = 1usize << l_bits;
     let l_mask = l_shards - 1;
@@ -5163,15 +5274,16 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
         let mut w = Worker::new(ctx, wide_slice);
         let mut sc = SolveScratch::new();
         {
-            let mut lev_w = Scatter::<LEv8, 128>::new(&linked_ev_set);
-            let mut lp_w = Scatter::<LPurch, 64>::new(&linked_p_set);
-            let mut lcl_w = Scatter::<LClick, 128>::new(&linked_cl_set);
+            let mut scatter_meta = arena::ScatterMetaPool::new();
+            let mut lev_w = Scatter::<LEv8, 128>::new_in(&linked_ev_set, &mut scatter_meta);
+            let mut lp_w = Scatter::<LPurch, 64>::new_in(&linked_p_set, &mut scatter_meta);
+            let mut lcl_w = Scatter::<LClick, 128>::new_in(&linked_cl_set, &mut scatter_meta);
             loop {
                 let k = next1.fetch_add(1, Ordering::Relaxed);
                 if k >= total_t1 {
                     break;
                 }
-                if k == p_shards {
+                if k == order.len() {
                     let oes = other_ev_set.take(0);
                     let ocs = other_click_set.take(0);
                     sc.run_other_tier1_shard(
@@ -5189,39 +5301,43 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
                     );
                     continue;
                 }
-                let p = order[k].0;
-                let es = ev_set.take(p);
-                let ps = purch_set.take(p);
-                let cs = click_set.take(p);
-                sc.run_tier1_shard(
-                    es,
-                    ps,
-                    cs,
-                    links,
-                    &mut w,
-                    &mut lev_w,
-                    &mut lp_w,
-                    &mut lcl_w,
-                    l_bits,
-                    l_mask,
-                    wide_camps,
-                    &wide_cl_mu,
-                );
-                let les = long_ev_set.take(p);
-                let lcs = long_click_set.take(p);
-                sc.run_long_tier1_shard(
-                    les,
-                    lcs,
-                    links,
-                    &mut w,
-                    &mut lev_w,
-                    &mut lp_w,
-                    &mut lcl_w,
-                    l_bits,
-                    l_mask,
-                    wide_camps,
-                    &wide_cl_mu,
-                );
+                let id = order[k].0;
+                if id < p_shards {
+                    let es = ev_set.take(id);
+                    let ps = purch_set.take(id);
+                    let cs = click_set.take(id);
+                    sc.run_tier1_shard(
+                        es,
+                        ps,
+                        cs,
+                        links,
+                        &mut w,
+                        &mut lev_w,
+                        &mut lp_w,
+                        &mut lcl_w,
+                        l_bits,
+                        l_mask,
+                        wide_camps,
+                        &wide_cl_mu,
+                    );
+                } else {
+                    let lp = id - p_shards;
+                    let les = long_ev_set.take(lp);
+                    let lcs = long_click_set.take(lp);
+                    sc.run_long_tier1_shard(
+                        les,
+                        lcs,
+                        links,
+                        &mut w,
+                        &mut lev_w,
+                        &mut lp_w,
+                        &mut lcl_w,
+                        l_bits,
+                        l_mask,
+                        wide_camps,
+                        &wide_cl_mu,
+                    );
+                }
             }
             lev_w.finish();
             lp_w.finish();

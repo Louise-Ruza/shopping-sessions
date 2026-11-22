@@ -319,21 +319,29 @@ impl DateCache {
             let ep = event.as_ptr();
             let ip = ingest.as_ptr();
             unsafe {
-                let ep_pref = (ep as *const u64).read_unaligned();
-                let ep_dd = (ep.add(8) as *const u16).read_unaligned();
-                if ((*ep.add(19) ^ b'Z') | (*ip.add(19) ^ b'Z')) == 0
-                    && ep_pref == (ip as *const u64).read_unaligned()
-                    && ep_dd == (ip.add(8) as *const u16).read_unaligned()
-                {
-                    let slot = *self.slots.get_unchecked(dd_slot(ep_dd));
-                    if ((ep_pref ^ slot.prefix) | ((ep_dd ^ slot.dd) as u64)) == 0 {
+                if ((*ep.add(19) ^ b'Z') | (*ip.add(19) ^ b'Z')) == 0 {
+                    let ep_pref = (ep as *const u64).read_unaligned();
+                    let ep_dd = (ep.add(8) as *const u16).read_unaligned();
+                    let ip_pref = (ip as *const u64).read_unaligned();
+                    let ip_dd = (ip.add(8) as *const u16).read_unaligned();
+                    let eslot = *self.slots.get_unchecked(dd_slot(ep_dd));
+                    if ((ep_pref ^ eslot.prefix) | ((ep_dd ^ eslot.dd) as u64)) == 0 {
+                        let islot = if ((ep_pref ^ ip_pref) | ((ep_dd ^ ip_dd) as u64)) == 0 {
+                            eslot
+                        } else {
+                            let s = *self.slots.get_unchecked(dd_slot(ip_dd));
+                            if ((ip_pref ^ s.prefix) | ((ip_dd ^ s.dd) as u64)) != 0 {
+                                return self.parse_event_ingest_bcd_slow(event, ingest);
+                            }
+                            s
+                        };
                         let ev_ms = if *ep.add(10) == b'T' {
-                            Self::clock_strict(ep.add(11)).map(|ms| slot.day_ms + ms)
+                            Self::clock_strict(ep.add(11)).map(|ms| eslot.day_ms + ms)
                         } else {
                             None
                         };
-                        let ing_bcd = slot.day_tag | bcd_hms(ip.add(11));
-                        return (ev_ms, slot.day_ms, ing_bcd);
+                        let ing_bcd = islot.day_tag | bcd_hms(ip.add(11));
+                        return (ev_ms, islot.day_ms, ing_bcd);
                     }
                 }
             }
@@ -358,41 +366,48 @@ impl DateCache {
                 if *ep.add(22) == b':' && (sign == b'+' || sign == b'-') && *ip.add(19) == b'Z' {
                     let ep_pref = (ep as *const u64).read_unaligned();
                     let ep_dd = (ep.add(8) as *const u16).read_unaligned();
-                    if ep_pref == (ip as *const u64).read_unaligned()
-                        && ep_dd == (ip.add(8) as *const u16).read_unaligned()
-                    {
-                        let slot = *self.slots.get_unchecked(dd_slot(ep_dd));
-                        if ((ep_pref ^ slot.prefix) | ((ep_dd ^ slot.dd) as u64)) == 0 {
-                            let ing_bcd = slot.day_tag | bcd_hms(ip.add(11));
-                            let ev_ms = if *ep.add(10) == b'T' {
-                                Self::clock_strict(ep.add(11)).and_then(|ms| {
-                                    let h0 = (*ep.add(20)).wrapping_sub(b'0');
-                                    let h1 = (*ep.add(21)).wrapping_sub(b'0');
-                                    let m0 = (*ep.add(23)).wrapping_sub(b'0');
-                                    let m1 = (*ep.add(24)).wrapping_sub(b'0');
-                                    if ((non_digit_bits(h0)
-                                        | non_digit_bits(h1)
-                                        | non_digit_bits(m0)
-                                        | non_digit_bits(m1))
-                                        & 0xF0)
-                                        != 0
-                                    {
-                                        return None;
-                                    }
-                                    let oh = h0 as u32 * 10 + h1 as u32;
-                                    let om = m0 as u32 * 10 + m1 as u32;
-                                    if oh > 23 || om > 59 {
-                                        return None;
-                                    }
-                                    let off = (oh as i64 * 60 + om as i64) * 60_000;
-                                    let base = slot.day_ms + ms;
-                                    Some(if sign == b'+' { base - off } else { base + off })
-                                })
-                            } else {
-                                None
-                            };
-                            return (ev_ms, slot.day_ms, ing_bcd);
-                        }
+                    let ip_pref = (ip as *const u64).read_unaligned();
+                    let ip_dd = (ip.add(8) as *const u16).read_unaligned();
+                    let eslot = *self.slots.get_unchecked(dd_slot(ep_dd));
+                    if ((ep_pref ^ eslot.prefix) | ((ep_dd ^ eslot.dd) as u64)) == 0 {
+                        let islot = if ((ep_pref ^ ip_pref) | ((ep_dd ^ ip_dd) as u64)) == 0 {
+                            eslot
+                        } else {
+                            let s = *self.slots.get_unchecked(dd_slot(ip_dd));
+                            if ((ip_pref ^ s.prefix) | ((ip_dd ^ s.dd) as u64)) != 0 {
+                                return self.parse_f2_ingest_bcd_slow(event, ingest);
+                            }
+                            s
+                        };
+                        let ing_bcd = islot.day_tag | bcd_hms(ip.add(11));
+                        let ev_ms = if *ep.add(10) == b'T' {
+                            Self::clock_strict(ep.add(11)).and_then(|ms| {
+                                let h0 = (*ep.add(20)).wrapping_sub(b'0');
+                                let h1 = (*ep.add(21)).wrapping_sub(b'0');
+                                let m0 = (*ep.add(23)).wrapping_sub(b'0');
+                                let m1 = (*ep.add(24)).wrapping_sub(b'0');
+                                if ((non_digit_bits(h0)
+                                    | non_digit_bits(h1)
+                                    | non_digit_bits(m0)
+                                    | non_digit_bits(m1))
+                                    & 0xF0)
+                                    != 0
+                                {
+                                    return None;
+                                }
+                                let oh = h0 as u32 * 10 + h1 as u32;
+                                let om = m0 as u32 * 10 + m1 as u32;
+                                if oh > 23 || om > 59 {
+                                    return None;
+                                }
+                                let off = (oh as i64 * 60 + om as i64) * 60_000;
+                                let base = eslot.day_ms + ms;
+                                Some(if sign == b'+' { base - off } else { base + off })
+                            })
+                        } else {
+                            None
+                        };
+                        return (ev_ms, islot.day_ms, ing_bcd);
                     }
                 }
             }

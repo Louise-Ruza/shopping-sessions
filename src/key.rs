@@ -53,6 +53,11 @@ pub fn register_input_region(base: usize, len: usize) {
 }
 
 #[inline(always)]
+pub fn input_base() -> usize {
+    INPUT_BASE.load(AOrd::Relaxed)
+}
+
+#[inline(always)]
 fn is_non_inline_raw(v: u64) -> bool {
     // Matches 0xC0 (OVF_TAG) and 0xD0 (REF_TAG); excludes 0x00..=0x87 and 0xFF (TOMBSTONE).
     ((v >> 56) & 0xE0) == 0xC0
@@ -147,6 +152,17 @@ impl PartialEq for EKey {
 }
 impl Eq for EKey {}
 
+impl Hash for EKey {
+    #[inline(always)]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        if !is_non_inline_raw(self.0) {
+            self.0.hash(state);
+        } else {
+            non_inline_bytes(self.0).hash(state);
+        }
+    }
+}
+
 /// Exact 8-byte ordered key for `click_id` (`CKey`), fast-pathed for `'k'`-prefixed 8/9B IDs.
 #[derive(Clone, Copy, Default, Debug)]
 #[repr(transparent)]
@@ -164,25 +180,27 @@ impl Eq for CKey {}
 fn pack_prefixed<const PREFIX: u8>(s: &[u8]) -> u64 {
     let n = s.len();
     let p = s.as_ptr();
-    if n == 9 {
+    if n.wrapping_sub(8) <= 1 {
         unsafe {
             if *p == PREFIX {
-                let v = (p.add(1) as *const u64).read_unaligned();
-                if (v as i64) > 0 {
-                    return v;
+                let w = (p.add(n - 8) as *const u64).read_unaligned();
+                let d = (9 - n) as u64;
+                let payload = w >> (d << 3);
+                // Always > 0 for n==8 (d==1, top byte 0); exact `(w as i64) > 0` for n==9 (d==0). Zero `n == 8` branch!
+                if ((payload | d) as i64) > 0 {
+                    return payload | (d << 63);
                 }
             }
         }
         return pack_slow(s);
     }
-    if n == 8 {
-        unsafe {
-            let w0 = (p as *const u64).read_unaligned();
-            if (w0 as u8) == PREFIX {
-                return (w0 >> 8) | (0x80u64 << 56);
-            }
+    if n == 33 {
+        let ilen = INPUT_LEN.load(AOrd::Relaxed);
+        let base = INPUT_BASE.load(AOrd::Relaxed);
+        let off = (p as usize).wrapping_sub(base);
+        if off < ilen && 33 <= ilen - off {
+            return REF_TAG | (33u64 << 36) | (off as u64);
         }
-        return pack_slow(s);
     }
     pack_slow(s)
 }
@@ -191,30 +209,33 @@ fn pack_prefixed<const PREFIX: u8>(s: &[u8]) -> u64 {
 fn pack_prefixed_and_hash<const PREFIX: u8>(s: &[u8], seed: u64) -> (u64, u64) {
     let n = s.len();
     let p = s.as_ptr();
-    if n == 9 {
+    if n.wrapping_sub(8) <= 1 {
         unsafe {
             if *p == PREFIX {
-                let v = (p.add(1) as *const u64).read_unaligned();
-                if (v as i64) > 0 {
+                let w = (p.add(n - 8) as *const u64).read_unaligned();
+                let d = (9 - n) as u64;
+                let payload = w >> (d << 3);
+                // Always > 0 for n==8 (d==1, top byte 0); exact `(w as i64) > 0` for n==9 (d==0). Zero `n == 8` branch!
+                if ((payload | d) as i64) > 0 {
+                    let v = payload | (d << 63);
                     return (v, mum(v ^ seed, P0));
                 }
             }
         }
         return pack_slow_and_hash(s, seed);
     }
-    if n == 8 {
-        unsafe {
-            let w0 = (p as *const u64).read_unaligned();
-            if (w0 as u8) == PREFIX {
-                let v = (w0 >> 8) | (0x80u64 << 56);
-                return (v, mum(v ^ seed, P0));
-            }
+    if n == 33 {
+        let ilen = INPUT_LEN.load(AOrd::Relaxed);
+        let base = INPUT_BASE.load(AOrd::Relaxed);
+        let off = (p as usize).wrapping_sub(base);
+        if off < ilen && 33 <= ilen - off {
+            return (REF_TAG | (33u64 << 36) | (off as u64), crate::hash::hash33(s, seed));
         }
-        return pack_slow_and_hash(s, seed);
     }
     pack_slow_and_hash(s, seed)
 }
 
+#[cold]
 #[inline(never)]
 fn pack_slow(s: &[u8]) -> u64 {
     let n = s.len();
@@ -239,6 +260,7 @@ fn pack_slow(s: &[u8]) -> u64 {
     OVF_TAG | overflow_store().intern(s)
 }
 
+#[cold]
 #[inline(never)]
 fn pack_slow_and_hash(s: &[u8], seed: u64) -> (u64, u64) {
     let n = s.len();
@@ -335,6 +357,15 @@ impl EKey {
     }
 
     #[inline(always)]
+    pub fn ref_off_len(&self) -> Option<(u64, usize)> {
+        if (self.0 >> 56) == REF_TAG_BYTE {
+            Some((self.0 & REF_OFF_MASK, ((self.0 >> 36) & ((REF_MAX_LEN - 1) as u64)) as usize))
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
     pub fn hash(&self, seed: u64) -> u64 {
         key_hash(self.0, seed)
     }
@@ -374,44 +405,44 @@ impl Key8 {
         is_non_inline_raw(self.0)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn pack_short_or_sentinel(s: &[u8], seed: u64) -> (Key8, u64) {
+        let n = s.len();
+        if n == 0 {
+            return (Key8::EMPTY, 0);
+        }
+        let mut v = (0x80u64 | n as u64) << 56;
+        for (i, &b) in s.iter().enumerate() {
+            v |= (b as u64) << (i * 8);
+        }
+        (Key8(v), mum(v ^ seed, P0))
+    }
+
     /// Fast-path inline pack+hash for `user_id`: avoids `REF_TAG` calculation and 33-byte hashing
     /// for non-inline IDs (returns `(NON_INLINE_SENTINEL, 0)` so callers can hex128-pack them directly).
     #[inline(always)]
     pub fn pack_inline_or_sentinel(s: &[u8], seed: u64) -> (Key8, u64) {
         let n = s.len();
         let p = s.as_ptr();
-        if n == 9 {
+        if n.wrapping_sub(8) <= 1 {
             unsafe {
                 if *p == b'u' {
-                    let v = (p.add(1) as *const u64).read_unaligned();
-                    if (v as i64) > 0 {
+                    let w = (p.add(n - 8) as *const u64).read_unaligned();
+                    let d = (9 - n) as u64;
+                    let payload = w >> (d << 3);
+                    if ((payload | d) as i64) > 0 {
+                        let v = payload | (d << 63);
                         return (Key8(v), mum(v ^ seed, P0));
                     }
                 }
             }
             return (Key8::NON_INLINE_SENTINEL, 0);
         }
-        if n == 8 {
-            unsafe {
-                let w0 = (p as *const u64).read_unaligned();
-                if (w0 as u8) == b'u' {
-                    let v = (w0 >> 8) | (0x80u64 << 56);
-                    return (Key8(v), mum(v ^ seed, P0));
-                }
-            }
+        if n >= 10 {
             return (Key8::NON_INLINE_SENTINEL, 0);
         }
-        if n == 0 {
-            return (Key8::EMPTY, 0);
-        }
-        if n <= 7 {
-            let mut v = (0x80u64 | n as u64) << 56;
-            for (i, &b) in s.iter().enumerate() {
-                v |= (b as u64) << (i * 8);
-            }
-            return (Key8(v), mum(v ^ seed, P0));
-        }
-        (Key8::NON_INLINE_SENTINEL, 0)
+        Self::pack_short_or_sentinel(s, seed)
     }
 
     #[cfg(test)]

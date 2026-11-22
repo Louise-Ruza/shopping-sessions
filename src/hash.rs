@@ -19,6 +19,20 @@ unsafe fn r4(p: *const u8) -> u64 {
     u32::from_le((p as *const u32).read_unaligned()) as u64
 }
 
+/// Exact 3-mum depth-2 hash for 33-byte v5 hex IDs (4 non-overlapping u64 loads).
+/// Identical output to `hash(s, seed)` for `s.len() == 33`.
+#[inline(always)]
+pub fn hash33(s: &[u8], seed: u64) -> u64 {
+    debug_assert_eq!(s.len(), 33);
+    let p = s.as_ptr();
+    let seed = seed ^ P0;
+    unsafe {
+        let s0 = mum(r8(p.add(1)) ^ P1, r8(p.add(9)) ^ seed);
+        let s1 = mum(r8(p.add(17)) ^ P0, r8(p.add(25)) ^ (seed ^ (*p as u64)));
+        mum(s0 ^ P1, s1 ^ (33u64 << 32))
+    }
+}
+
 #[inline(always)]
 pub fn hash(s: &[u8], seed: u64) -> u64 {
     let len = s.len();

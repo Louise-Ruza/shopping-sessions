@@ -695,6 +695,43 @@ struct GroupCur {
     blocks: Vec<(usize, u32)>,
 }
 
+/// Shares a single 2 MB THP block across multiple per-thread `Scatter` writers
+/// (cutting per-thread `kernel_init_pages` faults 5x and L1 2MB dTLB footprint 5->1).
+pub struct ScatterMetaPool {
+    blocks: Vec<(usize, u32)>,
+    cur_base: usize,
+    cur_off: usize,
+}
+
+impl ScatterMetaPool {
+    pub fn new() -> Self {
+        let (baddr, bid) = get_block();
+        ScatterMetaPool { blocks: vec![(baddr, bid)], cur_base: baddr, cur_off: 0 }
+    }
+
+    fn alloc(&mut self, bytes: usize) -> usize {
+        let need = (bytes + 63) & !63;
+        assert!(need <= BLOCK, "Scatter meta exceeds 2MB");
+        if self.cur_off + need > BLOCK {
+            let (baddr, bid) = get_block();
+            self.blocks.push((baddr, bid));
+            self.cur_base = baddr;
+            self.cur_off = 0;
+        }
+        let ptr = self.cur_base + self.cur_off;
+        self.cur_off += need;
+        ptr
+    }
+}
+
+impl Drop for ScatterMetaPool {
+    fn drop(&mut self) {
+        if !self.blocks.is_empty() {
+            put_blocks(&self.blocks);
+        }
+    }
+}
+
 pub struct Scatter<'a, T: Copy, const STAGE: usize = 64, const SEG_SZ: usize = SEG> {
     set: &'a ShardSet<T, SEG_SZ>,
     /// Single 2 MB THP block holding `stage`, `fill`, `dest`, and `loc_next` (1 L1 dTLB entry!).
@@ -722,7 +759,10 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
     const PER: u8 = (STAGE / std::mem::size_of::<T>()) as u8;
     const SEGS_PER_BLK: usize = BLOCK / SEG_SZ;
 
-    pub fn new(set: &'a ShardSet<T, SEG_SZ>) -> Scatter<'a, T, STAGE, SEG_SZ> {
+    fn new_with_meta(
+        set: &'a ShardSet<T, SEG_SZ>,
+        meta: Option<&mut ScatterMetaPool>,
+    ) -> Scatter<'a, T, STAGE, SEG_SZ> {
         const {
             assert!(STAGE >= 32 && STAGE % std::mem::size_of::<T>() == 0);
             assert!(STAGE / std::mem::size_of::<T>() <= 255);
@@ -734,8 +774,15 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         let fill_bytes = (n + 63) & !63;
         let dest_bytes = (n * std::mem::size_of::<Dest>() + 63) & !63;
         let loc_bytes = (n * std::mem::size_of::<u32>() + 63) & !63;
-        assert!(stage_bytes + fill_bytes + dest_bytes + loc_bytes <= BLOCK, "Scatter meta exceeds 2MB");
-        let (baddr, bid) = get_block();
+        let total = stage_bytes + fill_bytes + dest_bytes + loc_bytes;
+        assert!(total <= BLOCK, "Scatter meta exceeds 2MB");
+        let (baddr, meta_block) = match meta {
+            Some(pool) => (pool.alloc(total), None),
+            None => {
+                let (b, bid) = get_block();
+                (b, Some((b, bid)))
+            }
+        };
         let stage_ptr = baddr as *mut u8;
         let fill_ptr = (baddr + stage_bytes) as *mut u8;
         let dest_ptr = (baddr + stage_bytes + fill_bytes) as *mut Dest;
@@ -746,7 +793,7 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         }
         Scatter {
             set,
-            meta_block: Some((baddr, bid)),
+            meta_block,
             stage_ptr,
             fill_ptr,
             dest_ptr,
@@ -760,46 +807,99 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
         }
     }
 
+    pub fn new(set: &'a ShardSet<T, SEG_SZ>) -> Scatter<'a, T, STAGE, SEG_SZ> {
+        Self::new_with_meta(set, None)
+    }
+
+    pub fn new_in(set: &'a ShardSet<T, SEG_SZ>, meta: &mut ScatterMetaPool) -> Scatter<'a, T, STAGE, SEG_SZ> {
+        Self::new_with_meta(set, Some(meta))
+    }
+
     /// Creates a `Scatter` for 16-byte records supporting `push_with_loc`, which returns the
     /// exact stable `loc` where each staged record will land after flushing (NT or tail).
     /// `Self::PER` must be a power of 2 so `loc & (PER - 1)` gives the exact staging slot
     /// without touching `fill`.
+    #[allow(dead_code)]
     pub fn new_located(set: &'a ShardSet<T, SEG_SZ>) -> Scatter<'a, T, STAGE, SEG_SZ> {
+        Self::new_located_inner(set, None)
+    }
+
+    pub fn new_located_in(
+        set: &'a ShardSet<T, SEG_SZ>,
+        meta: &mut ScatterMetaPool,
+    ) -> Scatter<'a, T, STAGE, SEG_SZ> {
+        Self::new_located_inner(set, Some(meta))
+    }
+
+    fn new_located_inner(
+        set: &'a ShardSet<T, SEG_SZ>,
+        meta: Option<&mut ScatterMetaPool>,
+    ) -> Scatter<'a, T, STAGE, SEG_SZ> {
         const {
             assert!(std::mem::size_of::<T>() == 16);
             assert!((STAGE / 16).is_power_of_two());
             assert!((SEG_SZ / 16) % (STAGE / 16) == 0);
             assert!((BLOCK / SEG_SZ) * (SEG_SZ / 16) <= (1 << 17));
         }
-        let mut sc = Self::new(set);
+        let mut sc = Self::new_with_meta(set, meta);
         sc.located = true;
         unsafe { std::ptr::write_bytes(sc.loc_ptr, 0xFF, sc.nshards) }; // LOC_INVALID = u32::MAX
         sc
     }
 
     /// Creates a `Scatter` for 12-byte records supporting `push_with_loc12` (bits 30..31 always 0).
+    #[allow(dead_code)]
     pub fn new_located12(set: &'a ShardSet<T, SEG_SZ>) -> Scatter<'a, T, STAGE, SEG_SZ> {
+        Self::new_located12_inner(set, None)
+    }
+
+    pub fn new_located12_in(
+        set: &'a ShardSet<T, SEG_SZ>,
+        meta: &mut ScatterMetaPool,
+    ) -> Scatter<'a, T, STAGE, SEG_SZ> {
+        Self::new_located12_inner(set, Some(meta))
+    }
+
+    fn new_located12_inner(
+        set: &'a ShardSet<T, SEG_SZ>,
+        meta: Option<&mut ScatterMetaPool>,
+    ) -> Scatter<'a, T, STAGE, SEG_SZ> {
         const {
             assert!(std::mem::size_of::<T>() == 12);
             assert!((STAGE / 12).is_power_of_two());
             assert!((SEG_SZ / 12) % (STAGE / 12) == 0);
             assert!((BLOCK / SEG_SZ) * (SEG_SZ / 12) < (1 << 18));
         }
-        let mut sc = Self::new(set);
+        let mut sc = Self::new_with_meta(set, meta);
         sc.located = true;
         unsafe { std::ptr::write_bytes(sc.loc_ptr, 0xFF, sc.nshards) }; // LOC_INVALID = u32::MAX
         sc
     }
 
     /// Creates a `Scatter` for 24-byte records supporting buffered NT `push_with_loc24` (bit 30 = 1).
+    #[allow(dead_code)]
     pub fn new_located24(set: &'a ShardSet<T, SEG_SZ>) -> Scatter<'a, T, STAGE, SEG_SZ> {
+        Self::new_located24_inner(set, None)
+    }
+
+    pub fn new_located24_in(
+        set: &'a ShardSet<T, SEG_SZ>,
+        meta: &mut ScatterMetaPool,
+    ) -> Scatter<'a, T, STAGE, SEG_SZ> {
+        Self::new_located24_inner(set, Some(meta))
+    }
+
+    fn new_located24_inner(
+        set: &'a ShardSet<T, SEG_SZ>,
+        meta: Option<&mut ScatterMetaPool>,
+    ) -> Scatter<'a, T, STAGE, SEG_SZ> {
         const {
             assert!(std::mem::size_of::<T>() == 24);
             assert!((STAGE / 24).is_power_of_two());
             assert!((SEG_SZ / 24) % (STAGE / 24) == 0);
             assert!((BLOCK / SEG_SZ) * (SEG_SZ / 24) < (1 << 17));
         }
-        let mut sc = Self::new(set);
+        let mut sc = Self::new_with_meta(set, meta);
         sc.located = true;
         unsafe { std::ptr::write_bytes(sc.loc_ptr, 0xFF, sc.nshards) }; // LOC_INVALID = u32::MAX
         sc
@@ -908,6 +1008,11 @@ impl<'a, T: Copy, const STAGE: usize, const SEG_SZ: usize> Scatter<'a, T, STAGE,
             *self.dest_ptr.add(s) = Dest { dst: 0, rem: 0 };
             *self.loc_ptr.add(s) = LOC_INVALID;
         }
+    }
+
+    #[inline(always)]
+    pub fn shard_stage_ptr(&self, s: usize) -> *const u8 {
+        unsafe { self.stage_ptr.add(s * STAGE) }
     }
 
     #[inline(always)]
