@@ -597,7 +597,7 @@ macro_rules! place_pad {
 #[cold]
 #[inline(never)]
 fn is_late_slow(ing_bcd: u32, ing_day_ms: i64, ts: i64) -> bool {
-    place_pad!(62); // +64 B: scan_avx2 placement
+    place_pad!(46); // +48 B: scan_avx2 placement
     let ing_ms = if ing_bcd < INGEST_OOB_BASE {
         ing_day_ms + bcd_hms_to_ms(ing_bcd)
     } else {
@@ -1351,7 +1351,7 @@ fn dedup_long_shard(
     base: i64,
     oob: &[i64],
 ) {
-    place_pad!(62); // +64 B: scan_clicks placement
+    place_pad!(110); // +112 B: long-row scanner placement
     let n = segs.len();
     if n < 2 {
         return;
@@ -5017,7 +5017,6 @@ const OTHER_CL_SEG: usize = 3840;
 struct EventHandler<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const P_STAGE: usize> {
     ctx: &'a Ctx,
     ws: i64,
-    base: i64,
     wlen: u64,
     oob_ref: &'b Mutex<Vec<i64>>,
     wide_ref: &'b Mutex<Vec<(u32, u16)>>,
@@ -5141,6 +5140,58 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
         }
         push_other_dedup(self.other_id_set, &mut self.other_id_w, OtherDedupRec { eid: ek, ingest, loc });
     }
+
+    #[inline(always)]
+    fn emit<const KIND: u8>(&mut self, ev: event_front::Event<'_>) {
+        let kind = if KIND == 0 { ev.kind } else { KIND };
+        if ev.ek.0 == 0 {
+            return;
+        }
+        let ek = ev.ek;
+        let id_sh = (ev.eh >> (64 - ID_BITS)) as usize;
+        let mut loc = arena::LOC_INVALID;
+        'v: {
+            // An unknown kind arrives with an empty `product`. The timestamp sentinel
+            // also identifies events the parser dropped for lateness or invalid ingest.
+            // An empty `user_id` arrives as `NON_INLINE_SENTINEL` and is rejected in the cold
+            // `push_other_event` (or `push_long_purchase`), so the hot path tests only `product`.
+            if ev.product.is_empty() {
+                break 'v;
+            }
+            let ts = ev.timestamp;
+            let elapsed = ts.wrapping_sub(self.ws) as u64;
+            if elapsed >= self.wlen {
+                break 'v;
+            }
+            let ts_rel = (elapsed as u32).wrapping_add(SEVEN_DAYS_MS as u32);
+            if ev.uid_k.0 != Key8::NON_INLINE_SENTINEL.0 {
+                let p_sh = (ev.uh >> (64 - P_BITS)) as usize;
+                if kind == 1 {
+                    loc = self.ev_w.push_with_loc12(p_sh, PEv12 { person: ev.uid_k, ts: ts_rel });
+                } else {
+                    loc = push_purchase(
+                        self.ctx,
+                        self.wide_ref,
+                        &mut self.purch_w,
+                        p_sh,
+                        ev.uid_k,
+                        ts_rel,
+                        ev.product,
+                        ev.price,
+                    );
+                }
+            } else if kind == 1 {
+                loc = self.push_long_non_purch(ev.uid_bytes, ts_rel);
+            } else {
+                loc = self.push_long_purchase(ev.uid_bytes, ts_rel, ev.product, ev.price);
+            }
+        }
+        if !ek.is_non_inline() {
+            self.id_w.push(id_sh, DedupRec { eid: ek, ingest: ev.ing_bcd, loc });
+        } else {
+            self.push_long_dedup(ek, ev.eh, ev.ing_bcd, loc);
+        }
+    }
 }
 
 impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const P_STAGE: usize>
@@ -5157,64 +5208,24 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
         self.ev_w.prefetch_located_shard((uh >> (64 - P_BITS)) as usize);
     }
 
+    fn encode_special_ingest(&self, ingest: u32, exact_ms: i64) -> u32 {
+        encode_special_ingest(ingest, exact_ms, self.oob_ref)
+    }
+
     #[inline(always)]
     fn on_event(&mut self, ev: event_front::Event<'_>) {
-        if ev.ek.0 == 0 {
-            return;
-        }
-        let ek = ev.ek;
-        let id_sh = (ev.eh >> (64 - ID_BITS)) as usize;
-        let ing_u32 = if ev.ing_bcd < INGEST_OOB_BASE {
-            ev.ing_bcd
-        } else {
-            encode_special_ingest(ev.ing_bcd, ev.ing_day_ms, self.oob_ref)
-        };
-        let mut loc = arena::LOC_INVALID;
-        'v: {
-            // An unknown kind arrives with an empty `product`, and an unparseable ingest
-            // (`INGEST_NONE`) with `ing_day_ms == i64::MAX`, which the late check rejects.
-            // An empty `user_id` arrives as `NON_INLINE_SENTINEL` and is rejected in the cold
-            // `push_other_event` (or `push_long_purchase`), so the hot path tests only `product`.
-            if ev.product.is_empty() {
-                break 'v;
-            }
-            let ts = ev.timestamp;
-            if ts.wrapping_sub(self.ws) as u64 >= self.wlen {
-                break 'v;
-            }
-            if ev.ing_day_ms.saturating_sub(ts) > LATE_MS - DAY_MS
-                && is_late_slow(ev.ing_bcd, ev.ing_day_ms, ts)
-            {
-                break 'v;
-            }
-            let ts_rel = (ts - self.base) as u32;
-            if ev.uid_k.0 != Key8::NON_INLINE_SENTINEL.0 {
-                let p_sh = (ev.uh >> (64 - P_BITS)) as usize;
-                if ev.kind == 1 {
-                    loc = self.ev_w.push_with_loc12(p_sh, PEv12 { person: ev.uid_k, ts: ts_rel });
-                } else {
-                    loc = push_purchase(
-                        self.ctx,
-                        self.wide_ref,
-                        &mut self.purch_w,
-                        p_sh,
-                        ev.uid_k,
-                        ts_rel,
-                        ev.product,
-                        ev.price,
-                    );
-                }
-            } else if ev.kind == 1 {
-                loc = self.push_long_non_purch(ev.uid_bytes, ts_rel);
-            } else {
-                loc = self.push_long_purchase(ev.uid_bytes, ts_rel, ev.product, ev.price);
-            }
-        }
-        if !ek.is_non_inline() {
-            self.id_w.push(id_sh, DedupRec { eid: ek, ingest: ing_u32, loc });
-        } else {
-            self.push_long_dedup(ek, ev.eh, ing_u32, loc);
-        }
+        self.emit::<0>(ev);
+    }
+
+    #[inline(always)]
+    fn on_non_purchase(&mut self, ev: event_front::Event<'_>) {
+        self.emit::<1>(ev);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn on_purchase(&mut self, ev: event_front::Event<'_>) {
+        self.emit::<2>(ev);
     }
 }
 
@@ -5334,7 +5345,6 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
             let mut handler = EventHandler::<ID_BITS, P_BITS, EV_STAGE, P_STAGE> {
                 ctx,
                 ws: ctx.ws,
-                base: ctx.base,
                 wlen,
                 oob_ref: &oob_ingest,
                 wide_ref: &wide_store,

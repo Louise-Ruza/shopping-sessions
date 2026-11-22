@@ -104,10 +104,10 @@ fn key_eq(a: u64, b: u64) -> bool {
 
 #[inline(never)]
 fn key_hash_slow(v: u64, seed: u64) -> u64 {
-    // +48 B placement pad (a jump over int3 filler, never executed) for the functions after this one.
+    // +112 B placement pad (a jump over int3 filler, never executed) for the functions after this one.
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        core::arch::asm!("jmp 2f\n.skip 46, 0xcc\n2:", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("jmp 2f\n.skip 110, 0xcc\n2:", options(nomem, nostack, preserves_flags));
     }
     crate::hash::hash(non_inline_bytes(v), seed)
 }

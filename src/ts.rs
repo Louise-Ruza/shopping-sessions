@@ -226,6 +226,16 @@ fn dd_slot(dd: u16) -> usize {
     }
 }
 
+/// Rejects a late event with the same sentinel as a bad timestamp.
+#[inline(always)]
+pub fn timely_event(ingest: u32, ingest_day: i64, timestamp: i64) -> i64 {
+    if ingest_day > timestamp && crate::is_late_slow(ingest, ingest_day, timestamp) {
+        i64::MAX
+    } else {
+        timestamp
+    }
+}
+
 pub struct DateCache {
     slots: [DateSlot; 64],
     pub base_day_ms: i64,
@@ -355,13 +365,16 @@ impl DateCache {
 
     #[cold]
     #[inline(never)]
-    fn parse_event_ingest_bcd_slow(&self, event: &[u8], ingest: &[u8]) -> (i64, i64, u32) {
-        let (ing_day_ms, ing_bcd) = self.parse_f1_ingest_bcd(ingest);
-        (self.parse_ts(event).unwrap_or(i64::MAX), ing_day_ms, ing_bcd)
+    fn parse_event_ingest_bcd_slow(
+        &self, event: &[u8], ingest: &[u8], encode: impl FnOnce(u32, i64) -> u32,
+    ) -> (i64, u32) {
+        self.with_ingest(self.parse_ts(event).unwrap_or(i64::MAX), ingest, encode)
     }
 
     #[inline(always)]
-    pub fn parse_event_ingest_bcd(&self, event: &[u8], ingest: &[u8]) -> (i64, i64, u32) {
+    pub fn parse_event_ingest_bcd(
+        &self, event: &[u8], ingest: &[u8], encode: impl FnOnce(u32, i64) -> u32,
+    ) -> (i64, u32) {
         if event.len() == 20 && ingest.len() == 20 {
             let ep = event.as_ptr();
             let ip = ingest.as_ptr();
@@ -373,34 +386,30 @@ impl DateCache {
                     let ip_dd = (ip.add(8) as *const u16).read_unaligned();
                     let eslot = *self.slots.get_unchecked(dd_slot(ep_dd));
                     if ((ep_pref ^ eslot.prefix) | ((ep_dd ^ eslot.dd) as u64)) == 0 {
-                        let islot = if ((ep_pref ^ ip_pref) | ((ep_dd ^ ip_dd) as u64)) == 0 {
-                            eslot
-                        } else {
-                            let s = *self.slots.get_unchecked(dd_slot(ip_dd));
-                            if ((ip_pref ^ s.prefix) | ((ip_dd ^ s.dd) as u64)) != 0 {
-                                return self.parse_event_ingest_bcd_slow(event, ingest);
-                            }
-                            s
-                        };
-                        let ev_ms = Self::clock_strict::<true>(ep).map(|ms| eslot.day_ms + ms);
-                        let ing_bcd = islot.day_tag | bcd_hms(ip.add(11));
-                        return (ev_ms.unwrap_or(i64::MAX), islot.day_ms, ing_bcd);
+                        if ((ep_pref ^ ip_pref) | ((ep_dd ^ ip_dd) as u64)) == 0 {
+                            let ts = Self::clock_strict::<true>(ep).map_or(i64::MAX, |ms| eslot.day_ms + ms);
+                            let ingest = eslot.day_tag | bcd_hms(ip.add(11));
+                            return (ts, ingest);
+                        }
                     }
                 }
             }
         }
-        self.parse_event_ingest_bcd_slow(event, ingest)
+        self.parse_event_ingest_bcd_slow(event, ingest, encode)
     }
 
     #[cold]
     #[inline(never)]
-    fn parse_f2_ingest_bcd_slow(&self, event: &[u8], ingest: &[u8]) -> (i64, i64, u32) {
-        let (ing_day_ms, ing_bcd) = self.parse_f1_ingest_bcd(ingest);
-        (self.parse_ts_25(event).unwrap_or(i64::MAX), ing_day_ms, ing_bcd)
+    fn parse_f2_ingest_bcd_slow(
+        &self, event: &[u8], ingest: &[u8], encode: impl FnOnce(u32, i64) -> u32,
+    ) -> (i64, u32) {
+        self.with_ingest(self.parse_ts_25(event).unwrap_or(i64::MAX), ingest, encode)
     }
 
     #[inline(always)]
-    pub fn parse_f2_ingest_bcd(&self, event: &[u8], ingest: &[u8]) -> (i64, i64, u32) {
+    pub fn parse_f2_ingest_bcd(
+        &self, event: &[u8], ingest: &[u8], encode: impl FnOnce(u32, i64) -> u32,
+    ) -> (i64, u32) {
         if event.len() == 25 && ingest.len() == 20 {
             let ep = event.as_ptr();
             let ip = ingest.as_ptr();
@@ -418,7 +427,7 @@ impl DateCache {
                         } else {
                             let s = *self.slots.get_unchecked(dd_slot(ip_dd));
                             if ((ip_pref ^ s.prefix) | ((ip_dd ^ s.dd) as u64)) != 0 {
-                                return self.parse_f2_ingest_bcd_slow(event, ingest);
+                                return self.parse_f2_ingest_bcd_slow(event, ingest, encode);
                             }
                             s
                         };
@@ -450,16 +459,48 @@ impl DateCache {
                         } else {
                             None
                         };
-                        return (ev_ms.unwrap_or(i64::MAX), islot.day_ms, ing_bcd);
+                        let ts = timely_event(ing_bcd, islot.day_ms, ev_ms.unwrap_or(i64::MAX));
+                        return (ts, ing_bcd);
                     }
                 }
             }
         }
-        self.parse_f2_ingest_bcd_slow(event, ingest)
+        self.parse_f2_ingest_bcd_slow(event, ingest, encode)
     }
 
     #[inline(always)]
+    pub fn parse_f3_ingest_bcd(
+        &self, event: &[u8], ingest: &[u8], encode: impl FnOnce(u32, i64) -> u32,
+    ) -> (i64, u32) {
+        self.with_ingest(parse_f3_13(event).unwrap_or(i64::MAX), ingest, encode)
+    }
+
+    #[inline(always)]
+    fn with_ingest(
+        &self, timestamp: i64, ingest: &[u8], encode: impl FnOnce(u32, i64) -> u32,
+    ) -> (i64, u32) {
+        if let Some((day, bcd)) = self.cached_ingest(ingest) {
+            return (timely_event(bcd, day, timestamp), bcd);
+        }
+        Self::with_uncached_ingest(timestamp, ingest, encode)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn with_uncached_ingest(
+        timestamp: i64, ingest: &[u8], encode: impl FnOnce(u32, i64) -> u32,
+    ) -> (i64, u32) {
+        let (exact_ms, code) = Self::parse_f1_ingest_slow(ingest);
+        (timely_event(code, exact_ms, timestamp), encode(code, exact_ms))
+    }
+
+    #[cfg(test)]
     pub fn parse_f1_ingest_bcd(&self, b: &[u8]) -> (i64, u32) {
+        self.cached_ingest(b).unwrap_or_else(|| Self::parse_f1_ingest_slow(b))
+    }
+
+    #[inline(always)]
+    fn cached_ingest(&self, b: &[u8]) -> Option<(i64, u32)> {
         if b.len() == 20 {
             let p = b.as_ptr();
             unsafe {
@@ -468,12 +509,12 @@ impl DateCache {
                     let dd = (p.add(8) as *const u16).read_unaligned();
                     let slot = *self.slots.get_unchecked(dd_slot(dd));
                     if pref == slot.prefix && dd == slot.dd {
-                        return (slot.day_ms, slot.day_tag | bcd_hms(p.add(11)));
+                        return Some((slot.day_ms, slot.day_tag | bcd_hms(p.add(11))));
                     }
                 }
             }
         }
-        Self::parse_f1_ingest_slow(b)
+        None
     }
 
     #[cold]
@@ -485,12 +526,6 @@ impl DateCache {
             // check, so the per-row handler needs no separate `INGEST_NONE` test.
             None => (i64::MAX, INGEST_NONE),
         }
-    }
-
-    /// Parse a known 13-byte F3 timestamp.
-    #[inline(always)]
-    pub fn parse_ts_13(b: &[u8]) -> Option<i64> {
-        parse_f3_13(b)
     }
 
     /// Parse a known 25-byte F2 timestamp.

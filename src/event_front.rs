@@ -10,6 +10,8 @@ use crate::csv;
 use crate::key::{EKey, Key8};
 use crate::links::SEED_A;
 use crate::ts::{parse_price, DateCache};
+#[cfg(test)]
+use crate::ts::timely_event;
 use crate::SEED_ID;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,7 +24,6 @@ pub struct Event<'a> {
     pub product: &'a [u8],
     // i64::MAX is outside every half-open event window.
     pub timestamp: i64,
-    pub ing_day_ms: i64,
     pub ing_bcd: u32,
     pub kind: u8, // 0 invalid (then `product` is empty); 1 view/cart; 2 purchase
     pub price: u32,
@@ -33,6 +34,17 @@ pub trait EventSink<'a> {
     const PAD_ROW_160: bool = false;
     #[inline(always)]
     fn prefetch_keys(&self, _ek_long: bool, _eh: u64, _uid_long: bool, _uh: u64) {}
+    fn encode_special_ingest(&self, ingest: u32, _exact_ms: i64) -> u32 {
+        ingest
+    }
+    #[inline(always)]
+    fn on_non_purchase(&mut self, ev: Event<'a>) {
+        self.on_event(ev);
+    }
+    #[inline(always)]
+    fn on_purchase(&mut self, ev: Event<'a>) {
+        self.on_event(ev);
+    }
     fn on_event(&mut self, ev: Event<'a>);
 }
 
@@ -74,7 +86,9 @@ fn fallback<'a, S: EventSink<'a>>(data: &'a [u8], dates: &DateCache, f: &mut S) 
             b"purchase" => 2,
             _ => 0,
         };
-        let (timestamp, ing_day_ms, ing_bcd) = dates.parse_event_ingest_bcd(fields[2], fields[3]);
+        let (timestamp, ing_bcd) = dates.parse_event_ingest_bcd(fields[2], fields[3], |ingest, exact_ms| {
+            f.encode_special_ingest(ingest, exact_ms)
+        });
         let (ek, eh) = EKey::new_and_hash(fields[0], SEED_ID);
         let (uid_k, uh) = Key8::pack_inline_or_sentinel(fields[1], SEED_A);
         f.on_event(Event {
@@ -87,7 +101,6 @@ fn fallback<'a, S: EventSink<'a>>(data: &'a [u8], dates: &DateCache, f: &mut S) 
             // and the per-row handler never tests `kind == 0`.
             product: if kind == 0 { &[] } else { fields[5] },
             timestamp,
-            ing_day_ms,
             ing_bcd,
             kind,
             price: if kind == 2 { parse_price(fields[6]) } else { 0 },
@@ -157,8 +170,8 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
     c5: usize,
     quotes: Option<u8>,
     dates: &DateCache,
-    sink: &S,
-) -> Option<Event<'a>> {
+    sink: &mut S,
+) -> bool {
     let quoted = |field: u32, read: bool| -> usize {
         match quotes {
             Some(bits) => usize::from((bits >> field) & 1),
@@ -176,9 +189,8 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
         let iq = quoted(3, *p.add(c2 + 1) == b'"');
         let ia = c2 + 1 + iq;
         let c3 = ia + 20 + iq;
-        // One branch: `c3 >= c5` alone rejects; otherwise the byte at `c3` must be a comma.
-        if (c3 >= c5) | (*p.add(c3.min(c5)) != b',') {
-            return None;
+        if c3 >= c5 || *p.add(c3) != b',' {
+            return false;
         }
         let q0 = quoted(0, c0 > 0 && *p == b'"');
         let q1 = quoted(1, c0 + 1 < c1 && *p.add(c0 + 1) == b'"');
@@ -188,56 +200,54 @@ fn parse_row_tail<'a, S: EventSink<'a>>(
         let (uid_k, uh) = Key8::pack_inline_or_sentinel(uid, SEED_A);
         sink.prefetch_keys(ek.is_non_inline(), eh, uid_k.0 == Key8::NON_INLINE_SENTINEL.0, uh);
 
-        let (timestamp, ing_day_ms, ing_bcd) = if tlen == 20 {
-            dates.parse_event_ingest_bcd(data.get_unchecked(ta..ta + 20), data.get_unchecked(ia..ia + 20))
+        let ingest = data.get_unchecked(ia..ia + 20);
+        let encode = |ingest, exact_ms| sink.encode_special_ingest(ingest, exact_ms);
+        let (timestamp, ing_bcd) = if tlen == 20 {
+            dates.parse_event_ingest_bcd(data.get_unchecked(ta..ta + 20), ingest, encode)
         } else if tlen == 13 {
-            let (id, ib) = dates.parse_f1_ingest_bcd(data.get_unchecked(ia..ia + 20));
-            (DateCache::parse_ts_13(data.get_unchecked(ta..ta + 13)).unwrap_or(i64::MAX), id, ib)
+            dates.parse_f3_ingest_bcd(data.get_unchecked(ta..ta + 13), ingest, encode)
         } else if tlen == 25 {
-            dates.parse_f2_ingest_bcd(data.get_unchecked(ta..ta + 25), data.get_unchecked(ia..ia + 20))
+            dates.parse_f2_ingest_bcd(data.get_unchecked(ta..ta + 25), ingest, encode)
         } else {
-            return None;
+            return false;
         };
         let kq = quoted(4, *p.add(c3 + 1) == b'"');
         let ka = c3 + 1 + kq;
         // No `ka + 4 + kq < c5` bound: a matching `view`/`cart` followed by a comma makes that
         // comma the first one after `c3`, i.e. `c4 < c5`. Reads reach at most `end + 3`, which
         // stays inside the input (`INPUT_TAIL` slack after every file).
-        let (kind, c4) = {
-            let k4 = (p.add(ka) as *const u32).read_unaligned();
-            let is_vc = ((k4 == u32::from_ne_bytes(*b"view")) | (k4 == u32::from_ne_bytes(*b"cart")))
-                & (*p.add(ka + 4 + kq) == b',');
-            if is_vc {
-                (1u8, ka + 4 + kq)
-            } else if ka + 8 + kq < c5
-                && (p.add(ka) as *const u64).read_unaligned() == u64::from_ne_bytes(*b"purchase")
-                && *p.add(ka + 8 + kq) == b','
-            {
-                (2u8, ka + 8 + kq)
-            } else {
-                return None;
+        let event = |kind, c4, price| {
+            let pq = quoted(5, c4 + 1 < c5 && *p.add(c4 + 1) == b'"');
+            Event {
+                ek,
+                eh,
+                uid_k,
+                uh,
+                uid_bytes: uid,
+                product: data.get_unchecked(c4 + 1 + pq..c5 - pq),
+                timestamp,
+                ing_bcd,
+                kind,
+                price,
             }
         };
-        let pq = quoted(5, c4 + 1 < c5 && *p.add(c4 + 1) == b'"');
-        let price = if kind == 2 {
+        let k4 = (p.add(ka) as *const u32).read_unaligned();
+        let is_vc = ((k4 == u32::from_ne_bytes(*b"view")) | (k4 == u32::from_ne_bytes(*b"cart")))
+            & (*p.add(ka + 4 + kq) == b',');
+        if is_vc {
+            sink.on_non_purchase(event(1, ka + 4 + kq, 0));
+            true
+        } else if ka + 8 + kq < c5
+            && (p.add(ka) as *const u64).read_unaligned() == u64::from_ne_bytes(*b"purchase")
+            && *p.add(ka + 8 + kq) == b','
+        {
             let prq = quoted(6, c5 + 1 < end && *p.add(c5 + 1) == b'"');
-            parse_price(data.get_unchecked(c5 + 1 + prq..end - prq))
+            let price = parse_price(data.get_unchecked(c5 + 1 + prq..end - prq));
+            sink.on_purchase(event(2, ka + 8 + kq, price));
+            true
         } else {
-            0
-        };
-        Some(Event {
-            ek,
-            eh,
-            uid_k,
-            uh,
-            uid_bytes: uid,
-            product: data.get_unchecked(c4 + 1 + pq..c5 - pq),
-            timestamp,
-            ing_day_ms,
-            ing_bcd,
-            kind,
-            price,
-        })
+            false
+        }
     }
 }
 
@@ -251,13 +261,13 @@ fn parse_row_hi<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     qt2: u32,
     dates: &DateCache,
     parity64: &P,
-    sink: &S,
-) -> Option<Event<'a>> {
+    sink: &mut S,
+) -> bool {
     let end_bit_hi = 1u32 << end_hi;
     let below_hi = end_bit_hi - 1;
     let c_hi = cm2 & below_hi;
     if c_lo.count_ones() + c_hi.count_ones() != 6 {
-        return None;
+        return false;
     }
     let q_hi = qt2 & below_hi;
     let p_lo = parity64(q_lo);
@@ -268,7 +278,7 @@ fn parse_row_hi<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     let edges_hi = (seps_hi << 1) | ((seps_lo >> 63) as u32) | (seps_hi >> 1);
     let p_hi = p_hi_raw ^ 0u32.wrapping_sub((p_lo >> 63) as u32);
     if ((q_lo & !edges_lo) | (p_lo & seps_lo)) != 0 || ((q_hi & !edges_hi) | (p_hi & seps_hi)) != 0 {
-        return None;
+        return false;
     }
     let (c0, c1, c2) = if c_lo != 0 {
         let c0 = c_lo.trailing_zeros() as usize;
@@ -313,13 +323,13 @@ fn parse_row_lo<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     q_lo: u64,
     dates: &DateCache,
     parity64: &P,
-    sink: &S,
-) -> Option<Event<'a>> {
+    sink: &mut S,
+) -> bool {
     let end_bit = 1u64 << end;
     let below = end_bit - 1;
     let c = c_lo & below;
     if c.count_ones() != 6 {
-        return None;
+        return false;
     }
     let c0 = c.trailing_zeros() as usize;
     let low1 = c & c.wrapping_sub(1);
@@ -330,7 +340,7 @@ fn parse_row_lo<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     let seps = c | end_bit;
     let edges = (seps << 1) | 1 | (seps >> 1);
     if ((q & !edges) | (parity64(q) & seps)) != 0 {
-        return None;
+        return false;
     }
     let c5 = 63 - c.leading_zeros() as usize;
     parse_row_tail(data, end, c0, c1, c2, c5, None, dates, sink)
@@ -346,8 +356,8 @@ fn parse_row_mid128<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     q_mid_raw: u64,
     dates: &DateCache,
     parity64: &P,
-    sink: &S,
-) -> Option<Event<'a>> {
+    sink: &mut S,
+) -> bool {
     let end_bit_mid = 1u64 << end_mid;
     let below_mid = end_bit_mid - 1;
     let c_mid = c_mid_raw & below_mid;
@@ -362,7 +372,7 @@ fn parse_row_mid128<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     if (c_lo.count_ones() + c_mid.count_ones() != 6)
         | (((q_lo & !edges_lo) | (p_lo & seps_lo) | (q_mid & !edges_mid) | (p_mid & seps_mid)) != 0)
     {
-        return None;
+        return false;
     }
     // 98.3% of v5 rows have >= 2 commas in c_lo (`low1 != 0`); branchless cmov picks c2 from low2 vs c_mid!
     let low1 = c_lo & c_lo.wrapping_sub(1);
@@ -425,13 +435,13 @@ fn parse_row_top160<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
     qt4: u32,
     dates: &DateCache,
     parity64: &P,
-    sink: &S,
-) -> Option<Event<'a>> {
+    sink: &mut S,
+) -> bool {
     let end_bit_top = 1u32 << end_top;
     let below_top = end_bit_top - 1;
     let c_top = cm4 & below_top;
     if c_lo.count_ones() + c_mid.count_ones() + c_top.count_ones() != 6 {
-        return None;
+        return false;
     }
     let q_top = qt4 & below_top;
     let seps_lo = c_lo;
@@ -447,7 +457,7 @@ fn parse_row_top160<'a, S: EventSink<'a>, P: Fn(u64) -> u64>(
         || ((q_mid & !edges_mid) | (p_mid & seps_mid)) != 0
         || ((q_top & !edges_top) | (p_top & seps_top)) != 0
     {
-        return None;
+        return false;
     }
     let mut clo = c_lo;
     let mut cmid = c_mid;
@@ -480,9 +490,7 @@ fn scan_with<'a, S: EventSink<'a>, M: Fn(&[u8; 96]) -> (u64, u32, u64, u32, u64,
             if nl2 != 0 {
                 let end_hi = nl2.trailing_zeros() as usize;
                 let end = 64 + end_hi;
-                if let Some(ev) = parse_row_hi(bytes, end_hi, c_lo, cm2, q_lo, qt2, dates, &parity64, &f) {
-                    f.on_event(ev);
-                } else {
+                if !parse_row_hi(bytes, end_hi, c_lo, cm2, q_lo, qt2, dates, &parity64, &mut f) {
                     fallback(unsafe { data.get_unchecked(..end + 1) }, dates, &mut f);
                 }
                 data = unsafe { data.get_unchecked(end + 1..) };
@@ -493,11 +501,7 @@ fn scan_with<'a, S: EventSink<'a>, M: Fn(&[u8; 96]) -> (u64, u32, u64, u32, u64,
                 if nl3 != 0 {
                     let end_mid = 32 + nl3.trailing_zeros() as usize;
                     let end = 64 + end_mid;
-                    if let Some(ev) =
-                        parse_row_mid128(data, end_mid, c_lo, c_mid, q_lo, q_mid, dates, &parity64, &f)
-                    {
-                        f.on_event(ev);
-                    } else {
+                    if !parse_row_mid128(data, end_mid, c_lo, c_mid, q_lo, q_mid, dates, &parity64, &mut f) {
                         fallback(unsafe { data.get_unchecked(..end + 1) }, dates, &mut f);
                     }
                     data = unsafe { data.get_unchecked(end + 1..) };
@@ -506,11 +510,9 @@ fn scan_with<'a, S: EventSink<'a>, M: Fn(&[u8; 96]) -> (u64, u32, u64, u32, u64,
                     if nl4 != 0 {
                         let end_top = nl4.trailing_zeros() as usize;
                         let end = 128 + end_top;
-                        if let Some(ev) = parse_row_top160(
-                            data, end_top, c_lo, c_mid, cm4, q_lo, q_mid, qt4, dates, &parity64, &f,
+                        if !parse_row_top160(
+                            data, end_top, c_lo, c_mid, cm4, q_lo, q_mid, qt4, dates, &parity64, &mut f,
                         ) {
-                            f.on_event(ev);
-                        } else {
                             fallback(unsafe { data.get_unchecked(..end + 1) }, dates, &mut f);
                         }
                         data = unsafe { data.get_unchecked(end + 1..) };
@@ -540,9 +542,7 @@ fn scan_with<'a, S: EventSink<'a>, M: Fn(&[u8; 96]) -> (u64, u32, u64, u32, u64,
             }
         } else {
             let end = l_lo.trailing_zeros() as usize;
-            if let Some(ev) = parse_row_lo(bytes, end, c_lo, q_lo, dates, &parity64, &f) {
-                f.on_event(ev);
-            } else {
+            if !parse_row_lo(bytes, end, c_lo, q_lo, dates, &parity64, &mut f) {
                 fallback(unsafe { data.get_unchecked(..end + 1) }, dates, &mut f);
             }
             data = unsafe { data.get_unchecked(end + 1..) };
@@ -590,9 +590,7 @@ unsafe fn handle_row_lo_avx2<'a, S: EventSink<'a>>(
     let parity64 = |q: u64| -> u64 {
         _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(q as i64), v_ones)) as u64
     };
-    if let Some(ev) = parse_row_lo(bytes, end, c_lo, q_lo, dates, &parity64, f) {
-        f.on_event(ev);
-    } else {
+    if !parse_row_lo(bytes, end, c_lo, q_lo, dates, &parity64, f) {
         fallback(data.get_unchecked(..end + 1), dates, f);
     }
     end + 1
@@ -613,9 +611,11 @@ unsafe fn handle_row_160_avx2<'a, S: EventSink<'a>>(
     f: &mut S,
 ) -> usize {
     use core::arch::x86_64::*;
-    // Pad the first instantiation to preserve alignment of the <10> handler and click scanner.
+    // Restore the long-row handler and following click scanner offsets.
     if S::PAD_ROW_160 {
         core::arch::asm!("jmp 2f\n.skip 14, 0xcc\n2:", options(nomem, nostack, preserves_flags));
+    } else {
+        core::arch::asm!("jmp 2f\n.skip 30, 0xcc\n2:", options(nomem, nostack, preserves_flags));
     }
     if data.len() >= 160 {
         let p = data.as_ptr();
@@ -633,11 +633,7 @@ unsafe fn handle_row_160_avx2<'a, S: EventSink<'a>>(
         if nl4 != 0 {
             let end_top = nl4.trailing_zeros() as usize;
             let end = 128 + end_top;
-            if let Some(ev) =
-                parse_row_top160(data, end_top, c_lo, c_mid, cm4, q_lo, q_mid, qt4, dates, &parity64, f)
-            {
-                f.on_event(ev);
-            } else {
+            if !parse_row_top160(data, end_top, c_lo, c_mid, cm4, q_lo, q_mid, qt4, dates, &parity64, f) {
                 fallback(data.get_unchecked(..end + 1), dates, f);
             }
             return end + 1;
@@ -697,11 +693,7 @@ unsafe fn scan_avx2<'a, S: EventSink<'a>>(mut data: &'a [u8], dates: &DateCache,
             if l_mid != 0 {
                 let end_mid = l_mid.trailing_zeros() as usize;
                 let end = 64 + end_mid;
-                if let Some(ev) =
-                    parse_row_mid128(data, end_mid, c_lo, c_mid, q_lo, q_mid, dates, &parity64, &f)
-                {
-                    f.on_event(ev);
-                } else {
+                if !parse_row_mid128(data, end_mid, c_lo, c_mid, q_lo, q_mid, dates, &parity64, &mut f) {
                     fallback(data.get_unchecked(..end + 1), dates, &mut f);
                 }
                 data = data.get_unchecked(end + 1..);
@@ -1145,6 +1137,10 @@ mod tests {
                 _ => 0,
             };
             let (ing_day_ms, ing_bcd) = dates.parse_f1_ingest_bcd(f[3]);
+            let ts = dates.parse_ts(f[2]).unwrap_or(i64::MAX);
+            let same_cached_utc_day = f[2].len() == 20 && f[3].len() == 20
+                && f[2][..10] == f[3][..10] && ing_bcd < crate::ts::INGEST_OOB_BASE;
+            let timestamp = if same_cached_utc_day { ts } else { timely_event(ing_bcd, ing_day_ms, ts) };
             let ek = EKey::new(f[0]);
             let eh = ek.hash(SEED_ID);
             let (uid_k, uh) = Key8::pack_inline_or_sentinel(f[1], SEED_A);
@@ -1155,8 +1151,7 @@ mod tests {
                 uh,
                 uid_bytes: f[1],
                 product: if kind == 0 { &[] } else { f[5] },
-                timestamp: dates.parse_ts(f[2]).unwrap_or(i64::MAX),
-                ing_day_ms,
+                timestamp,
                 ing_bcd,
                 kind,
                 price: if kind == 2 { parse_price(f[6]) } else { 0 },
