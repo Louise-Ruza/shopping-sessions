@@ -163,11 +163,37 @@ impl InputArena {
             .collect()
     }
 
+    fn compact_event_limit(&self, files: &[&[u8]]) -> u64 {
+        // All copies of a 33-byte ID must enter the same deduplicator, including
+        // copies in files that fell back to an independent mmap.
+        let limit = self.cursor.min(1usize << 34);
+        let all_fit = files.iter().all(|file| {
+            let off = (file.as_ptr() as usize).wrapping_sub(self.base);
+            file.is_empty() || (off < limit && file.len() <= limit - off)
+        });
+        if all_fit { limit as u64 } else { 0 }
+    }
+
     fn finish(self) {
         if self.base != 0 && self.cursor > 0 {
             key::register_input_region(self.base, self.cursor);
         }
     }
+}
+
+#[test]
+fn compact_event_limit_checks_every_mapping_and_the_last_byte() {
+    let bytes = [0u8; 64];
+    let p = bytes.as_ptr() as usize;
+    let bound = 1usize << 34;
+    let mut arena = InputArena { base: p, cap: 64, cursor: 32, page: 4096 };
+    assert_eq!(arena.compact_event_limit(&[&[], &bytes[..32]]), 32);
+    assert_eq!(arena.compact_event_limit(&[&bytes[..16], &bytes[32..]]), 0);
+    arena.base = p.wrapping_sub(bound - 32);
+    arena.cursor = bound + 4096;
+    assert_eq!(arena.compact_event_limit(&[&bytes[..32]]), bound as u64);
+    assert_eq!(arena.compact_event_limit(&[&bytes[..32], &bytes[32..]]), 0);
+    assert_eq!(arena.compact_event_limit(&[&bytes[..33]]), 0);
 }
 
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -711,6 +737,7 @@ const _: () = assert!(arena::SEG / std::mem::size_of::<DedupRec>() <= 1024);
 const _: () = assert!(arena::SEG / std::mem::size_of::<LongDedupRec>() <= 1024);
 
 struct Ctx {
+    compact_event_limit: u64,
     ws: i64,
     base: i64,
     we: i64,
@@ -4892,7 +4919,7 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
     #[inline(always)]
     fn push_long_dedup(&mut self, ek: EKey, eh: u64, ingest: u32, loc: u32) {
         if let Some((off, 33)) = ek.ref_off_len() {
-            if off < (1u64 << 34) {
+            if off < self.ctx.compact_event_limit {
                 let lid_sh = (eh >> (64 - (ID_BITS - 2))) as usize;
                 let h30 = (eh >> 26) & 0x3FFF_FFFF;
                 self.long_id_w.push(lid_sh, LongDedupRec { off_h30: (h30 << 34) | off, ingest, loc });
@@ -5470,9 +5497,11 @@ fn main() {
     let link_files = input_arena.map_dir(&links_dir);
     let click_files = input_arena.map_dir(&clicks_dir);
     let event_files = input_arena.map_dir(&events_dir);
+    let compact_event_limit = input_arena.compact_event_limit(&event_files);
     input_arena.finish();
     let wide = cat_names.len() > 256;
     let ctx = Ctx {
+        compact_event_limit,
         ws,
         base: ws - SEVEN_DAYS_MS,
         we,
