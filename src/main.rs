@@ -463,6 +463,64 @@ impl KeyMap {
     }
 }
 
+/// Exact lookup for the short decimal campaign IDs. The index discards bits;
+/// full key verification and the ordinary map handle collisions and other IDs.
+struct ClickCampaigns {
+    slots: Vec<u64>,
+}
+
+impl ClickCampaigns {
+    #[inline(always)]
+    fn index(tail: u32) -> usize {
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        unsafe {
+            core::arch::x86_64::_pext_u32(tail, 0x0f0f_0f03) as usize
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        {
+            let digits = tail & 0x0f0f_0f03;
+            ((digits & 3) | ((digits >> 6) & 0x3c) | ((digits >> 10) & 0x3c0)
+                | ((digits >> 14) & 0x3c00)) as usize
+        }
+    }
+
+    #[inline(always)]
+    fn key(id: &[u8]) -> (usize, u64) {
+        let p = id.as_ptr();
+        let n = id.len();
+        // The caller checked that the field contains 4 to 6 bytes.
+        let prefix = unsafe { p.cast::<u16>().read_unaligned() };
+        let tail = unsafe { p.add(n - 4).cast::<u32>().read_unaligned() };
+        let key = (u64::from(tail) << 16) | u64::from(prefix);
+        (Self::index(tail), (key << 2) | (n - 3) as u64)
+    }
+
+    fn new(ids: &[&[u8]]) -> Self {
+        let mut slots = vec![0; 1 << 14];
+        for (value, &id) in ids.iter().enumerate().skip(1).take((1 << 14) - 1) {
+            if (4..=6).contains(&id.len()) {
+                let (slot, key) = Self::key(id);
+                if slots[slot] == 0 {
+                    slots[slot] = ((value as u64) << 50) | key;
+                }
+            }
+        }
+        Self { slots }
+    }
+
+    #[inline(always)]
+    fn get(&self, id: &[u8], fallback: &KeyMap) -> Option<u32> {
+        if id.len().wrapping_sub(4) <= 2 {
+            let (slot, key) = Self::key(id);
+            let entry = unsafe { *self.slots.get_unchecked(slot) };
+            if (entry & ((1 << 50) - 1)) == key {
+                return Some((entry >> 50) as u32);
+            }
+        }
+        fallback.get_swar(id)
+    }
+}
+
 fn read_static(path: &Path) -> &'static [u8] {
     match std::fs::read(path) {
         Ok(v) => Box::leak(v.into_boxed_slice()),
@@ -5075,6 +5133,7 @@ impl<'a, 'b, const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, const
 
 struct ClickHandler<'a, 'b, const P_BITS: u32, const CL_STAGE: usize> {
     ctx: &'a Ctx,
+    camps: &'a ClickCampaigns,
     cws: i64,
     cwlen: u64,
     base: i64,
@@ -5112,7 +5171,7 @@ impl<'a, 'b, const P_BITS: u32, const CL_STAGE: usize> event_front::ClickSink<'_
         let sh = (uh >> (64 - P_BITS)) as usize;
         // Unconditional prefetch: when non-inline, uh == 0 -> shard 0 (already L1-hot), zero branch!
         self.w.prefetch_shard(sh);
-        let Some(camp) = self.ctx.camps.get_swar(f[2]) else { return };
+        let Some(camp) = self.camps.get(f[2], &self.ctx.camps) else { return };
         let ts = match self.ctx.dates.parse_ts(f[3]) {
             Some(t) if (t.wrapping_sub(self.cws) as u64) < self.cwlen => t,
             _ => return,
@@ -5281,6 +5340,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
         mark("dedup");
 
         // ---- clicks: parse, validate, scatter directly by raw user_id (ZERO LinkTable lookups!)
+        let camps = ClickCampaigns::new(&ctx.camp_ids);
         let cws = ctx.ws - SEVEN_DAYS_MS;
         let cwlen: u64 = (ctx.we - cws).max(0) as u64;
         let chunks = make_chunks(click_files, chunk_target(click_files, threads));
@@ -5292,6 +5352,7 @@ fn run_pipeline<const ID_BITS: u32, const P_BITS: u32, const EV_STAGE: usize, co
             let mut scatter_meta = arena::ScatterMetaPool::new();
             let mut handler = ClickHandler::<P_BITS, CL_STAGE> {
                 ctx,
+                camps: &camps,
                 cws,
                 cwlen,
                 base: ctx.base,
